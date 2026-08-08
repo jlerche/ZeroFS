@@ -5,6 +5,7 @@
 //! to mount a branch or decide storage liveness. JSON and PostgreSQL implement
 //! the same projection contract.
 
+mod deletion;
 mod json;
 mod lease;
 mod lifecycle;
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub use deletion::{CheckpointDeleteRequest, DeletionLifecycle, DeletionLifecycleError};
 pub use json::JsonCatalogProjection;
 pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
@@ -36,7 +38,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const CATALOG_SCHEMA_VERSION: u32 = 5;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -375,13 +377,7 @@ impl BranchCreateOperation {
     pub fn gc_roots(&self) -> Vec<&DurableRoot> {
         match self.phase {
             BranchCreatePhase::Reserved => vec![&self.source_root],
-            BranchCreatePhase::RootCreated => {
-                let mut roots = vec![&self.source_root];
-                if let Some(destination) = &self.destination_root {
-                    roots.push(destination);
-                }
-                roots
-            }
+            BranchCreatePhase::RootCreated => self.destination_root.iter().collect(),
             BranchCreatePhase::Published => Vec::new(),
         }
     }
@@ -414,6 +410,10 @@ pub struct TombstoneRecord {
     pub parent_id: Option<Uuid>,
     pub origin_checkpoint_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// Exact live-record revision consumed by deletion. Older migrated
+    /// tombstones may not carry this proof and cannot satisfy exact retries.
+    #[serde(default)]
+    pub deleted_revision: Option<u64>,
     pub deleted_generation: u64,
     pub deleted_at: DateTime<Utc>,
 }
@@ -424,6 +424,11 @@ impl TombstoneRecord {
         validate_name(&self.name)?;
         validate_optional_id(self.parent_id, "tombstone parent")?;
         validate_optional_id(self.origin_checkpoint_id, "tombstone origin checkpoint")?;
+        if self.deleted_revision == Some(0) {
+            return Err(CatalogError::Invalid(
+                "tombstone deleted revision cannot be zero".to_string(),
+            ));
+        }
         validate_timestamp(self.created_at, "tombstone created_at")?;
         validate_timestamp(self.deleted_at, "tombstone deleted_at")?;
         if self.deleted_at < self.created_at {
@@ -756,6 +761,7 @@ pub(crate) trait Catalog: Send + Sync {
         id: Uuid,
     ) -> Result<Option<BranchCreateOperation>, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
+    async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
 
     /// Apply one atomic mutation and advance the root-snapshot generation.
     /// Updates/deletes carry per-record revisions, so unrelated mutations do
@@ -833,20 +839,37 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                         operation.id
                     )));
                 }
-                let source = snapshot
-                    .checkpoints
-                    .get(&operation.source_checkpoint_id)
-                    .ok_or_else(|| {
-                        CatalogError::Corrupt(format!(
-                            "incomplete operation {} has no live source checkpoint",
+                if operation.phase == BranchCreatePhase::Reserved {
+                    let source = snapshot
+                        .checkpoints
+                        .get(&operation.source_checkpoint_id)
+                        .ok_or_else(|| {
+                            CatalogError::Corrupt(format!(
+                                "reserved operation {} has no live source checkpoint",
+                                operation.id
+                            ))
+                        })?;
+                    if source.root != operation.source_root {
+                        return Err(CatalogError::Corrupt(format!(
+                            "reserved operation {} source root changed",
                             operation.id
-                        ))
-                    })?;
-                if source.root != operation.source_root {
-                    return Err(CatalogError::Corrupt(format!(
-                        "incomplete operation {} source root changed",
-                        operation.id
-                    )));
+                        )));
+                    }
+                } else {
+                    let live_source_matches = snapshot
+                        .checkpoints
+                        .get(&operation.source_checkpoint_id)
+                        .is_some_and(|source| source.root == operation.source_root);
+                    let deleted_source_matches = snapshot
+                        .tombstones
+                        .get(&operation.source_checkpoint_id)
+                        .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Checkpoint);
+                    if !live_source_matches && !deleted_source_matches {
+                        return Err(CatalogError::Corrupt(format!(
+                            "root-created operation {} has no matching source history",
+                            operation.id
+                        )));
+                    }
                 }
             }
             BranchCreatePhase::Published => {
@@ -1100,6 +1123,7 @@ mod tests {
                 parent_id: None,
                 origin_checkpoint_id: None,
                 created_at,
+                deleted_revision: Some(1),
                 deleted_generation: 2,
                 deleted_at: created_at - chrono::Duration::microseconds(1),
             },

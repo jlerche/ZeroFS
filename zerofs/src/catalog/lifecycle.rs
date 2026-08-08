@@ -49,6 +49,10 @@ impl BranchLifecycle {
         super::LeaseLifecycle::new(Arc::clone(&self.catalog), self.roots.clone())
     }
 
+    pub fn deletions(&self) -> super::DeletionLifecycle {
+        super::DeletionLifecycle::new(Arc::clone(&self.catalog))
+    }
+
     /// Resolve a checkpoint name once to its stable catalog UUID and exact
     /// SlateDB checkpoint/manifest identity, then use the same creation
     /// primitive as an already-resolved request.
@@ -119,11 +123,11 @@ impl BranchLifecycle {
         &self,
         request: BranchCreateRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
-        if let Some(existing) = self
+        let existing = self
             .catalog
             .branch_create_operation(request.operation_id)
-            .await?
-        {
+            .await?;
+        let operation = if let Some(existing) = existing {
             if existing.destination_id != request.destination_id
                 || existing.destination_name != request.destination_name
                 || existing.source_checkpoint_id != request.source.checkpoint_id
@@ -137,47 +141,48 @@ impl BranchLifecycle {
             if existing.phase == BranchCreatePhase::Published {
                 return self.ready_branch(existing.destination_id).await;
             }
-        }
-        let source_record = self
-            .catalog
-            .checkpoint(request.source.checkpoint_id)
-            .await?
-            .ok_or_else(|| CatalogError::NotFound(request.source.checkpoint_id.to_string()))?;
-        if source_record.root != request.source.durable_root() {
-            return Err(BranchLifecycleError::SourceRootConflict(source_record.id));
-        }
-        let branch = BranchRecord {
-            id: request.destination_id,
-            revision: 1,
-            name: request.destination_name.clone(),
-            state: BranchState::Creating,
-            root: None,
-            parent_id: Some(source_record.branch_id),
-            origin_checkpoint_id: Some(source_record.id),
-            created_at: request.created_at,
-            updated_at: request.created_at,
+            existing
+        } else {
+            let source_record = self
+                .catalog
+                .checkpoint(request.source.checkpoint_id)
+                .await?
+                .ok_or_else(|| CatalogError::NotFound(request.source.checkpoint_id.to_string()))?;
+            if source_record.root != request.source.durable_root() {
+                return Err(BranchLifecycleError::SourceRootConflict(source_record.id));
+            }
+            let branch = BranchRecord {
+                id: request.destination_id,
+                revision: 1,
+                name: request.destination_name.clone(),
+                state: BranchState::Creating,
+                root: None,
+                parent_id: Some(source_record.branch_id),
+                origin_checkpoint_id: Some(source_record.id),
+                created_at: request.created_at,
+                updated_at: request.created_at,
+            };
+            let reservation = BranchCreateOperation {
+                id: request.operation_id,
+                revision: 1,
+                destination_id: request.destination_id,
+                destination_name: request.destination_name.clone(),
+                source_checkpoint_id: source_record.id,
+                source_root: source_record.root,
+                parent_id: Some(source_record.branch_id),
+                phase: BranchCreatePhase::Reserved,
+                destination_root: None,
+                created_at: request.created_at,
+                updated_at: request.created_at,
+            };
+            self.catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch,
+                    operation: Box::new(reservation),
+                })
+                .await?;
+            self.operation(request.operation_id).await?
         };
-        let reservation = BranchCreateOperation {
-            id: request.operation_id,
-            revision: 1,
-            destination_id: request.destination_id,
-            destination_name: request.destination_name,
-            source_checkpoint_id: source_record.id,
-            source_root: source_record.root,
-            parent_id: Some(source_record.branch_id),
-            phase: BranchCreatePhase::Reserved,
-            destination_root: None,
-            created_at: request.created_at,
-            updated_at: request.created_at,
-        };
-        self.catalog
-            .apply(CatalogMutation::ReserveBranchCreate {
-                branch,
-                operation: Box::new(reservation.clone()),
-            })
-            .await?;
-
-        let operation = self.operation(request.operation_id).await?;
         if operation.phase == BranchCreatePhase::Published {
             return self.ready_branch(operation.destination_id).await;
         }
@@ -281,8 +286,8 @@ pub enum BranchLifecycleError {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CatalogMutation, CheckpointRecord, DurableRoot, LeaseAccessMode, LeaseAcquireRequest,
-        SlateDbCatalog, catalog_timestamp,
+        CatalogMutation, CheckpointDeleteRequest, CheckpointRecord, DurableRoot, LeaseAccessMode,
+        LeaseAcquireRequest, SlateDbCatalog, catalog_timestamp,
     };
     use slatedb::Db;
     use slatedb::admin::AdminBuilder;
@@ -328,6 +333,10 @@ mod tests {
             .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
             .await
             .unwrap();
+        let resumable_checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
         source_db.close().await.unwrap();
         let source = ImmutableCheckpoint {
             database_path: source_path.clone(),
@@ -345,6 +354,24 @@ mod tests {
         };
         catalog
             .apply(CatalogMutation::CreateCheckpoint(source_record.clone()))
+            .await
+            .unwrap();
+        let resumable_source = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: resumable_checkpoint.id,
+            manifest_id: resumable_checkpoint.manifest_id,
+        };
+        let resumable_record = CheckpointRecord {
+            id: resumable_checkpoint.id,
+            revision: 1,
+            branch_id: parent.id,
+            name: "resumable".to_string(),
+            root: resumable_source.durable_root(),
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(resumable_record.clone()))
             .await
             .unwrap();
 
@@ -374,7 +401,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = catalog.snapshot().await.unwrap();
-        assert_eq!(snapshot.generation, 5);
+        assert_eq!(snapshot.generation, 6);
         assert_eq!(
             snapshot.branch_create_operations[&operation_id].phase,
             BranchCreatePhase::Published
@@ -410,13 +437,14 @@ mod tests {
             ))
         ));
 
-        catalog
-            .apply(CatalogMutation::DeleteCheckpoint {
-                id: source_record.id,
-                expected_revision: source_record.revision,
-                name: source_record.name.clone(),
-                deleted_at: catalog_timestamp(Utc::now()),
-            })
+        let delete_request = CheckpointDeleteRequest {
+            checkpoint_id: source_record.id,
+            expected_revision: source_record.revision,
+            name: source_record.name.clone(),
+        };
+        lifecycle
+            .deletions()
+            .delete_checkpoint(delete_request.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -460,6 +488,11 @@ mod tests {
             }))
             .await
             .unwrap();
+        lifecycle
+            .deletions()
+            .delete_checkpoint(delete_request)
+            .await
+            .expect("an exact checkpoint deletion retry must ignore name reuse");
         assert_eq!(
             lifecycle
                 .create_from_checkpoint_name(named_request)
@@ -467,6 +500,77 @@ mod tests {
                 .expect("a published named retry must ignore source deletion and name reuse"),
             left
         );
+        let resume_request = BranchCreateRequest {
+            operation_id: Uuid::new_v4(),
+            destination_id: Uuid::new_v4(),
+            destination_name: "resumed-child".to_string(),
+            source: resumable_source,
+            created_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: BranchRecord {
+                    id: resume_request.destination_id,
+                    revision: 1,
+                    name: resume_request.destination_name.clone(),
+                    state: BranchState::Creating,
+                    root: None,
+                    parent_id: Some(parent.id),
+                    origin_checkpoint_id: Some(resumable_record.id),
+                    created_at: now,
+                    updated_at: now,
+                },
+                operation: Box::new(BranchCreateOperation {
+                    id: resume_request.operation_id,
+                    revision: 1,
+                    destination_id: resume_request.destination_id,
+                    destination_name: resume_request.destination_name.clone(),
+                    source_checkpoint_id: resumable_record.id,
+                    source_root: resumable_record.root.clone(),
+                    parent_id: Some(parent.id),
+                    phase: BranchCreatePhase::Reserved,
+                    destination_root: None,
+                    created_at: now,
+                    updated_at: now,
+                }),
+            })
+            .await
+            .unwrap();
+        let resumed_root = root_store
+            .create_from_checkpoint(
+                resume_request.operation_id,
+                resume_request.destination_id,
+                &resume_request.source,
+            )
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::RecordBranchCreateRoot {
+                operation_id: resume_request.operation_id,
+                expected_revision: 1,
+                destination_root: resumed_root,
+                updated_at: catalog_timestamp(Utc::now()),
+            })
+            .await
+            .unwrap();
+        lifecycle
+            .deletions()
+            .delete_checkpoint(CheckpointDeleteRequest {
+                checkpoint_id: resumable_record.id,
+                expected_revision: resumable_record.revision,
+                name: resumable_record.name,
+            })
+            .await
+            .unwrap();
+        let resumed = lifecycle
+            .create_from_checkpoint(resume_request)
+            .await
+            .expect("root-created operation must resume after source deletion");
+        assert_eq!(resumed.state, BranchState::Ready);
+        root_store
+            .verify(resumed.root.as_ref().unwrap())
+            .await
+            .unwrap();
         let leases = lifecycle.leases();
         let lease_request = LeaseAcquireRequest {
             lease_id: Uuid::new_v4(),

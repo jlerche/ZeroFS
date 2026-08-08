@@ -122,8 +122,9 @@ These two descriptors are the single invariant-required storage proof for one
 clone, not customer projections or lifecycle authority. Their locations are
 derived from the destination root. The authoritative catalog operation in
 `reserved` phase owns the owner descriptor and conservatively roots the source
-plus destination namespace; in `root_created` phase it stores the exact
-`DurableRoot`, which must equal the immutable result descriptor. A live branch or
+plus destination namespace. Recording the exact authenticated `DurableRoot`
+atomically replaces that source hold because the destination is then
+independently pinned; `root_created` retains only the destination. A live branch or
 lease root likewise owns that derived proof. Only a catalog batch may make the
 branch `Ready`, and a descriptor without the matching catalog operation/live
 root cannot do so. Additional sequential step receipts remain prohibited.
@@ -162,12 +163,13 @@ checkpoint UUID and immutable manifest identity, and (for history) parent UUID.
 - The same operation ID with different inputs returns an operation conflict.
 - A different operation targeting a reserved UUID or live name returns an
   identity/name conflict.
-- The source checkpoint remains held as a GC root throughout `Creating`.
+- The source checkpoint remains held as a GC root until an independently pinned
+  destination root is recorded.
   Checkpoint deletion and this hold are serialized in one catalog mutation
   domain for that exact checkpoint/operation. After storage establishes the
-  destination root, the operation records that root as an additional incomplete
-  GC root. The `Ready` publication batch atomically converts it to the live
-  branch head and removes the source hold; there is no interval with neither.
+  destination root, one batch replaces the source hold with that incomplete
+  destination root. The `Ready` publication batch atomically converts it to the
+  live branch head; there is no interval with neither.
 - Publication is the transition to `Ready`, after destination-root durability.
   A response lost after publication is recovered by reading the operation and
   branch records; publication is not repeated with a different root.

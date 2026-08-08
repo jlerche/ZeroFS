@@ -30,6 +30,7 @@ const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
+const LEASE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -124,6 +125,7 @@ impl SlateDbCatalog {
             LEGACY_SCHEMA_VERSION,
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
+            LEASE_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -216,7 +218,7 @@ impl SlateDbCatalog {
             .await?;
         let expected_source_holds = branch_create_operations
             .iter()
-            .filter(|operation| operation.phase != BranchCreatePhase::Published)
+            .filter(|operation| operation.phase == BranchCreatePhase::Reserved)
             .map(|operation| branch_create_source_key(operation.source_checkpoint_id, operation.id))
             .collect::<BTreeSet<_>>();
         let mut source_hold_iterator = self.db.scan_prefix(BRANCH_CREATE_SOURCE_PREFIX, ..).await?;
@@ -600,6 +602,10 @@ impl SlateDbCatalog {
                     branch_create_operation_key(operation.id),
                     &operation,
                 )?;
+                batch.delete(branch_create_source_key(
+                    operation.source_checkpoint_id,
+                    operation.id,
+                ));
             }
             CatalogMutation::PublishBranchCreate {
                 operation_id,
@@ -662,10 +668,6 @@ impl SlateDbCatalog {
                     &operation,
                 )?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
-                batch.delete(branch_create_source_key(
-                    operation.source_checkpoint_id,
-                    operation.id,
-                ));
             }
             CatalogMutation::CreateBranch(record) => {
                 record.validate()?;
@@ -780,6 +782,7 @@ impl SlateDbCatalog {
                         parent_id: old.parent_id,
                         origin_checkpoint_id: old.origin_checkpoint_id,
                         created_at: old.created_at,
+                        deleted_revision: Some(old.revision),
                         deleted_generation: next_generation,
                         deleted_at,
                     },
@@ -895,6 +898,7 @@ impl SlateDbCatalog {
                         parent_id: Some(old.branch_id),
                         origin_checkpoint_id: None,
                         created_at: old.created_at,
+                        deleted_revision: Some(old.revision),
                         deleted_generation: next_generation,
                         deleted_at,
                     },
@@ -971,6 +975,11 @@ impl Catalog for SlateDbCatalog {
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         self.get_record(lease_key(id)).await
+    }
+
+    async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(tombstone_key(id)).await
     }
 
     async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
@@ -1330,7 +1339,19 @@ mod tests {
                 .unwrap()
                 .gc_roots()
                 .len(),
-            2
+            1
+        );
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::DeleteCheckpoint {
+                    id: source.id,
+                    expected_revision: source.revision,
+                    name: source.name.clone(),
+                    deleted_at: catalog_timestamp(Utc::now()),
+                })
+                .await
+                .unwrap(),
+            5
         );
         assert!(matches!(
             catalog
@@ -1353,8 +1374,8 @@ mod tests {
             expected_revision: 2,
             updated_at: published_at,
         };
-        assert_eq!(catalog.apply(publish.clone()).await.unwrap(), 5);
-        assert_eq!(catalog.apply(publish).await.unwrap(), 5);
+        assert_eq!(catalog.apply(publish.clone()).await.unwrap(), 6);
+        assert_eq!(catalog.apply(publish).await.unwrap(), 6);
         let snapshot = catalog.snapshot().await.unwrap();
         let ready = &snapshot.branches[&creating.id];
         assert_eq!(ready.state, BranchState::Ready);
@@ -1365,18 +1386,6 @@ mod tests {
         assert_eq!(completed.destination_root.as_ref(), Some(&destination_root));
         assert!(completed.gc_roots().is_empty());
 
-        assert_eq!(
-            catalog
-                .apply(CatalogMutation::DeleteCheckpoint {
-                    id: source.id,
-                    expected_revision: source.revision,
-                    name: source.name,
-                    deleted_at: catalog_timestamp(Utc::now()),
-                })
-                .await
-                .unwrap(),
-            6
-        );
         assert_eq!(
             catalog
                 .apply(CatalogMutation::PublishBranchCreate {
@@ -1851,10 +1860,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_and_v3_catalogs_to_lease_schema_without_rewriting_records() {
-        for prior_version in [PREVIOUS_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION] {
+    async fn migrates_v2_through_v4_catalogs_to_deletion_schema_without_rewriting_records() {
+        for prior_version in [
+            PREVIOUS_SCHEMA_VERSION,
+            OPERATION_SCHEMA_VERSION,
+            LEASE_SCHEMA_VERSION,
+        ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v4"));
+            let path = Path::from(format!("migration-v{prior_version}-v5"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await

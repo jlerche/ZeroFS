@@ -316,7 +316,7 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchCreateOperation, BranchRecord, BranchState, CatalogSnapshot, CheckpointRecord,
-        SlateDbCatalog,
+        SlateDbCatalog, TombstoneRecord,
     };
     use object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
@@ -358,6 +358,9 @@ mod tests {
         }
         async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
             self.inner.lease(id).await
+        }
+        async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError> {
+            self.inner.tombstone(id).await
         }
         async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
             let is_renewal = matches!(mutation, CatalogMutation::RenewLease { .. });

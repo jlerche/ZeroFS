@@ -317,6 +317,7 @@ mod tests {
                 parent_id: Some(historical_parent),
                 origin_checkpoint_id: None,
                 created_at: now,
+                deleted_revision: Some(1),
                 deleted_generation: 3,
                 deleted_at,
             },

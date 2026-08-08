@@ -171,15 +171,15 @@
 
 ### Epic 3.2: Delete checkpoints independently
 
-- [ ] Implement logical checkpoint deletion.
-  - [ ] Fence only branch creations that have not yet established independent durable roots.
-  - [ ] Do not block deletion because a ready branch records the checkpoint as historical provenance.
-  - [ ] Preserve ready descendant branches.
-- [ ] Add race tests.
-  - [ ] Delete while branch creation has not started cloning.
-  - [ ] Delete while clone storage exists but the branch is not yet published.
-  - [ ] Delete after the branch is ready.
-  - [ ] Retry after an ambiguous deletion response.
+- [x] Implement logical checkpoint deletion.
+  - [x] Fence only branch creations that have not yet established independent durable roots.
+  - [x] Do not block deletion because a ready branch records the checkpoint as historical provenance.
+  - [x] Preserve ready descendant branches.
+- [x] Add race tests.
+  - [x] Delete while branch creation has not started cloning.
+  - [x] Delete while clone storage exists but the branch is not yet published.
+  - [x] Delete after the branch is ready.
+  - [x] Retry after an ambiguous deletion response.
 
 ### Epic 3.3: Delete branches with descendants
 
@@ -378,7 +378,7 @@
 - Consistency contract: every successful mutation advances the root-snapshot generation, but unrelated writers do not compare-and-swap on that global value. Updates and deletes use per-record revisions and exact UUIDs, returning actionable revision conflicts without hidden retry loops.
 - Projection boundary: PostgreSQL/JSON contain only volume/resource UUIDs, kind, name, customer-visible state, lineage UUIDs, timestamps, observed generation, and customer metadata. They never contain durable roots or manifests and are never consulted for mounting or garbage collection.
 - Reconciliation: a projection consumes an authoritative generation-tagged SlateDB snapshot idempotently. Projection outages do not invalidate storage operations; a later reconciliation catches up while preserving customer-managed metadata.
-- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds bounded crash-resumable SlateDB migrations through the current v4 lease schema, and adds adversarial tests.
+- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds bounded crash-resumable SlateDB migrations through the current v5 deletion schema, and adds adversarial tests.
 
 ### 2026-08-08: semantics and research inventory
 
@@ -396,8 +396,8 @@
 
 ### 2026-08-08: authoritative branch-create publication
 
-- Catalog lifecycle: schema v3 adds independently keyed permanent create-operation records with only `reserved`, `root_created`, and `published` phases. Reserved operations root the exact source; root-created operations root source plus destination; published records enumerate no GC roots and remain only as operation-UUID/idempotency reservations.
-- Atomic boundaries: reservation creates the `Creating` branch, name index, operation, and exact source-hold index in one durable batch. Root recording adds the authenticated destination as an incomplete root. Publication re-authenticates storage, atomically changes the branch to `Ready`, retains the exact destination head, marks the operation published, and removes the source hold. Raw catalog mutations are crate-private so external callers cannot bypass the storage-verifying lifecycle coordinator; its factory rejects catalog/branch namespace overlap before storage I/O.
+- Catalog lifecycle: schema v3 adds independently keyed permanent create-operation records with only `reserved`, `root_created`, and `published` phases. Reserved operations root the exact source; root-created operations root only the independently pinned destination; published records enumerate no GC roots and remain only as operation-UUID/idempotency reservations.
+- Atomic boundaries: reservation creates the `Creating` branch, name index, operation, and exact source-hold index in one durable batch. Root recording atomically replaces the source hold with the authenticated destination as an incomplete root. Publication re-authenticates storage and atomically changes the branch to `Ready`, retains the exact destination head, and marks the operation published. Raw catalog mutations are crate-private so external callers cannot bypass the storage-verifying lifecycle coordinator; its factory rejects catalog/branch namespace overlap before storage I/O.
 - Retry and race proof: the safe name-based entry point resolves once to the catalog checkpoint UUID and encoded SlateDB checkpoint/manifest identity. Exact retries return the existing generation/result, changed immutable inputs or roots conflict, checkpoint deletion and reservation serialize under the exact source hold, snapshots fail closed if that derived hold index diverges from incomplete operations, completed retries do not require a deleted historical source, and generic mutations cannot create or rewrite `Creating` lifecycle state.
 - Projection boundary: create-operation phases, source holds, and both durable roots exist only in authoritative SlateDB. JSON and PostgreSQL continue to receive the same root-free branch/checkpoint/tombstone projection.
 
@@ -406,3 +406,9 @@
 - Lease authority: catalog schema v4 stores leases and permanent lease-UUID tombstones only in SlateDB. Each lease binds an exact subject kind/UUID/root, read/write mode, revision, issuance/renewal/expiry times, and SHA-256 renewal-token binding; PostgreSQL and JSON remain unchanged and root-free.
 - Acquisition and renewal: the public coordinator authenticates storage before an atomic exact-resource revision/root/state check and lease insertion. Name lookup is only the first locator and the request carries the stable subject UUID. Renewal requires the exact UUID, token, expected revision, unexpired lease, unchanged root, and still-mountable subject. The expected revision plus requested duration is the scoped idempotency key: exact retries reconcile an applied batch with a lost response, while timestamps and expiry can only move forward.
 - Expiry and GC: leases are bounded to five minutes. Release is exact and idempotent; crash cleanup expires only after the lease deadline plus 30 seconds of conservative clock skew. Live lease roots participate directly in generation-tagged root snapshots, survive logical subject deletion, and cannot be renewed after deletion or resurrected after expiry/tombstoning.
+
+### 2026-08-08: independent checkpoint deletion
+
+- Exact logical delete: the public deletion coordinator accepts the stable checkpoint UUID, expected revision, and historical name; server time supplies the deletion timestamp. One durable catalog batch removes the live name/root and writes the root-free tombstone with the consumed revision. Exact retries—including a lost success response after name reuse—must match the old UUID/name/revision tuple.
+- Narrow fence: deletion conflicts with the exact source-hold index only in `reserved`. Recording the authenticated independent destination root atomically removes that source hold, so a `root_created` operation retains only its destination and can resume/publicize after source deletion. Ready descendants and read leases retain independent roots and never block the logical deletion.
+- Race proof: tests cover delete-before-reservation serialization, deletion after destination storage exists but before publication, deletion after ready publication with the descendant still readable, checkpoint lease acquisition versus deletion, and response-loss/name-reuse reconciliation.
