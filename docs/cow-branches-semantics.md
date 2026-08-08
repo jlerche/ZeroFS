@@ -382,6 +382,68 @@ has released a segment. Metadata/tombstone GC continues independently; physical
 shared-pool deletion belongs exclusively to the authoritative catalog protocol
 until a future local-GC proof establishes exact private ownership.
 
+### Fast local GC proof
+
+Segment origin is not segment privacy. In particular, attaching a branch UUID
+to an object key proves which writer allocated it, but a later checkpoint or
+descendant may still reference it. Local deletion therefore requires one exact
+private-epoch capability, not an ancestry walk or an owner-shaped key.
+
+An epoch is eligible for local GC only while every condition below is proven:
+
+1. Its permanent pool reservation is authenticated by the volume key and binds
+   the epoch to the exact, never-reused branch UUID. Path, name, parent, and
+   mutable branch revision are not identity.
+2. Authoritative SlateDB contains the matching private-epoch record in
+   `sealed_private` state. Before that transition, the writer rotates away from
+   the epoch and holds the branch-local FrameLoc/reference-publication barrier
+   while it drains allocation, seal, replication, recovery, compaction, and
+   other reference publishers. Once sealed, no future local mutation may
+   publish a reference into that epoch. Pre-private-epoch reservations,
+   missing/corrupt records, inherited epochs, and conflicting identities are
+   always global-only.
+3. The collector holds an authoritative exclusion guard for that exact branch
+   UUID, sealed epoch, and bounded batch. Guard acquisition and epoch-state
+   validation are one atomic catalog transition. The guard is durable and does
+   not expire or permit revocation during the batch. While it exists,
+   clone-source capture, externally durable checkpoint publication, branch
+   deletion, and lease/recovery-root acquisition that could expose an older
+   view must conflict or wait until every attempted delete has confirmed its
+   outcome and progress is durable.
+4. No existing named/internal checkpoint or active lease/recovery root can
+   expose a segment the local database now considers dead. The conservative
+   implementation may pause local deletion for any such root. Unreadable or
+   changing local or catalog state retains data.
+5. Every candidate's segment ID carries the guarded epoch. The reclaimer may
+   inspect only the exact branch database for those candidates; inherited,
+   closed, shared, or otherwise ambiguous epochs remain for global GC.
+
+Before any operation can publish a root derived from the branch, it atomically
+changes every affected `open` or `sealed_private` epoch to `exposed` after
+excluding local collectors and before capturing the source root. `Exposed` is
+permanent. A writer rotates to a newly reserved/open epoch for later private
+allocations before sealing an old one, and it must never reopen or reuse the old
+epoch. If rotation and publisher drain cannot be completed, writes may continue
+only in global-only mode and local deletion stays disabled.
+
+The local collector checkpoints bounded progress and, for each object, holds
+the same branch-local FrameLoc/reference-publication barrier continuously from
+final local non-reference and guard validation through exact object-identity
+validation, delete, and confirmed absence. This closes the final-check/delete
+window even if a future publisher violates the sealed-epoch optimization.
+Releasing or losing either authority stops deletion.
+
+A crash leaves the durable batch guard in place. Recovery may resume the exact
+operation only after fencing the former database writer and proving all of its
+local publisher and object-store requests quiescent; it then reconciles each
+candidate by exact identity or confirmed absence. The guard cannot be expired,
+stolen, administratively cleared, or converted to `exposed` merely because it
+is old. If quiescence or ownership cannot be proven, root publication remains
+excluded and the objects are retained for repair. Global two-observation GC
+remains the sole collector for all other segments. This deliberately rejects
+the research design's structural "owner UUID" rule as a deletion proof:
+allocation ownership alone does not exclude descendant references.
+
 ### Streaming mark, inventory, quarantine, and delete
 
 All branches of one volume resolve `FrameLoc` segment IDs in one immutable,
