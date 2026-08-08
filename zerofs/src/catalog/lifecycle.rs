@@ -53,6 +53,10 @@ impl BranchLifecycle {
         super::DeletionLifecycle::new(Arc::clone(&self.catalog))
     }
 
+    pub fn root_captures(&self) -> super::RootCaptureLifecycle {
+        super::RootCaptureLifecycle::new(Arc::clone(&self.catalog), self.roots.clone())
+    }
+
     /// Resolve a checkpoint name once to its stable catalog UUID and exact
     /// SlateDB checkpoint/manifest identity, then use the same creation
     /// primitive as an already-resolved request.

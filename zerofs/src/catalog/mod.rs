@@ -6,6 +6,7 @@
 //! the same projection contract.
 
 mod deletion;
+mod gc;
 mod json;
 mod lease;
 mod lifecycle;
@@ -29,6 +30,7 @@ pub use deletion::{
     BranchDeleteRequest, BranchDeleteResult, CheckpointDeleteRequest, DeletionLifecycle,
     DeletionLifecycleError,
 };
+pub use gc::{RootCaptureLifecycle, RootCaptureLifecycleError};
 pub use json::JsonCatalogProjection;
 pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
@@ -41,7 +43,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 6;
+pub const CATALOG_SCHEMA_VERSION: u32 = 7;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -467,6 +469,121 @@ pub struct TombstoneRecord {
     pub deleted_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcRootKind {
+    Branch,
+    Checkpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcRootPin {
+    pub kind: GcRootKind,
+    pub root: DurableRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcRunPhase {
+    Captured,
+    Marking,
+    Quarantined,
+    Revalidating,
+    Completed,
+    Aborted,
+}
+
+impl GcRunPhase {
+    fn retains_roots(self) -> bool {
+        // Terminal transitions are intentionally unsupported in schema v7.
+        // Until a separately reviewed proof protocol lands, uncertainty keeps
+        // every persisted run pinned regardless of its decoded phase.
+        let _ = self;
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcRunRecord {
+    pub id: Uuid,
+    pub revision: u64,
+    pub catalog_generation: u64,
+    pub inventory_cutoff: DateTime<Utc>,
+    pub roots: Vec<GcRootPin>,
+    pub root_digest: String,
+    pub mark_shard_locations: Vec<String>,
+    pub phase: GcRunPhase,
+    pub quarantine_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl GcRunRecord {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "GC run")?;
+        validate_revision(self.revision, "GC run")?;
+        if self.revision != 1 || self.phase != GcRunPhase::Captured {
+            return Err(CatalogError::Invalid(
+                "GC schema v7 supports only revision-one captured runs".to_string(),
+            ));
+        }
+        validate_timestamp(self.inventory_cutoff, "GC inventory cutoff")?;
+        validate_timestamp(self.created_at, "GC run created_at")?;
+        validate_timestamp(self.updated_at, "GC run updated_at")?;
+        if self.updated_at < self.created_at || self.inventory_cutoff < self.created_at {
+            return Err(CatalogError::Invalid(
+                "GC run times cannot move backwards".to_string(),
+            ));
+        }
+        if self.root_digest.len() != 64
+            || !self
+                .root_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "GC root digest must be 64 hexadecimal bytes".to_string(),
+            ));
+        }
+        for pin in &self.roots {
+            validate_root(&pin.root)?;
+        }
+        let mut canonical_roots = self.roots.clone();
+        canonicalize_gc_root_pins(&mut canonical_roots);
+        if canonical_roots != self.roots {
+            return Err(CatalogError::Invalid(
+                "GC roots must be sorted and deduplicated".to_string(),
+            ));
+        }
+        if gc_root_digest(&self.roots)? != self.root_digest {
+            return Err(CatalogError::Invalid(
+                "GC root digest does not match its immutable root list".to_string(),
+            ));
+        }
+        for location in &self.mark_shard_locations {
+            if location.is_empty() || location.len() > MAX_ROOT_IDENTIFIER_BYTES {
+                return Err(CatalogError::Invalid(
+                    "GC mark-shard location is empty or oversized".to_string(),
+                ));
+            }
+        }
+        if let Some(quarantine_at) = self.quarantine_at {
+            validate_timestamp(quarantine_at, "GC quarantine timestamp")?;
+            if quarantine_at < self.created_at {
+                return Err(CatalogError::Invalid(
+                    "GC quarantine cannot precede run creation".to_string(),
+                ));
+            }
+        }
+        if !self.mark_shard_locations.is_empty() || self.quarantine_at.is_some() {
+            return Err(CatalogError::Invalid(
+                "a newly captured GC run cannot contain later-phase artifacts".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl TombstoneRecord {
     fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "tombstone")?;
@@ -508,6 +625,8 @@ pub struct CatalogSnapshot {
     #[serde(default)]
     pub branch_delete_operations: BTreeMap<Uuid, BranchDeleteOperation>,
     #[serde(default)]
+    pub gc_runs: BTreeMap<Uuid, GcRunRecord>,
+    #[serde(default)]
     pub leases: BTreeMap<Uuid, LeaseRecord>,
     #[serde(default)]
     pub lease_tombstones: BTreeMap<Uuid, LeaseTombstone>,
@@ -524,6 +643,7 @@ impl Default for CatalogSnapshot {
             checkpoints: BTreeMap::new(),
             branch_create_operations: BTreeMap::new(),
             branch_delete_operations: BTreeMap::new(),
+            gc_runs: BTreeMap::new(),
             leases: BTreeMap::new(),
             lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
@@ -555,6 +675,7 @@ impl CatalogSnapshot {
             |record| record.id,
             BranchDeleteOperation::validate,
         )?;
+        validate_records(&self.gc_runs, |record| record.id, GcRunRecord::validate)?;
         validate_records(&self.leases, |record| record.id, LeaseRecord::validate)?;
         validate_records(
             &self.lease_tombstones,
@@ -600,6 +721,11 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let gc_run_ids = self
+            .gc_runs
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let lease_ids = self
             .leases
             .keys()
@@ -631,6 +757,13 @@ impl CatalogSnapshot {
             || !delete_operation_ids.is_disjoint(&lease_ids)
             || !delete_operation_ids.is_disjoint(&lease_tombstone_ids)
             || !delete_operation_ids.is_disjoint(&tombstone_ids)
+            || !gc_run_ids.is_disjoint(&branch_ids)
+            || !gc_run_ids.is_disjoint(&checkpoint_ids)
+            || !gc_run_ids.is_disjoint(&operation_ids)
+            || !gc_run_ids.is_disjoint(&delete_operation_ids)
+            || !gc_run_ids.is_disjoint(&lease_ids)
+            || !gc_run_ids.is_disjoint(&lease_tombstone_ids)
+            || !gc_run_ids.is_disjoint(&tombstone_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -648,6 +781,20 @@ impl CatalogSnapshot {
         )?;
         validate_branch_create_relationships(self)?;
         validate_branch_delete_relationships(self)?;
+        for run in self.gc_runs.values() {
+            if run.catalog_generation > self.generation {
+                return Err(CatalogError::Corrupt(format!(
+                    "GC run {} captured future catalog generation {}",
+                    run.id, run.catalog_generation
+                )));
+            }
+            if gc_root_digest(&run.roots)? != run.root_digest {
+                return Err(CatalogError::Corrupt(format!(
+                    "GC run {} root digest does not match its immutable root list",
+                    run.id
+                )));
+            }
+        }
         for lease in self.leases.values() {
             let expected_kind = match lease.subject_kind {
                 LeaseSubjectKind::Branch => TombstoneKind::Branch,
@@ -692,8 +839,86 @@ impl CatalogSnapshot {
                 .map(|operation| &operation.root),
         );
         roots.extend(self.leases.values().map(|lease| &lease.root));
+        roots.extend(
+            self.gc_runs
+                .values()
+                .filter(|run| run.phase.retains_roots())
+                .flat_map(|run| run.roots.iter().map(|pin| &pin.root)),
+        );
         roots
     }
+
+    /// Stable, typed root list captured at this exact catalog generation.
+    pub fn gc_root_pins(&self) -> Vec<GcRootPin> {
+        let mut pins = Vec::new();
+        let mut push = |kind, root: &DurableRoot| {
+            let pin = GcRootPin {
+                kind,
+                root: root.clone(),
+            };
+            if !pins.contains(&pin) {
+                pins.push(pin);
+            }
+        };
+        for branch in self.branches.values() {
+            if let Some(root) = &branch.root {
+                push(GcRootKind::Branch, root);
+            }
+        }
+        for checkpoint in self.checkpoints.values() {
+            push(GcRootKind::Checkpoint, &checkpoint.root);
+        }
+        for operation in self.branch_create_operations.values() {
+            match operation.phase {
+                BranchCreatePhase::Reserved => push(GcRootKind::Checkpoint, &operation.source_root),
+                BranchCreatePhase::RootCreated => {
+                    if let Some(root) = &operation.destination_root {
+                        push(GcRootKind::Branch, root);
+                    }
+                }
+                BranchCreatePhase::Published => {}
+            }
+        }
+        for operation in self.branch_delete_operations.values() {
+            if operation.phase == BranchDeletePhase::Draining {
+                push(GcRootKind::Branch, &operation.root);
+            }
+        }
+        for lease in self.leases.values() {
+            let kind = match lease.subject_kind {
+                LeaseSubjectKind::Branch => GcRootKind::Branch,
+                LeaseSubjectKind::Checkpoint => GcRootKind::Checkpoint,
+            };
+            push(kind, &lease.root);
+        }
+        for run in self
+            .gc_runs
+            .values()
+            .filter(|run| run.phase.retains_roots())
+        {
+            for pin in &run.roots {
+                push(pin.kind, &pin.root);
+            }
+        }
+        canonicalize_gc_root_pins(&mut pins);
+        pins
+    }
+}
+
+fn canonicalize_gc_root_pins(pins: &mut Vec<GcRootPin>) {
+    pins.sort_by(|left, right| {
+        (
+            gc_root_kind_order(left.kind),
+            &left.root.identity,
+            &left.root.manifest_id,
+        )
+            .cmp(&(
+                gc_root_kind_order(right.kind),
+                &right.root.identity,
+                &right.root.manifest_id,
+            ))
+    });
+    pins.dedup();
 }
 
 #[derive(Debug, Clone)]
@@ -844,6 +1069,15 @@ pub(crate) trait Catalog: Send + Sync {
         &self,
         id: Uuid,
     ) -> Result<Option<BranchDeleteOperation>, CatalogError>;
+    async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError>;
+    /// Persist immutable root pins only if no root-affecting catalog mutation
+    /// occurred since capture. The pins duplicate roots present at that same
+    /// generation, so this bookkeeping write does not advance it.
+    async fn begin_gc_run(
+        &self,
+        expected_generation: u64,
+        run: GcRunRecord,
+    ) -> Result<(), CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
 
@@ -890,6 +1124,18 @@ fn validate_records<T>(
         validate(record)?;
     }
     Ok(())
+}
+
+fn gc_root_kind_order(kind: GcRootKind) -> u8 {
+    match kind {
+        GcRootKind::Branch => 0,
+        GcRootKind::Checkpoint => 1,
+    }
+}
+
+pub(crate) fn gc_root_digest(roots: &[GcRootPin]) -> Result<String, CatalogError> {
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(roots)?)))
 }
 
 fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {

@@ -2,7 +2,7 @@ use super::lease::LEASE_CLOCK_SKEW;
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
-    CatalogSnapshot, CheckpointRecord, LeaseAccessMode, LeaseRecord, LeaseSubjectKind,
+    CatalogSnapshot, CheckpointRecord, GcRunRecord, LeaseAccessMode, LeaseRecord, LeaseSubjectKind,
     LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
     validate_timestamp,
 };
@@ -26,6 +26,7 @@ const CHECKPOINT_NAME_PREFIX: &[u8] = b"catalog/checkpoint-name/";
 const TOMBSTONE_PREFIX: &[u8] = b"catalog/tombstone/";
 const BRANCH_CREATE_OPERATION_PREFIX: &[u8] = b"catalog/branch-create-operation/";
 const BRANCH_DELETE_OPERATION_PREFIX: &[u8] = b"catalog/branch-delete-operation/";
+const GC_RUN_PREFIX: &[u8] = b"catalog/gc-run/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
@@ -34,6 +35,7 @@ const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
 const LEASE_SCHEMA_VERSION: u32 = 4;
 const DELETION_SCHEMA_VERSION: u32 = 5;
+const BRANCH_DELETION_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -130,6 +132,7 @@ impl SlateDbCatalog {
             OPERATION_SCHEMA_VERSION,
             LEASE_SCHEMA_VERSION,
             DELETION_SCHEMA_VERSION,
+            BRANCH_DELETION_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -223,6 +226,7 @@ impl SlateDbCatalog {
         let branch_delete_operations = self
             .scan_records::<BranchDeleteOperation>(BRANCH_DELETE_OPERATION_PREFIX)
             .await?;
+        let gc_runs = self.scan_records::<GcRunRecord>(GC_RUN_PREFIX).await?;
         let expected_source_holds = branch_create_operations
             .iter()
             .filter(|operation| operation.phase == BranchCreatePhase::Reserved)
@@ -261,6 +265,10 @@ impl SlateDbCatalog {
                 .map(|record| (record.id, record))
                 .collect(),
             branch_delete_operations: branch_delete_operations
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            gc_runs: gc_runs
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -1087,6 +1095,44 @@ impl Catalog for SlateDbCatalog {
         self.get_record(branch_delete_operation_key(id)).await
     }
 
+    async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(gc_run_key(id)).await
+    }
+
+    async fn begin_gc_run(
+        &self,
+        expected_generation: u64,
+        run: GcRunRecord,
+    ) -> Result<(), CatalogError> {
+        let _guard = self.lock.lock().await;
+        run.validate()?;
+        ensure_initial_revision(run.revision)?;
+        if run.catalog_generation != expected_generation {
+            return Err(CatalogError::Invalid(
+                "GC run generation disagrees with its capture fence".to_string(),
+            ));
+        }
+        let state = self.state_unlocked().await?;
+        if let Some(existing) = self.get_record::<GcRunRecord>(gc_run_key(run.id)).await? {
+            if existing == run {
+                return Ok(());
+            }
+            return Err(CatalogError::OperationConflict(run.id.to_string()));
+        }
+        ensure_expected_revision(expected_generation, state.generation)?;
+        ensure_resource_id_available(self.db.as_ref(), run.id).await?;
+        self.db
+            .put_with_options(
+                gc_run_key(run.id),
+                serde_json::to_vec(&run)?,
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         self.get_record(lease_key(id)).await
@@ -1141,6 +1187,10 @@ fn branch_delete_operation_key(id: Uuid) -> Bytes {
     joined_key(BRANCH_DELETE_OPERATION_PREFIX, id.to_string().as_bytes())
 }
 
+fn gc_run_key(id: Uuid) -> Bytes {
+    joined_key(GC_RUN_PREFIX, id.to_string().as_bytes())
+}
+
 fn lease_key(id: Uuid) -> Bytes {
     joined_key(LEASE_PREFIX, id.to_string().as_bytes())
 }
@@ -1191,6 +1241,7 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         tombstone_key(id),
         branch_create_operation_key(id),
         branch_delete_operation_key(id),
+        gc_run_key(id),
         lease_key(id),
         lease_tombstone_key(id),
     ] {
@@ -1994,12 +2045,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v5_catalogs_to_branch_deletion_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v6_catalogs_to_gc_capture_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
             LEASE_SCHEMA_VERSION,
             DELETION_SCHEMA_VERSION,
+            BRANCH_DELETION_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let path = Path::from(format!("migration-v{prior_version}-v5"));

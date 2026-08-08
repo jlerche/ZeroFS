@@ -199,19 +199,19 @@
 
 ### Epic 4.1: Build a root-capture protocol
 
-- [ ] Begin each global GC run by reading catalog generation `G`.
-- [ ] Capture exact immutable root identities for all live branches, checkpoints, and leases.
-- [ ] Pin the captured roots for the duration of the run.
-- [ ] Record a physical-inventory cutoff so newer objects are never eligible in that run.
-- [ ] Persist a compact resumable run record.
-  - [ ] Run UUID.
-  - [ ] Catalog generation.
-  - [ ] Inventory cutoff.
-  - [ ] Captured root identities or a digest plus immutable root-list object.
-  - [ ] Mark-shard locations.
-  - [ ] Current phase.
-  - [ ] Quarantine timestamp.
-- [ ] Abort safely when a root cannot be opened, authenticated, or enumerated.
+- [x] Begin each global GC run by reading catalog generation `G`.
+- [x] Capture exact immutable root identities for all live branches, checkpoints, and leases.
+- [x] Pin the captured roots for the duration of the run.
+- [x] Record a physical-inventory cutoff so newer objects are never eligible in that run.
+- [x] Persist a compact resumable run record.
+  - [x] Run UUID.
+  - [x] Catalog generation.
+  - [x] Inventory cutoff.
+  - [x] Captured root identities or a digest plus immutable root-list object.
+  - [x] Mark-shard locations.
+  - [x] Current phase.
+  - [x] Quarantine timestamp.
+- [x] Abort safely when a root cannot be opened, authenticated, or enumerated.
 
 ### Epic 4.2: Stream the reachable set
 
@@ -419,3 +419,10 @@
 - Lease boundary: finalization conservatively waits for every authoritative writer-lease record on the deleted branch to be explicitly released or expired. Reader leases do not block and retain their exact roots independently; no lease can be acquired or renewed after the `Deleting` fence. A draining operation itself roots the branch until finalization, while a published operation retains metadata but contributes no GC root.
 - Descendant independence: deletion never traverses lineage. Ready descendant roots, live descendant leases, and reserved/root-created descendant operations remain authoritative in SlateDB and can continue through publication after an ancestor is tombstoned. Tombstones preserve only root-free lineage UUIDs for explanation and the identical PostgreSQL/JSON customer projection.
 - Race proof: tests delete parents and middle branches in deep lineages, delete parent/child pairs in both orders, retain mounted descendants, finish a reserved descendant after ancestor deletion, serialize concurrent exact deletion retries, drain an active writer, permit readers, reuse deleted names under new UUIDs, and prove stale retries return only the old incarnation's tombstone.
+
+### 2026-08-08: generation-fenced GC root capture
+
+- Capture boundary: catalog schema v7 stores compact GC run records in authoritative SlateDB only. A run binds its permanent UUID to catalog generation `G`, a server-recorded physical-inventory cutoff, a canonical typed and deduplicated root list, its SHA-256 digest, phase, future mark-shard locations, and quarantine timestamp. PostgreSQL/JSON projections remain identical and contain none of this storage authority.
+- Complete pins: capture includes ready/deleting branch roots, checkpoints, incomplete create-operation roots, leases, and roots retained by overlapping active GC runs. Captured run roots participate directly in every later authoritative root snapshot until that run reaches a terminal phase.
+- Fail-closed fence: the coordinator authenticates and enumerates every branch root and exact checkpoint root with bounded concurrency before persistence. The durable insert succeeds only if the catalog is still at `G`; any root failure or generation change leaves no partial run. Because each new pin duplicates a root already present at `G`, inserting the run record itself is generation-neutral, while exact retries reconcile by run UUID and immutable contents. Schema v7 accepts only revision-one `captured` runs and retains every stored run's roots; terminal phases cannot be persisted or release pins until a separately reviewed transition/proof protocol lands.
+- Executable proof: tests cover typed canonical root collection, durable generation-neutral empty capture and exact retry, mismatched-digest rejection before persistence, fabricated terminal-phase fail-closed retention, unreadable root failure with no run record, and a concurrent catalog mutation rejecting capture without partial pins. Schema migration now accepts every prior catalog through v6 before installing the v7 marker.

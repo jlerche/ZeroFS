@@ -349,6 +349,19 @@ mod tests {
         ) -> Result<Option<BranchDeleteOperation>, CatalogError> {
             self.inner.branch_delete_operation(id).await
         }
+        async fn gc_run(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<crate::catalog::GcRunRecord>, CatalogError> {
+            self.inner.gc_run(id).await
+        }
+        async fn begin_gc_run(
+            &self,
+            expected_generation: u64,
+            run: crate::catalog::GcRunRecord,
+        ) -> Result<(), CatalogError> {
+            self.inner.begin_gc_run(expected_generation, run).await
+        }
         async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
             self.inner.lease(id).await
         }
