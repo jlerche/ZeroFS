@@ -183,17 +183,17 @@
 
 ### Epic 3.3: Delete branches with descendants
 
-- [ ] Implement logical branch deletion without recursively deleting descendants.
-  - [ ] Tombstone the exact branch UUID.
-  - [ ] Preserve descendants' roots, mountability, and write behavior.
-  - [ ] Preserve enough historical metadata to explain lineage.
-  - [ ] Prevent stale requests from deleting a new branch that reused the old name.
-- [ ] Add descendant tests.
-  - [ ] Delete a parent with one child.
-  - [ ] Delete a middle branch in a deep lineage.
-  - [ ] Delete ancestors in different orders.
-  - [ ] Delete a branch while descendants are mounted or being created.
-  - [ ] Recreate a deleted branch name and verify identity isolation.
+- [x] Implement logical branch deletion without recursively deleting descendants.
+  - [x] Tombstone the exact branch UUID.
+  - [x] Preserve descendants' roots, mountability, and write behavior.
+  - [x] Preserve enough historical metadata to explain lineage.
+  - [x] Prevent stale requests from deleting a new branch that reused the old name.
+- [x] Add descendant tests.
+  - [x] Delete a parent with one child.
+  - [x] Delete a middle branch in a deep lineage.
+  - [x] Delete ancestors in different orders.
+  - [x] Delete a branch while descendants are mounted or being created.
+  - [x] Recreate a deleted branch name and verify identity isolation.
 
 ## Phase 4: Implement production garbage collection
 
@@ -412,3 +412,10 @@
 - Exact logical delete: the public deletion coordinator accepts the stable checkpoint UUID, expected revision, and historical name; server time supplies the deletion timestamp. One durable catalog batch removes the live name/root and writes the root-free tombstone with the consumed revision. Exact retries—including a lost success response after name reuse—must match the old UUID/name/revision tuple.
 - Narrow fence: deletion conflicts with the exact source-hold index only in `reserved`. Recording the authenticated independent destination root atomically removes that source hold, so a `root_created` operation retains only its destination and can resume/publicize after source deletion. Ready descendants and read leases retain independent roots and never block the logical deletion.
 - Race proof: tests cover delete-before-reservation serialization, deletion after destination storage exists but before publication, deletion after ready publication with the descendant still readable, checkpoint lease acquisition versus deletion, and response-loss/name-reuse reconciliation.
+
+### 2026-08-08: descendant-preserving branch deletion
+
+- Two-phase delete: catalog schema v6 adds a permanent, independently keyed branch-delete operation. Its first durable batch changes the exact branch UUID from `Ready` to `Deleting`, increments its revision, and removes only its name index, immediately fencing new mounts and writes without touching checkpoints or descendants. A second batch removes the live branch/root, writes a root-free historical tombstone bound to the operation UUID and consumed branch revision, and marks the operation published for exact crash retries.
+- Lease boundary: finalization conservatively waits for every authoritative writer-lease record on the deleted branch to be explicitly released or expired. Reader leases do not block and retain their exact roots independently; no lease can be acquired or renewed after the `Deleting` fence. A draining operation itself roots the branch until finalization, while a published operation retains metadata but contributes no GC root.
+- Descendant independence: deletion never traverses lineage. Ready descendant roots, live descendant leases, and reserved/root-created descendant operations remain authoritative in SlateDB and can continue through publication after an ancestor is tombstoned. Tombstones preserve only root-free lineage UUIDs for explanation and the identical PostgreSQL/JSON customer projection.
+- Race proof: tests delete parents and middle branches in deep lineages, delete parent/child pairs in both orders, retain mounted descendants, finish a reserved descendant after ancestor deletion, serialize concurrent exact deletion retries, drain an active writer, permit readers, reuse deleted names under new UUIDs, and prove stale retries return only the old incarnation's tombstone.

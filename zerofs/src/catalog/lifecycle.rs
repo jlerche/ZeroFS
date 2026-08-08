@@ -636,15 +636,20 @@ mod tests {
             duration: chrono::Duration::minutes(2),
         };
         let renewed_writer = leases.renew(writer_renewal.clone()).await.unwrap();
-        catalog
-            .apply(CatalogMutation::DeleteBranch {
-                id: left.id,
+        let deleting = BranchLifecycle::new(catalog.clone(), root_store.clone())
+            .deletions()
+            .delete_branch(crate::catalog::BranchDeleteRequest {
+                operation_id: Uuid::new_v4(),
+                branch_id: left.id,
                 expected_revision: left.revision,
                 name: left.name.clone(),
-                deleted_at: catalog_timestamp(Utc::now()),
             })
             .await
             .unwrap();
+        assert!(matches!(
+            deleting,
+            crate::catalog::BranchDeleteResult::Draining(_)
+        ));
         catalog
             .apply(CatalogMutation::CreateBranch(BranchRecord {
                 id: Uuid::new_v4(),

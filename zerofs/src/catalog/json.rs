@@ -318,6 +318,7 @@ mod tests {
                 origin_checkpoint_id: None,
                 created_at: now,
                 deleted_revision: Some(1),
+                deletion_operation_id: None,
                 deleted_generation: 3,
                 deleted_at,
             },

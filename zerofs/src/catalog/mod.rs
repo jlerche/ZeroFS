@@ -25,7 +25,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub use deletion::{CheckpointDeleteRequest, DeletionLifecycle, DeletionLifecycleError};
+pub use deletion::{
+    BranchDeleteRequest, BranchDeleteResult, CheckpointDeleteRequest, DeletionLifecycle,
+    DeletionLifecycleError,
+};
 pub use json::JsonCatalogProjection;
 pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
@@ -38,7 +41,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 5;
+pub const CATALOG_SCHEMA_VERSION: u32 = 6;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -324,6 +327,50 @@ pub struct BranchCreateOperation {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchDeletePhase {
+    Draining,
+    Published,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchDeleteOperation {
+    pub id: Uuid,
+    pub revision: u64,
+    pub branch_id: Uuid,
+    pub branch_name: String,
+    pub expected_branch_revision: u64,
+    pub root: DurableRoot,
+    pub parent_id: Option<Uuid>,
+    pub origin_checkpoint_id: Option<Uuid>,
+    pub phase: BranchDeletePhase,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl BranchDeleteOperation {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "branch delete operation")?;
+        validate_revision(self.revision, "branch delete operation")?;
+        validate_id(self.branch_id, "branch delete subject")?;
+        validate_name(&self.branch_name)?;
+        validate_revision(self.expected_branch_revision, "deleted branch")?;
+        validate_root(&self.root)?;
+        validate_optional_id(self.parent_id, "deleted branch parent")?;
+        validate_optional_id(
+            self.origin_checkpoint_id,
+            "deleted branch origin checkpoint",
+        )?;
+        if self.id == self.branch_id {
+            return Err(CatalogError::Invalid(
+                "branch and deletion operation UUIDs must differ".to_string(),
+            ));
+        }
+        validate_times(self.created_at, self.updated_at, "branch delete operation")
+    }
+}
+
 impl BranchCreateOperation {
     pub fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "branch create operation")?;
@@ -414,6 +461,8 @@ pub struct TombstoneRecord {
     /// tombstones may not carry this proof and cannot satisfy exact retries.
     #[serde(default)]
     pub deleted_revision: Option<u64>,
+    #[serde(default)]
+    pub deletion_operation_id: Option<Uuid>,
     pub deleted_generation: u64,
     pub deleted_at: DateTime<Utc>,
 }
@@ -429,6 +478,7 @@ impl TombstoneRecord {
                 "tombstone deleted revision cannot be zero".to_string(),
             ));
         }
+        validate_optional_id(self.deletion_operation_id, "tombstone deletion operation")?;
         validate_timestamp(self.created_at, "tombstone created_at")?;
         validate_timestamp(self.deleted_at, "tombstone deleted_at")?;
         if self.deleted_at < self.created_at {
@@ -456,6 +506,8 @@ pub struct CatalogSnapshot {
     #[serde(default)]
     pub branch_create_operations: BTreeMap<Uuid, BranchCreateOperation>,
     #[serde(default)]
+    pub branch_delete_operations: BTreeMap<Uuid, BranchDeleteOperation>,
+    #[serde(default)]
     pub leases: BTreeMap<Uuid, LeaseRecord>,
     #[serde(default)]
     pub lease_tombstones: BTreeMap<Uuid, LeaseTombstone>,
@@ -471,6 +523,7 @@ impl Default for CatalogSnapshot {
             branches: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             branch_create_operations: BTreeMap::new(),
+            branch_delete_operations: BTreeMap::new(),
             leases: BTreeMap::new(),
             lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
@@ -496,6 +549,11 @@ impl CatalogSnapshot {
             &self.branch_create_operations,
             |record| record.id,
             BranchCreateOperation::validate,
+        )?;
+        validate_records(
+            &self.branch_delete_operations,
+            |record| record.id,
+            BranchDeleteOperation::validate,
         )?;
         validate_records(&self.leases, |record| record.id, LeaseRecord::validate)?;
         validate_records(
@@ -537,6 +595,11 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let delete_operation_ids = self
+            .branch_delete_operations
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let lease_ids = self
             .leases
             .keys()
@@ -562,6 +625,12 @@ impl CatalogSnapshot {
             || !lease_tombstone_ids.is_disjoint(&operation_ids)
             || !lease_tombstone_ids.is_disjoint(&tombstone_ids)
             || !lease_tombstone_ids.is_disjoint(&lease_ids)
+            || !delete_operation_ids.is_disjoint(&branch_ids)
+            || !delete_operation_ids.is_disjoint(&checkpoint_ids)
+            || !delete_operation_ids.is_disjoint(&operation_ids)
+            || !delete_operation_ids.is_disjoint(&lease_ids)
+            || !delete_operation_ids.is_disjoint(&lease_tombstone_ids)
+            || !delete_operation_ids.is_disjoint(&tombstone_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -578,6 +647,7 @@ impl CatalogSnapshot {
             "checkpoint",
         )?;
         validate_branch_create_relationships(self)?;
+        validate_branch_delete_relationships(self)?;
         for lease in self.leases.values() {
             let expected_kind = match lease.subject_kind {
                 LeaseSubjectKind::Branch => TombstoneKind::Branch,
@@ -615,6 +685,12 @@ impl CatalogSnapshot {
                 .values()
                 .flat_map(BranchCreateOperation::gc_roots),
         );
+        roots.extend(
+            self.branch_delete_operations
+                .values()
+                .filter(|operation| operation.phase == BranchDeletePhase::Draining)
+                .map(|operation| &operation.root),
+        );
         roots.extend(self.leases.values().map(|lease| &lease.root));
         roots
     }
@@ -623,6 +699,14 @@ impl CatalogSnapshot {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
 pub(crate) enum CatalogMutation {
+    StartBranchDelete {
+        operation: BranchDeleteOperation,
+    },
+    FinalizeBranchDelete {
+        operation_id: Uuid,
+        expected_revision: u64,
+        deleted_at: DateTime<Utc>,
+    },
     AcquireLease {
         expected_subject_revision: u64,
         lease: LeaseRecord,
@@ -664,12 +748,6 @@ pub(crate) enum CatalogMutation {
     ReplaceBranch {
         expected_revision: u64,
         record: BranchRecord,
-    },
-    DeleteBranch {
-        id: Uuid,
-        expected_revision: u64,
-        name: String,
-        deleted_at: DateTime<Utc>,
     },
     CreateCheckpoint(CheckpointRecord),
     ReplaceCheckpoint {
@@ -720,6 +798,8 @@ pub struct CustomerCatalogRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("branch {0} still has an active writer lease")]
+    WriterLeaseActive(Uuid),
     #[error("branch operation conflicts with its immutable request or phase: {0}")]
     OperationConflict(String),
     #[error("catalog record revision conflict: expected {expected}, found {actual}")]
@@ -760,6 +840,10 @@ pub(crate) trait Catalog: Send + Sync {
         &self,
         id: Uuid,
     ) -> Result<Option<BranchCreateOperation>, CatalogError>;
+    async fn branch_delete_operation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<BranchDeleteOperation>, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
 
@@ -894,6 +978,86 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                     )));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_branch_delete_relationships(snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {
+    let mut subjects = std::collections::BTreeSet::new();
+    for operation in snapshot.branch_delete_operations.values() {
+        if !subjects.insert(operation.branch_id) {
+            return Err(CatalogError::Corrupt(format!(
+                "multiple delete operations target branch {}",
+                operation.branch_id
+            )));
+        }
+        match operation.phase {
+            BranchDeletePhase::Draining => {
+                let deleting_revision = operation
+                    .expected_branch_revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt("deleted branch revision overflow".to_string())
+                    })?;
+                let branch = snapshot.branches.get(&operation.branch_id).ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "draining delete operation {} has no branch",
+                        operation.id
+                    ))
+                })?;
+                if branch.state != BranchState::Deleting
+                    || branch.name != operation.branch_name
+                    || branch.root.as_ref() != Some(&operation.root)
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != operation.origin_checkpoint_id
+                    || branch.revision != deleting_revision
+                {
+                    return Err(CatalogError::Corrupt(format!(
+                        "draining delete operation {} disagrees with its branch",
+                        operation.id
+                    )));
+                }
+            }
+            BranchDeletePhase::Published => {
+                let tombstone = snapshot
+                    .tombstones
+                    .get(&operation.branch_id)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt(format!(
+                            "published delete operation {} has no tombstone",
+                            operation.id
+                        ))
+                    })?;
+                if tombstone.kind != TombstoneKind::Branch
+                    || tombstone.name != operation.branch_name
+                    || tombstone.parent_id != operation.parent_id
+                    || tombstone.origin_checkpoint_id != operation.origin_checkpoint_id
+                    || tombstone.deleted_revision != Some(operation.expected_branch_revision)
+                    || tombstone.deletion_operation_id != Some(operation.id)
+                    || tombstone.deleted_at != operation.updated_at
+                    || snapshot.branches.contains_key(&operation.branch_id)
+                {
+                    return Err(CatalogError::Corrupt(format!(
+                        "published delete operation {} disagrees with its tombstone",
+                        operation.id
+                    )));
+                }
+            }
+        }
+    }
+    for branch in snapshot
+        .branches
+        .values()
+        .filter(|branch| branch.state == BranchState::Deleting)
+    {
+        if !snapshot.branch_delete_operations.values().any(|operation| {
+            operation.branch_id == branch.id && operation.phase == BranchDeletePhase::Draining
+        }) {
+            return Err(CatalogError::Corrupt(format!(
+                "deleting branch {} has no draining delete operation",
+                branch.id
+            )));
         }
     }
     Ok(())
@@ -1124,6 +1288,7 @@ mod tests {
                 origin_checkpoint_id: None,
                 created_at,
                 deleted_revision: Some(1),
+                deletion_operation_id: None,
                 deleted_generation: 2,
                 deleted_at: created_at - chrono::Duration::microseconds(1),
             },

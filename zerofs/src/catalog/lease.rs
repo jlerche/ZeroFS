@@ -356,6 +356,12 @@ mod tests {
         ) -> Result<Option<BranchCreateOperation>, CatalogError> {
             self.inner.branch_create_operation(id).await
         }
+        async fn branch_delete_operation(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<crate::catalog::BranchDeleteOperation>, CatalogError> {
+            self.inner.branch_delete_operation(id).await
+        }
         async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
             self.inner.lease(id).await
         }

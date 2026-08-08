@@ -1,9 +1,10 @@
 use super::lease::LEASE_CLOCK_SKEW;
 use super::{
-    BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, CATALOG_SCHEMA_VERSION,
-    Catalog, CatalogError, CatalogMutation, CatalogSnapshot, CheckpointRecord, LeaseAccessMode,
-    LeaseRecord, LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name,
-    validate_root, validate_timestamp,
+    BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
+    BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
+    CatalogSnapshot, CheckpointRecord, LeaseAccessMode, LeaseRecord, LeaseSubjectKind,
+    LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
+    validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,6 +25,7 @@ const CHECKPOINT_PREFIX: &[u8] = b"catalog/checkpoint/";
 const CHECKPOINT_NAME_PREFIX: &[u8] = b"catalog/checkpoint-name/";
 const TOMBSTONE_PREFIX: &[u8] = b"catalog/tombstone/";
 const BRANCH_CREATE_OPERATION_PREFIX: &[u8] = b"catalog/branch-create-operation/";
+const BRANCH_DELETE_OPERATION_PREFIX: &[u8] = b"catalog/branch-delete-operation/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
@@ -31,6 +33,7 @@ const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
 const LEASE_SCHEMA_VERSION: u32 = 4;
+const DELETION_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -126,6 +129,7 @@ impl SlateDbCatalog {
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
             LEASE_SCHEMA_VERSION,
+            DELETION_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -216,6 +220,9 @@ impl SlateDbCatalog {
         let branch_create_operations = self
             .scan_records::<BranchCreateOperation>(BRANCH_CREATE_OPERATION_PREFIX)
             .await?;
+        let branch_delete_operations = self
+            .scan_records::<BranchDeleteOperation>(BRANCH_DELETE_OPERATION_PREFIX)
+            .await?;
         let expected_source_holds = branch_create_operations
             .iter()
             .filter(|operation| operation.phase == BranchCreatePhase::Reserved)
@@ -250,6 +257,10 @@ impl SlateDbCatalog {
                 .map(|record| (record.id, record))
                 .collect(),
             branch_create_operations: branch_create_operations
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            branch_delete_operations: branch_delete_operations
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -315,6 +326,146 @@ impl SlateDbCatalog {
         let mut batch = WriteBatch::new();
 
         match mutation {
+            CatalogMutation::StartBranchDelete { operation } => {
+                operation.validate()?;
+                ensure_initial_revision(operation.revision)?;
+                if operation.phase != BranchDeletePhase::Draining
+                    || operation.updated_at != operation.created_at
+                {
+                    return Err(CatalogError::Invalid(
+                        "new branch deletion must begin in draining phase".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .get_record::<BranchDeleteOperation>(branch_delete_operation_key(operation.id))
+                    .await?
+                {
+                    if branch_delete_inputs_equal(&existing, &operation) {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(operation.id.to_string()));
+                }
+                ensure_resource_id_available(self.db.as_ref(), operation.id).await?;
+                let mut branch = self
+                    .get_record::<BranchRecord>(branch_key(operation.branch_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation.branch_id.to_string()))?;
+                if branch.state != BranchState::Ready
+                    || branch.name != operation.branch_name
+                    || branch.root.as_ref() != Some(&operation.root)
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != operation.origin_checkpoint_id
+                {
+                    return Err(CatalogError::OperationConflict(operation.id.to_string()));
+                }
+                ensure_expected_revision(operation.expected_branch_revision, branch.revision)?;
+                if operation.created_at < branch.created_at
+                    || operation.created_at < branch.updated_at
+                {
+                    return Err(CatalogError::Invalid(
+                        "branch deletion time cannot move backwards".to_string(),
+                    ));
+                }
+                branch.revision = branch
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogError::Corrupt("branch revision overflow".to_string()))?;
+                branch.state = BranchState::Deleting;
+                branch.updated_at = operation.created_at;
+                batch.delete(branch_name_key(&branch.name));
+                put_json(&mut batch, branch_key(branch.id), &branch)?;
+                put_json(
+                    &mut batch,
+                    branch_delete_operation_key(operation.id),
+                    &operation,
+                )?;
+            }
+            CatalogMutation::FinalizeBranchDelete {
+                operation_id,
+                expected_revision,
+                deleted_at,
+            } => {
+                validate_timestamp(deleted_at, "branch deleted_at")?;
+                let mut operation = self
+                    .get_record::<BranchDeleteOperation>(branch_delete_operation_key(operation_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
+                if operation.phase == BranchDeletePhase::Published {
+                    if expected_revision.checked_add(1) == Some(operation.revision) {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::RevisionConflict {
+                        expected: expected_revision,
+                        actual: operation.revision,
+                    });
+                }
+                ensure_expected_revision(expected_revision, operation.revision)?;
+                if deleted_at < operation.updated_at {
+                    return Err(CatalogError::Invalid(
+                        "branch deletion time cannot move backwards".to_string(),
+                    ));
+                }
+                let branch = self
+                    .get_record::<BranchRecord>(branch_key(operation.branch_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation.branch_id.to_string()))?;
+                let deleting_revision = operation
+                    .expected_branch_revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt("deleted branch revision overflow".to_string())
+                    })?;
+                if branch.state != BranchState::Deleting
+                    || branch.name != operation.branch_name
+                    || branch.root.as_ref() != Some(&operation.root)
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != operation.origin_checkpoint_id
+                    || branch.revision != deleting_revision
+                {
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                let leases = self.scan_records::<LeaseRecord>(LEASE_PREFIX).await?;
+                if leases.iter().any(|lease| {
+                    lease.subject_kind == LeaseSubjectKind::Branch
+                        && lease.subject_id == operation.branch_id
+                        && lease.access_mode == LeaseAccessMode::Write
+                }) {
+                    return Err(CatalogError::WriterLeaseActive(operation.branch_id));
+                }
+                ensure_absent(
+                    self.db.as_ref(),
+                    tombstone_key(operation.branch_id),
+                    &operation.branch_id.to_string(),
+                )
+                .await?;
+                batch.delete(branch_key(operation.branch_id));
+                put_json(
+                    &mut batch,
+                    tombstone_key(operation.branch_id),
+                    &TombstoneRecord {
+                        id: operation.branch_id,
+                        kind: TombstoneKind::Branch,
+                        name: operation.branch_name.clone(),
+                        parent_id: operation.parent_id,
+                        origin_checkpoint_id: operation.origin_checkpoint_id,
+                        created_at: branch.created_at,
+                        deleted_revision: Some(operation.expected_branch_revision),
+                        deletion_operation_id: Some(operation.id),
+                        deleted_generation: next_generation,
+                        deleted_at,
+                    },
+                )?;
+                operation.revision = operation.revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("branch delete operation revision overflow".to_string())
+                })?;
+                operation.phase = BranchDeletePhase::Published;
+                operation.updated_at = deleted_at;
+                put_json(
+                    &mut batch,
+                    branch_delete_operation_key(operation.id),
+                    &operation,
+                )?;
+            }
             CatalogMutation::AcquireLease {
                 expected_subject_revision,
                 lease,
@@ -671,9 +822,9 @@ impl SlateDbCatalog {
             }
             CatalogMutation::CreateBranch(record) => {
                 record.validate()?;
-                if record.state == BranchState::Creating {
+                if record.state != BranchState::Ready {
                     return Err(CatalogError::Invalid(
-                        "creating branches must be reserved with an operation".to_string(),
+                        "only ready branches may use the general create mutation".to_string(),
                     ));
                 }
                 ensure_initial_revision(record.revision)?;
@@ -708,8 +859,8 @@ impl SlateDbCatalog {
                     .get_record::<BranchRecord>(branch_key(record.id))
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(record.id.to_string()))?;
-                if old.state == BranchState::Creating
-                    || record.state == BranchState::Creating
+                if old.state != BranchState::Ready
+                    || record.state != BranchState::Ready
                     || old.state != record.state
                     || old.parent_id != record.parent_id
                     || old.origin_checkpoint_id != record.origin_checkpoint_id
@@ -742,51 +893,6 @@ impl SlateDbCatalog {
                     batch.put(branch_name_key(&record.name), record.id.to_string());
                 }
                 put_json(&mut batch, branch_key(record.id), &record)?;
-            }
-            CatalogMutation::DeleteBranch {
-                id,
-                expected_revision,
-                name,
-                deleted_at,
-            } => {
-                validate_name(&name)?;
-                validate_timestamp(deleted_at, "branch deleted_at")?;
-                let old = self
-                    .get_record::<BranchRecord>(branch_key(id))
-                    .await?
-                    .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
-                if old.state == BranchState::Creating {
-                    return Err(CatalogError::OperationConflict(format!(
-                        "creating branch {id} must be aborted through its operation"
-                    )));
-                }
-                if old.name != name {
-                    return Err(CatalogError::NotFound(format!("{name} ({id})")));
-                }
-                ensure_expected_revision(expected_revision, old.revision)?;
-                if deleted_at < old.created_at {
-                    return Err(CatalogError::Invalid(
-                        "branch deletion cannot precede creation".to_string(),
-                    ));
-                }
-                ensure_absent(self.db.as_ref(), tombstone_key(id), &id.to_string()).await?;
-                batch.delete(branch_key(id));
-                batch.delete(branch_name_key(&name));
-                put_json(
-                    &mut batch,
-                    tombstone_key(id),
-                    &TombstoneRecord {
-                        id,
-                        kind: TombstoneKind::Branch,
-                        name,
-                        parent_id: old.parent_id,
-                        origin_checkpoint_id: old.origin_checkpoint_id,
-                        created_at: old.created_at,
-                        deleted_revision: Some(old.revision),
-                        deleted_generation: next_generation,
-                        deleted_at,
-                    },
-                )?;
             }
             CatalogMutation::CreateCheckpoint(record) => {
                 record.validate()?;
@@ -899,6 +1005,7 @@ impl SlateDbCatalog {
                         origin_checkpoint_id: None,
                         created_at: old.created_at,
                         deleted_revision: Some(old.revision),
+                        deletion_operation_id: None,
                         deleted_generation: next_generation,
                         deleted_at,
                     },
@@ -972,6 +1079,14 @@ impl Catalog for SlateDbCatalog {
         self.get_record(branch_create_operation_key(id)).await
     }
 
+    async fn branch_delete_operation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<BranchDeleteOperation>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(branch_delete_operation_key(id)).await
+    }
+
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         self.get_record(lease_key(id)).await
@@ -1020,6 +1135,10 @@ fn tombstone_key(id: Uuid) -> Bytes {
 
 fn branch_create_operation_key(id: Uuid) -> Bytes {
     joined_key(BRANCH_CREATE_OPERATION_PREFIX, id.to_string().as_bytes())
+}
+
+fn branch_delete_operation_key(id: Uuid) -> Bytes {
+    joined_key(BRANCH_DELETE_OPERATION_PREFIX, id.to_string().as_bytes())
 }
 
 fn lease_key(id: Uuid) -> Bytes {
@@ -1071,12 +1190,24 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         checkpoint_key(id),
         tombstone_key(id),
         branch_create_operation_key(id),
+        branch_delete_operation_key(id),
         lease_key(id),
         lease_tombstone_key(id),
     ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
     Ok(())
+}
+
+fn branch_delete_inputs_equal(left: &BranchDeleteOperation, right: &BranchDeleteOperation) -> bool {
+    left.id == right.id
+        && left.branch_id == right.branch_id
+        && left.branch_name == right.branch_name
+        && left.expected_branch_revision == right.expected_branch_revision
+        && left.root == right.root
+        && left.parent_id == right.parent_id
+        && left.origin_checkpoint_id == right.origin_checkpoint_id
+        && left.created_at == right.created_at
 }
 
 async fn has_any_key(db: &Db, prefix: &[u8]) -> Result<bool, CatalogError> {
@@ -1193,6 +1324,37 @@ mod tests {
         }
     }
 
+    async fn delete_branch(catalog: &SlateDbCatalog, branch: &BranchRecord) {
+        let now = catalog_timestamp(Utc::now());
+        let operation = BranchDeleteOperation {
+            id: Uuid::new_v4(),
+            revision: 1,
+            branch_id: branch.id,
+            branch_name: branch.name.clone(),
+            expected_branch_revision: branch.revision,
+            root: branch.root.clone().unwrap(),
+            parent_id: branch.parent_id,
+            origin_checkpoint_id: branch.origin_checkpoint_id,
+            phase: BranchDeletePhase::Draining,
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::StartBranchDelete {
+                operation: operation.clone(),
+            })
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::FinalizeBranchDelete {
+                operation_id: operation.id,
+                expected_revision: operation.revision,
+                deleted_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
     fn reserved_create(
         source: &CheckpointRecord,
         name: &str,
@@ -1242,23 +1404,11 @@ mod tests {
             Some(record.clone())
         );
 
-        let deleted_at = catalog_timestamp(Utc::now());
-        catalog
-            .apply(CatalogMutation::DeleteBranch {
-                id: record.id,
-                expected_revision: record.revision,
-                name: record.name,
-                deleted_at,
-            })
-            .await
-            .unwrap();
+        delete_branch(&catalog, &record).await;
         let snapshot = catalog.snapshot().await.unwrap();
-        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.generation, 3);
         assert!(snapshot.branches.is_empty());
-        assert_eq!(
-            snapshot.tombstones.get(&record.id).unwrap().deleted_at,
-            deleted_at
-        );
+        assert_eq!(snapshot.tombstones.get(&record.id).unwrap().name, "main");
         catalog.close().await.unwrap();
     }
 
@@ -1444,15 +1594,7 @@ mod tests {
                 Err(CatalogError::OperationConflict(_))
             ));
         }
-        catalog
-            .apply(CatalogMutation::DeleteBranch {
-                id: branch.id,
-                expected_revision: branch.revision,
-                name: branch.name,
-                deleted_at: issued_at,
-            })
-            .await
-            .unwrap();
+        delete_branch(&catalog, &branch).await;
         let snapshot = catalog.snapshot().await.unwrap();
         assert!(!snapshot.branches.contains_key(&branch.id));
         assert!(snapshot.gc_roots().contains(&&lease.root));
@@ -1484,8 +1626,8 @@ mod tests {
             expected_revision: lease.revision,
             observed_at: lease.expires_at + LEASE_CLOCK_SKEW,
         };
-        assert_eq!(catalog.apply(expire.clone()).await.unwrap(), 4);
-        assert_eq!(catalog.apply(expire).await.unwrap(), 4);
+        assert_eq!(catalog.apply(expire.clone()).await.unwrap(), 5);
+        assert_eq!(catalog.apply(expire).await.unwrap(), 5);
         let snapshot = catalog.snapshot().await.unwrap();
         assert!(!snapshot.leases.contains_key(&lease.id));
         assert!(snapshot.lease_tombstones.contains_key(&lease.id));
@@ -1689,15 +1831,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(collision, CatalogError::AlreadyExists(_)));
 
-        catalog
-            .apply(CatalogMutation::DeleteBranch {
-                id: first.id,
-                expected_revision: first.revision,
-                name: first.name,
-                deleted_at: catalog_timestamp(Utc::now()),
-            })
-            .await
-            .unwrap();
+        delete_branch(&catalog, &first).await;
         let reused = catalog
             .apply(CatalogMutation::CreateBranch(BranchRecord {
                 id: first.id,
@@ -1860,11 +1994,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v4_catalogs_to_deletion_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v5_catalogs_to_branch_deletion_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
             LEASE_SCHEMA_VERSION,
+            DELETION_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let path = Path::from(format!("migration-v{prior_version}-v5"));

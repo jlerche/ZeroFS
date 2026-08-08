@@ -84,6 +84,7 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
             origin_checkpoint_id: None,
             created_at: now,
             deleted_revision: Some(1),
+            deletion_operation_id: None,
             deleted_generation: 3,
             deleted_at,
         },
