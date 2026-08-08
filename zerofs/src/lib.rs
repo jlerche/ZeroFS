@@ -1,4 +1,5 @@
 pub mod block_transformer;
+pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod dedup;
