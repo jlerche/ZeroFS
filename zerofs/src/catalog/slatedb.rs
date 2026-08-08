@@ -2,12 +2,13 @@ use super::lease::LEASE_CLOCK_SKEW;
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
-    CatalogSnapshot, CheckpointRecord, GcRunRecord, LeaseAccessMode, LeaseRecord, LeaseSubjectKind,
-    LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
-    validate_timestamp,
+    CatalogSnapshot, CheckpointRecord, GcMarkShard, GcMarkStats, GcRunPhase, GcRunRecord,
+    LeaseAccessMode, LeaseRecord, LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord,
+    validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
 use serde::{Serialize, de::DeserializeOwned};
 use slatedb::config::WriteOptions;
@@ -36,6 +37,7 @@ const OPERATION_SCHEMA_VERSION: u32 = 3;
 const LEASE_SCHEMA_VERSION: u32 = 4;
 const DELETION_SCHEMA_VERSION: u32 = 5;
 const BRANCH_DELETION_SCHEMA_VERSION: u32 = 6;
+const GC_CAPTURE_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -133,6 +135,7 @@ impl SlateDbCatalog {
             LEASE_SCHEMA_VERSION,
             DELETION_SCHEMA_VERSION,
             BRANCH_DELETION_SCHEMA_VERSION,
+            GC_CAPTURE_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -1133,6 +1136,57 @@ impl Catalog for SlateDbCatalog {
         Ok(())
     }
 
+    async fn publish_gc_marks(
+        &self,
+        id: Uuid,
+        expected_revision: u64,
+        root_digest: String,
+        mark_shards: Vec<GcMarkShard>,
+        mark_stats: GcMarkStats,
+        updated_at: DateTime<Utc>,
+    ) -> Result<GcRunRecord, CatalogError> {
+        let _guard = self.lock.lock().await;
+        validate_timestamp(updated_at, "GC marking updated_at")?;
+        let mut run = self
+            .get_record::<GcRunRecord>(gc_run_key(id))
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        if run.phase == GcRunPhase::Marking {
+            if run.root_digest == root_digest
+                && run.mark_shards == mark_shards
+                && run.mark_stats.as_ref() == Some(&mark_stats)
+            {
+                return Ok(run);
+            }
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        ensure_expected_revision(expected_revision, run.revision)?;
+        if run.phase != GcRunPhase::Captured
+            || run.root_digest != root_digest
+            || updated_at < run.updated_at
+        {
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        run.revision = run
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::Corrupt("GC run revision overflow".to_string()))?;
+        run.phase = GcRunPhase::Marking;
+        run.mark_shards = mark_shards;
+        run.mark_stats = Some(mark_stats);
+        run.updated_at = updated_at;
+        run.validate()?;
+        self.db
+            .put_with_options(
+                gc_run_key(run.id),
+                serde_json::to_vec(&run)?,
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await?;
+        Ok(run)
+    }
+
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         self.get_record(lease_key(id)).await
@@ -2045,13 +2099,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v6_catalogs_to_gc_capture_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v7_catalogs_to_gc_mark_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
             LEASE_SCHEMA_VERSION,
             DELETION_SCHEMA_VERSION,
             BRANCH_DELETION_SCHEMA_VERSION,
+            GC_CAPTURE_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let path = Path::from(format!("migration-v{prior_version}-v5"));

@@ -2,10 +2,10 @@ use super::{DurableRoot, MAX_ROOT_IDENTIFIER_BYTES, validate_root};
 use futures::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use slatedb::PathResolver;
 use slatedb::admin::{Admin, AdminBuilder, CloneSourceSpec};
 use slatedb::config::CheckpointOptions;
 use slatedb::object_store::path::Path;
+use slatedb::{DbReader, DbReaderMode, PathResolver};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -97,6 +97,26 @@ impl SlateDbRootStore {
     pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self {
         self.wal_object_store = Some(wal_object_store);
         self
+    }
+
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.object_store)
+    }
+
+    /// Open the immutable checkpoint encoded by an already-authenticated root.
+    pub(crate) async fn checkpoint_reader(
+        &self,
+        root: &DurableRoot,
+    ) -> Result<DbReader, RootStoreError> {
+        let checkpoint = ImmutableCheckpoint::from_durable_root(root)?;
+        let mut builder =
+            DbReader::builder(checkpoint.database_path, Arc::clone(&self.object_store))
+                .with_reader_mode(DbReaderMode::Checkpoint(checkpoint.checkpoint_id))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
+        if let Some(wal_object_store) = &self.wal_object_store {
+            builder = builder.with_wal_object_store(Arc::clone(wal_object_store));
+        }
+        Ok(builder.build().await?)
     }
 
     /// Authenticate an ordinary named checkpoint before exposing a read lease.

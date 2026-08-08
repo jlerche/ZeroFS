@@ -375,6 +375,26 @@ mod tests {
         ) -> Result<(), CatalogError> {
             self.inner.begin_gc_run(expected_generation, run).await
         }
+        async fn publish_gc_marks(
+            &self,
+            id: Uuid,
+            expected_revision: u64,
+            root_digest: String,
+            mark_shards: Vec<crate::catalog::GcMarkShard>,
+            mark_stats: crate::catalog::GcMarkStats,
+            updated_at: chrono::DateTime<Utc>,
+        ) -> Result<crate::catalog::GcRunRecord, CatalogError> {
+            self.inner
+                .publish_gc_marks(
+                    id,
+                    expected_revision,
+                    root_digest,
+                    mark_shards,
+                    mark_stats,
+                    updated_at,
+                )
+                .await
+        }
         async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
             self.inner.lease(id).await
         }

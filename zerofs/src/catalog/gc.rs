@@ -1,3 +1,4 @@
+use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
     Catalog, CatalogError, GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint,
     RootStoreError, SlateDbRootStore, catalog_timestamp, gc_root_digest,
@@ -67,7 +68,8 @@ impl RootCaptureLifecycle {
             inventory_cutoff,
             root_digest: gc_root_digest(&pins)?,
             roots: pins,
-            mark_shard_locations: Vec::new(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             created_at: inventory_cutoff,
@@ -88,6 +90,70 @@ impl RootCaptureLifecycle {
         }
         Ok(run)
     }
+
+    /// Stream every captured checkpoint's extent pointers into bounded sorted
+    /// runs, merge/deduplicate them, and publish 256 independently verifiable
+    /// mark shards atomically in the authoritative run record.
+    pub async fn mark(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        let store = GcMarkStore::new(self.roots.clone());
+        if run.phase == GcRunPhase::Marking {
+            let digest = decode_digest(&run.root_digest)?;
+            store.verify_all(run.id, digest, &run.mark_shards).await?;
+            return Ok(run);
+        }
+        if run.phase != GcRunPhase::Captured || run.revision != 1 {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let build = store.build(&run).await?;
+        let mark_shards = build.shards;
+        let mark_stats = build.stats;
+        let published = self
+            .catalog
+            .publish_gc_marks(
+                run.id,
+                run.revision,
+                run.root_digest.clone(),
+                mark_shards.clone(),
+                mark_stats.clone(),
+                catalog_timestamp(Utc::now()),
+            )
+            .await;
+        match published {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                if let Some(existing) = self.catalog.gc_run(run_id).await?
+                    && existing.phase == GcRunPhase::Marking
+                    && existing.root_digest == run.root_digest
+                    && existing.mark_shards == mark_shards
+                    && existing.mark_stats.as_ref() == Some(&mark_stats)
+                {
+                    let digest = decode_digest(&existing.root_digest)?;
+                    store
+                        .verify_all(existing.id, digest, &existing.mark_shards)
+                        .await?;
+                    return Ok(existing);
+                }
+                Err(error.into())
+            }
+        }
+    }
+}
+
+fn decode_digest(value: &str) -> Result<[u8; 32], RootCaptureLifecycleError> {
+    if value.len() != 64 {
+        return Err(CatalogError::Corrupt("invalid GC root digest".to_string()).into());
+    }
+    let mut output = [0u8; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| CatalogError::Corrupt("invalid GC root digest".to_string()))?;
+    }
+    Ok(output)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +162,14 @@ pub enum RootCaptureLifecycleError {
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     RootStore(#[from] RootStoreError),
+    #[error("GC marking failed: {0}")]
+    Mark(String),
+}
+
+impl From<GcMarkError> for RootCaptureLifecycleError {
+    fn from(error: GcMarkError) -> Self {
+        Self::Mark(error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -105,9 +179,13 @@ mod tests {
         BranchRecord, BranchState, CatalogMutation, CatalogSnapshot, CheckpointRecord, DurableRoot,
         GcRootPin, LeaseAccessMode, LeaseRecord, LeaseSubjectKind, SlateDbCatalog,
     };
-    use object_store::ObjectStore;
+    use crate::fs::key_codec::KeyCodec;
+    use crate::segment::{FrameLoc, Segid};
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use slatedb::config::{CheckpointOptions, CheckpointScope};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
+    use slatedb::{Db, WriteBatch};
 
     #[test]
     fn root_list_is_typed_canonical_and_deduplicated() {
@@ -198,7 +276,8 @@ mod tests {
             inventory_cutoff: now,
             root_digest: gc_root_digest(&pins).unwrap(),
             roots: pins,
-            mark_shard_locations: Vec::new(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
             phase: GcRunPhase::Completed,
             quarantine_at: None,
             created_at: now,
@@ -316,7 +395,8 @@ mod tests {
             inventory_cutoff: now,
             root_digest: gc_root_digest(&pins).unwrap(),
             roots: pins,
-            mark_shard_locations: Vec::new(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             created_at: now,
@@ -330,6 +410,120 @@ mod tests {
             })
         ));
         assert!(catalog.gc_run(id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn marking_streams_exact_checkpoint_and_publishes_verified_shards() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let data_path = Path::from("gc-mark-data");
+        let db = Db::builder(data_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let codec = KeyCodec::new();
+        let mut batch = WriteBatch::new();
+        for index in 0..9_000u64 {
+            let segment = Segid::new(7, index % 1_000);
+            batch.put(
+                codec.extent_key(1, index),
+                FrameLoc {
+                    segid: segment,
+                    frame_index: 0,
+                    byte_offset: 0,
+                    byte_len: 1,
+                }
+                .encode(),
+            );
+        }
+        db.write(batch).await.unwrap();
+        db.flush().await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.put(
+            codec.extent_key(2, 0),
+            FrameLoc {
+                segid: Segid::new(99, 99_999),
+                frame_index: 0,
+                byte_offset: 0,
+                byte_len: 1,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        let root = ImmutableCheckpoint {
+            database_path: data_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        }
+        .durable_root();
+        let pins = vec![crate::catalog::GcRootPin {
+            kind: GcRootKind::Checkpoint,
+            root,
+        }];
+        let now = catalog_timestamp(Utc::now());
+        let run = GcRunRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            catalog_generation: 0,
+            inventory_cutoff: now,
+            root_digest: gc_root_digest(&pins).unwrap(),
+            roots: pins,
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            phase: GcRunPhase::Captured,
+            quarantine_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-mark-catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        catalog.begin_gc_run(0, run.clone()).await.unwrap();
+        let artifact_store = Arc::clone(&store);
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, Path::from("gc-mark-branches")),
+        );
+        let marked = lifecycle.mark(run.id).await.unwrap();
+        assert_eq!(marked.phase, GcRunPhase::Marking);
+        assert_eq!(marked.revision, 2);
+        assert_eq!(marked.mark_shards.len(), 256);
+        assert_eq!(
+            marked
+                .mark_shards
+                .iter()
+                .map(|shard| shard.segment_count)
+                .sum::<u64>(),
+            1_000
+        );
+        let stats = marked.mark_stats.as_ref().unwrap();
+        assert_eq!(stats.roots_enumerated, 1);
+        assert_eq!(stats.references_enumerated, 9_000);
+        assert_eq!(stats.intermediate_runs, 512);
+        assert_eq!(stats.unique_segments, 1_000);
+        assert_eq!(lifecycle.mark(run.id).await.unwrap(), marked);
+        assert_eq!(catalog.snapshot().await.unwrap().generation, 0);
+        artifact_store
+            .put(
+                &Path::from(marked.mark_shards[0].location.clone()),
+                bytes::Bytes::from_static(b"corrupt").into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle.mark(run.id).await,
+            Err(RootCaptureLifecycleError::Mark(_))
+        ));
         catalog.close().await.unwrap();
     }
 }

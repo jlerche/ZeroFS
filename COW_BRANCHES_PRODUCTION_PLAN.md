@@ -215,17 +215,17 @@
 
 ### Epic 4.2: Stream the reachable set
 
-- [ ] Enumerate segment references from each pinned root exactly once per run.
-- [ ] Avoid `candidate count × branch count × checkpoint count` point-read behavior.
-- [ ] Emit reachable segment IDs into bounded sorted runs.
-  - [ ] Partition runs by a stable segment-ID prefix.
-  - [ ] Bound memory independently of total live storage.
-  - [ ] Persist checksums and run metadata.
-- [ ] Merge and deduplicate sorted runs into authoritative mark shards.
-  - [ ] Make every shard independently verifiable.
-  - [ ] Treat missing or corrupt shards as a failed run.
-  - [ ] Permit Bloom filters only as performance hints, never as deletion authority.
-- [ ] Measure work proportional to reachable references rather than repeated remote view probes.
+- [x] Enumerate segment references from each pinned root exactly once per run.
+- [x] Avoid `candidate count × branch count × checkpoint count` point-read behavior.
+- [x] Emit reachable segment IDs into bounded sorted runs.
+  - [x] Partition runs by a stable segment-ID prefix.
+  - [x] Bound memory independently of total live storage.
+  - [x] Persist checksums and run metadata.
+- [x] Merge and deduplicate sorted runs into authoritative mark shards.
+  - [x] Make every shard independently verifiable.
+  - [x] Treat missing or corrupt shards as a failed run.
+  - [x] Permit Bloom filters only as performance hints, never as deletion authority.
+- [x] Measure work proportional to reachable references rather than repeated remote view probes.
 
 ### Epic 4.3: Inventory and quarantine unreachable objects
 
@@ -426,3 +426,11 @@
 - Complete pins: capture includes ready/deleting branch roots, checkpoints, incomplete create-operation roots, leases, and roots retained by overlapping active GC runs. Captured run roots participate directly in every later authoritative root snapshot until that run reaches a terminal phase.
 - Fail-closed fence: the coordinator authenticates and enumerates every branch root and exact checkpoint root with bounded concurrency before persistence. The durable insert succeeds only if the catalog is still at `G`; any root failure or generation change leaves no partial run. Because each new pin duplicates a root already present at `G`, inserting the run record itself is generation-neutral, while exact retries reconcile by run UUID and immutable contents. Schema v7 accepts only revision-one `captured` runs and retains every stored run's roots; terminal phases cannot be persisted or release pins until a separately reviewed transition/proof protocol lands.
 - Executable proof: tests cover typed canonical root collection, durable generation-neutral empty capture and exact retry, mismatched-digest rejection before persistence, fabricated terminal-phase fail-closed retention, unreadable root failure with no run record, and a concurrent catalog mutation rejecting capture without partial pins. Schema migration now accepts every prior catalog through v6 before installing the v7 marker.
+
+### 2026-08-08: streaming authoritative GC marks
+
+- Exact enumeration: each captured durable root is opened through SlateDB's exact checkpoint reader and its extent keyspace is scanned once. Extent values decode directly to segment IDs; malformed values, unreadable roots, and missing checkpoint state fail the run without publishing mark authority. Later writes outside the captured checkpoint are excluded by construction.
+- Bounded marking: references accumulate in an 8,192-entry global buffer, partitioned by the low byte of the stable segment counter. Every flush sorts and deduplicates each nonempty partition into a deterministic intermediate object. Per-shard online binary-carry merges retain only logarithmically many object paths, and every merge uses at most two bounded readers and one bounded writer; segment data memory stays fixed independently of live storage and work is driven by captured references instead of candidate-by-root probes.
+- Verifiable authority: schema v8 publishes exactly 256 ordered final shards in the authoritative SlateDB run record. Each binary shard binds its format version, run UUID, root digest, shard number, sorted segment records, record count, and SHA-256 checksum. The coordinator verifies every final shard before the atomic `captured` to `marking` transition and re-verifies published shards on retries; missing, truncated, corrupt, reordered, duplicated, or descriptor-mismatched data fails closed. Bloom filters are not deletion authority.
+- Work accounting: the run persists root, reference, intermediate-run, and unique-segment counts. Validation ties those statistics to the immutable root list and final shard descriptors, while PostgreSQL and JSON remain identical root-free customer projections.
+- Executable proof: the focused test scans 9,000 checkpoint references through two bounded flushes, deduplicates them to 1,000 segments across 256 independently verifiable shards, excludes a post-checkpoint segment, preserves the catalog generation during mark publication, reconciles an exact retry, and rejects a subsequently corrupted authoritative shard. A million-flush stress test proves resident spill-path handles equal the binary population count and never exceed the logarithmic bound.

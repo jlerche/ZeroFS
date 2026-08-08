@@ -7,6 +7,7 @@
 
 mod deletion;
 mod gc;
+mod gc_mark;
 mod json;
 mod lease;
 mod lifecycle;
@@ -43,7 +44,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 7;
+pub const CATALOG_SCHEMA_VERSION: u32 = 8;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -511,21 +512,51 @@ pub struct GcRunRecord {
     pub inventory_cutoff: DateTime<Utc>,
     pub roots: Vec<GcRootPin>,
     pub root_digest: String,
-    pub mark_shard_locations: Vec<String>,
+    #[serde(default)]
+    pub mark_shards: Vec<GcMarkShard>,
+    #[serde(default)]
+    pub mark_stats: Option<GcMarkStats>,
     pub phase: GcRunPhase,
     pub quarantine_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcMarkShard {
+    pub shard: u8,
+    pub location: String,
+    pub checksum: String,
+    pub segment_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcMarkStats {
+    pub roots_enumerated: u64,
+    pub references_enumerated: u64,
+    pub intermediate_runs: u64,
+    pub unique_segments: u64,
+}
+
 impl GcRunRecord {
     pub fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "GC run")?;
         validate_revision(self.revision, "GC run")?;
-        if self.revision != 1 || self.phase != GcRunPhase::Captured {
-            return Err(CatalogError::Invalid(
-                "GC schema v7 supports only revision-one captured runs".to_string(),
-            ));
+        match self.phase {
+            GcRunPhase::Captured
+                if self.revision == 1
+                    && self.mark_shards.is_empty()
+                    && self.mark_stats.is_none() => {}
+            GcRunPhase::Marking
+                if self.revision == 2
+                    && self.mark_shards.len() == 256
+                    && self.mark_stats.is_some() => {}
+            _ => {
+                return Err(CatalogError::Invalid(
+                    "GC schema v8 supports only captured revision one or marking revision two"
+                        .to_string(),
+                ));
+            }
         }
         validate_timestamp(self.inventory_cutoff, "GC inventory cutoff")?;
         validate_timestamp(self.created_at, "GC run created_at")?;
@@ -560,10 +591,31 @@ impl GcRunRecord {
                 "GC root digest does not match its immutable root list".to_string(),
             ));
         }
-        for location in &self.mark_shard_locations {
-            if location.is_empty() || location.len() > MAX_ROOT_IDENTIFIER_BYTES {
+        for (expected_shard, shard) in (0u8..=u8::MAX).zip(&self.mark_shards) {
+            if shard.shard != expected_shard
+                || shard.location.is_empty()
+                || shard.location.len() > MAX_ROOT_IDENTIFIER_BYTES
+                || shard.checksum.len() != 64
+                || !shard.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
                 return Err(CatalogError::Invalid(
-                    "GC mark-shard location is empty or oversized".to_string(),
+                    "GC mark shards must be complete, ordered, bounded, and checksummed"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(stats) = &self.mark_stats {
+            let unique_segments = self.mark_shards.iter().try_fold(0u64, |total, shard| {
+                total.checked_add(shard.segment_count).ok_or_else(|| {
+                    CatalogError::Invalid("GC unique-segment count overflow".to_string())
+                })
+            })?;
+            if stats.roots_enumerated != self.roots.len() as u64
+                || stats.unique_segments != unique_segments
+                || stats.unique_segments > stats.references_enumerated
+            {
+                return Err(CatalogError::Invalid(
+                    "GC mark statistics disagree with roots or shards".to_string(),
                 ));
             }
         }
@@ -575,9 +627,9 @@ impl GcRunRecord {
                 ));
             }
         }
-        if !self.mark_shard_locations.is_empty() || self.quarantine_at.is_some() {
+        if self.quarantine_at.is_some() {
             return Err(CatalogError::Invalid(
-                "a newly captured GC run cannot contain later-phase artifacts".to_string(),
+                "GC schema v8 does not support quarantine artifacts".to_string(),
             ));
         }
         Ok(())
@@ -1078,6 +1130,15 @@ pub(crate) trait Catalog: Send + Sync {
         expected_generation: u64,
         run: GcRunRecord,
     ) -> Result<(), CatalogError>;
+    async fn publish_gc_marks(
+        &self,
+        id: Uuid,
+        expected_revision: u64,
+        root_digest: String,
+        mark_shards: Vec<GcMarkShard>,
+        mark_stats: GcMarkStats,
+        updated_at: DateTime<Utc>,
+    ) -> Result<GcRunRecord, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
 
