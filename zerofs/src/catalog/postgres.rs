@@ -1,5 +1,5 @@
 use super::{
-    CATALOG_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
+    CATALOG_PROJECTION_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
     CustomerCatalogRecord, CustomerMetadata, CustomerResourceKind, TombstoneKind,
     validate_metadata,
 };
@@ -95,7 +95,7 @@ impl CatalogProjection for PostgresCatalogProjection {
                 "INSERT INTO zerofs_catalog_projection_state \
                  (volume_id, schema_version, observed_generation) VALUES ($1, $2, -1) \
                  ON CONFLICT (volume_id) DO NOTHING",
-                &[&volume_id, &(CATALOG_SCHEMA_VERSION as i32)],
+                &[&volume_id, &(CATALOG_PROJECTION_SCHEMA_VERSION as i32)],
             )
             .await?;
         let state = transaction
@@ -107,7 +107,7 @@ impl CatalogProjection for PostgresCatalogProjection {
             .await?;
         let schema_version: i32 = state.get(0);
         let observed: i64 = state.get(1);
-        if schema_version != CATALOG_SCHEMA_VERSION as i32 {
+        if schema_version != CATALOG_PROJECTION_SCHEMA_VERSION as i32 {
             return Err(CatalogError::Corrupt(format!(
                 "unsupported PostgreSQL projection schema {schema_version}"
             )));
@@ -133,6 +133,7 @@ impl CatalogProjection for PostgresCatalogProjection {
                 branch.created_at,
                 branch.updated_at,
                 None,
+                false,
             )
             .await?;
         }
@@ -151,6 +152,7 @@ impl CatalogProjection for PostgresCatalogProjection {
                 checkpoint.created_at,
                 checkpoint.updated_at,
                 None,
+                false,
             )
             .await?;
         }
@@ -167,12 +169,13 @@ impl CatalogProjection for PostgresCatalogProjection {
                 kind,
                 &tombstone.name,
                 "deleted",
-                None,
-                None,
+                tombstone.parent_id,
+                tombstone.origin_checkpoint_id,
                 generation,
-                tombstone.deleted_at,
+                tombstone.created_at,
                 tombstone.deleted_at,
                 Some(tombstone.deleted_at),
+                false,
             )
             .await?;
         }
@@ -269,6 +272,7 @@ async fn upsert_resource(
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    preserve_lineage: bool,
 ) -> Result<(), CatalogError> {
     transaction
         .execute(
@@ -278,8 +282,8 @@ async fn upsert_resource(
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
              ON CONFLICT (volume_id, resource_id) DO UPDATE SET \
              kind=EXCLUDED.kind, name=EXCLUDED.name, state=EXCLUDED.state, \
-             parent_id=COALESCE(EXCLUDED.parent_id, zerofs_catalog_projection_resources.parent_id), \
-             origin_checkpoint_id=COALESCE(EXCLUDED.origin_checkpoint_id, zerofs_catalog_projection_resources.origin_checkpoint_id), \
+             parent_id=CASE WHEN $12 THEN COALESCE(EXCLUDED.parent_id, zerofs_catalog_projection_resources.parent_id) ELSE EXCLUDED.parent_id END, \
+             origin_checkpoint_id=CASE WHEN $12 THEN COALESCE(EXCLUDED.origin_checkpoint_id, zerofs_catalog_projection_resources.origin_checkpoint_id) ELSE EXCLUDED.origin_checkpoint_id END, \
              observed_generation=EXCLUDED.observed_generation, \
              created_at=LEAST(zerofs_catalog_projection_resources.created_at, EXCLUDED.created_at), \
              updated_at=EXCLUDED.updated_at, deleted_at=EXCLUDED.deleted_at",
@@ -295,6 +299,7 @@ async fn upsert_resource(
                 &created_at,
                 &updated_at,
                 &deleted_at,
+                &preserve_lineage,
             ],
         )
         .await?;

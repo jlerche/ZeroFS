@@ -1,5 +1,5 @@
 use super::{
-    CATALOG_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
+    CATALOG_PROJECTION_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
     CustomerCatalogRecord, CustomerMetadata, CustomerResourceKind, validate_metadata,
 };
 use async_trait::async_trait;
@@ -47,7 +47,7 @@ impl JsonCatalogProjection {
         match tokio::fs::read(&self.path).await {
             Ok(bytes) => {
                 let document = serde_json::from_slice::<ProjectionDocument>(&bytes)?;
-                if document.schema_version != CATALOG_SCHEMA_VERSION {
+                if document.schema_version != CATALOG_PROJECTION_SCHEMA_VERSION {
                     return Err(CatalogError::Corrupt(format!(
                         "unsupported JSON projection schema version {}",
                         document.schema_version
@@ -56,7 +56,7 @@ impl JsonCatalogProjection {
                 Ok(document)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProjectionDocument {
-                schema_version: CATALOG_SCHEMA_VERSION,
+                schema_version: CATALOG_PROJECTION_SCHEMA_VERSION,
                 ..ProjectionDocument::default()
             }),
             Err(error) => Err(error.into()),
@@ -82,7 +82,12 @@ impl JsonCatalogProjection {
             tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
             file.sync_all().await?;
             drop(file);
-            tokio::fs::rename(&temporary, &self.path).await
+            tokio::fs::rename(&temporary, &self.path).await?;
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
+            Ok::<(), std::io::Error>(())
         }
         .await;
         if result.is_err() {
@@ -216,12 +221,10 @@ fn reconcile_volume(volume_id: Uuid, volume: &mut ProjectedVolume, snapshot: &Ca
                 },
                 name: tombstone.name.clone(),
                 state: "deleted".to_string(),
-                parent_id: previous.and_then(|record| record.parent_id),
-                origin_checkpoint_id: previous.and_then(|record| record.origin_checkpoint_id),
+                parent_id: tombstone.parent_id,
+                origin_checkpoint_id: tombstone.origin_checkpoint_id,
                 observed_generation: snapshot.generation,
-                created_at: previous
-                    .map(|record| record.created_at)
-                    .unwrap_or(tombstone.deleted_at),
+                created_at: tombstone.created_at,
                 updated_at: tombstone.deleted_at,
                 deleted_at: Some(tombstone.deleted_at),
                 customer_metadata: metadata,
@@ -259,20 +262,24 @@ mod tests {
         let projection = JsonCatalogProjection::new(directory.path().join("projection.json"));
         let volume_id = Uuid::new_v4();
         let branch_id = Uuid::new_v4();
+        let historical_parent = Uuid::new_v4();
         let now = catalog_timestamp(Utc::now());
-        let mut snapshot = CatalogSnapshot::default();
-        snapshot.generation = 1;
+        let mut snapshot = CatalogSnapshot {
+            generation: 1,
+            ..CatalogSnapshot::default()
+        };
         snapshot.branches.insert(
             branch_id,
             BranchRecord {
                 id: branch_id,
+                revision: 1,
                 name: "main".to_string(),
                 state: BranchState::Ready,
                 root: Some(DurableRoot {
                     identity: "secret-root".to_string(),
                     manifest_id: "secret-manifest".to_string(),
                 }),
-                parent_id: None,
+                parent_id: Some(historical_parent),
                 origin_checkpoint_id: None,
                 created_at: now,
                 updated_at: now,
@@ -287,6 +294,7 @@ mod tests {
             .await
             .unwrap();
         snapshot.generation = 2;
+        snapshot.branches.get_mut(&branch_id).unwrap().parent_id = None;
         projection.reconcile(volume_id, &snapshot).await.unwrap();
 
         let record = projection
@@ -295,6 +303,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.customer_metadata, metadata);
+        assert_eq!(record.parent_id, None);
+
+        let deleted_at = catalog_timestamp(Utc::now());
+        snapshot.generation = 3;
+        snapshot.branches.clear();
+        snapshot.tombstones.insert(
+            branch_id,
+            crate::catalog::TombstoneRecord {
+                id: branch_id,
+                kind: crate::catalog::TombstoneKind::Branch,
+                name: "main".to_string(),
+                parent_id: Some(historical_parent),
+                origin_checkpoint_id: None,
+                created_at: now,
+                deleted_generation: 3,
+                deleted_at,
+            },
+        );
+        projection.reconcile(volume_id, &snapshot).await.unwrap();
+        let deleted = projection
+            .record(volume_id, branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted.state, "deleted");
+        assert_eq!(deleted.parent_id, Some(historical_parent));
+        assert_eq!(deleted.created_at, now);
+        assert_eq!(deleted.customer_metadata, metadata);
+
+        snapshot.generation = 4;
+        snapshot.tombstones.get_mut(&branch_id).unwrap().parent_id = None;
+        projection.reconcile(volume_id, &snapshot).await.unwrap();
+        assert_eq!(
+            projection
+                .record(volume_id, branch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .parent_id,
+            None
+        );
         let json = tokio::fs::read_to_string(projection.path()).await.unwrap();
         assert!(!json.contains("secret-root"));
         assert!(!json.contains("secret-manifest"));
