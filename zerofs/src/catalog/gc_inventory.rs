@@ -1,5 +1,8 @@
 use super::gc_mark::{GcMarkError, MarkReader, decode_digest, encode_digest};
-use super::{GcInventoryStats, GcQuarantineShard, GcRunRecord, SlateDbRootStore};
+use super::{
+    GcInventoryStats, GcMarkShard, GcQuarantineShard, GcRevalidationRecord, GcRevalidationStats,
+    GcRunRecord, SlateDbRootStore,
+};
 use crate::segment::Segid;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -13,9 +16,9 @@ use uuid::Uuid;
 
 const INVENTORY_MAGIC: &[u8; 8] = b"ZFGCIN01";
 const QUARANTINE_MAGIC: &[u8; 8] = b"ZFGCQR01";
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 const HEADER_LEN: usize = 8 + 4 + 16 + 32 + 1;
-const RECORD_LEN: usize = 16 + 8 + 8 + 4;
+const RECORD_LEN: usize = 16 + 8 + 8 + 4 + 32;
 const FOOTER_LEN: usize = 8 + 8 + 32;
 const INVENTORY_BUFFER_OBJECTS: usize = 8_192;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
@@ -26,6 +29,7 @@ struct InventoryRecord {
     size: u64,
     modified_seconds: i64,
     modified_nanos: u32,
+    content_digest: [u8; 32],
 }
 
 impl InventoryRecord {
@@ -35,7 +39,20 @@ impl InventoryRecord {
             size: meta.size,
             modified_seconds: meta.last_modified.timestamp(),
             modified_nanos: meta.last_modified.timestamp_subsec_nanos(),
+            content_digest: [0; 32],
         }
+    }
+
+    fn with_content_digest(mut self, content_digest: [u8; 32]) -> Self {
+        self.content_digest = content_digest;
+        self
+    }
+
+    fn metadata_matches(self, other: Self) -> bool {
+        self.segid == other.segid
+            && self.size == other.size
+            && self.modified_seconds == other.modified_seconds
+            && self.modified_nanos == other.modified_nanos
     }
 
     fn modified_at(self) -> Result<DateTime<Utc>, GcInventoryError> {
@@ -48,6 +65,11 @@ impl InventoryRecord {
 pub(crate) struct GcInventoryBuild {
     pub(crate) shards: Vec<GcQuarantineShard>,
     pub(crate) stats: GcInventoryStats,
+}
+
+pub(crate) struct GcRevalidationBuild {
+    pub(crate) shards: Vec<GcQuarantineShard>,
+    pub(crate) stats: GcRevalidationStats,
 }
 
 pub(crate) struct GcInventoryStore {
@@ -285,7 +307,19 @@ impl GcInventoryStore {
                 )?;
                 mark = marks.next().await?;
             } else {
-                writer.push(record).await?;
+                let path = Path::from(format!(
+                    "{}/{}",
+                    run.segment_pool,
+                    record.segid.object_key()
+                ));
+                let identity = self.read_identity(&path, record.segid).await?;
+                if !record.metadata_matches(identity) {
+                    return Err(GcInventoryError::Corrupt(format!(
+                        "candidate {:?} changed during first observation",
+                        record.segid
+                    )));
+                }
+                writer.push(identity).await?;
                 stats.candidate_objects =
                     checked_add(stats.candidate_objects, 1, "quarantine candidate count")?;
                 stats.candidate_bytes = checked_add(
@@ -321,6 +355,180 @@ impl GcInventoryStore {
         digest: [u8; 32],
         shards: &[GcQuarantineShard],
     ) -> Result<(), GcInventoryError> {
+        self.verify_shards(run.id, digest, shards).await
+    }
+
+    pub(crate) async fn revalidate(
+        &self,
+        run: &GcRunRecord,
+        observation: &GcRevalidationRecord,
+        mark_shards: &[GcMarkShard],
+    ) -> Result<GcRevalidationBuild, GcInventoryError> {
+        let original_digest = decode_digest(&run.root_digest)?;
+        let digest = decode_digest(&observation.root_digest)?;
+        self.verify_shards(run.id, original_digest, &run.quarantine_shards)
+            .await?;
+        if mark_shards.len() != 256 {
+            return Err(GcInventoryError::Corrupt(
+                "second observation mark set is incomplete".to_string(),
+            ));
+        }
+        let first_observation_candidates = run
+            .quarantine_shards
+            .iter()
+            .try_fold(0u64, |total, shard| {
+                checked_add(total, shard.candidate_count, "first candidate count")
+            })?;
+        let mut stats = GcRevalidationStats {
+            first_observation_candidates,
+            became_reachable: 0,
+            already_absent: 0,
+            retained_candidates: 0,
+            retained_bytes: 0,
+        };
+        let mut shards = Vec::with_capacity(256);
+        for shard in 0u8..=u8::MAX {
+            let original = &run.quarantine_shards[shard as usize];
+            let marks = &mark_shards[shard as usize];
+            if original.shard != shard || marks.shard != shard {
+                return Err(GcInventoryError::Corrupt(
+                    "revalidation descriptors are not ordered by shard".to_string(),
+                ));
+            }
+            let mut candidates = InventoryReader::open_with_magic(
+                Arc::clone(&self.object_store),
+                &Path::from(original.location.clone()),
+                QUARANTINE_MAGIC,
+                run.id,
+                original_digest,
+                shard,
+            )
+            .await?;
+            let mut marks_reader = MarkReader::open(
+                Arc::clone(&self.object_store),
+                &Path::from(marks.location.clone()),
+                observation.id,
+                digest,
+                shard,
+            )
+            .await?;
+            let output = revalidation_path(run.id, observation.id, shard);
+            let mut writer = InventoryWriter::new(
+                Arc::clone(&self.object_store),
+                output.clone(),
+                QUARANTINE_MAGIC,
+                observation.id,
+                digest,
+                shard,
+            )
+            .await?;
+            let mut mark = marks_reader.next().await?;
+            while let Some(record) = candidates.next().await? {
+                while mark.is_some_and(|value| value < record.segid) {
+                    mark = marks_reader.next().await?;
+                }
+                if mark == Some(record.segid) {
+                    stats.became_reachable =
+                        checked_add(stats.became_reachable, 1, "newly reachable candidate count")?;
+                    mark = marks_reader.next().await?;
+                    continue;
+                }
+                let path = Path::from(format!(
+                    "{}/{}",
+                    run.segment_pool,
+                    record.segid.object_key()
+                ));
+                match self.read_identity(&path, record.segid).await {
+                    Ok(identity) => {
+                        if identity != record {
+                            return Err(GcInventoryError::Corrupt(format!(
+                                "candidate {:?} changed between observations",
+                                record.segid
+                            )));
+                        }
+                        writer.push(record).await?;
+                        stats.retained_candidates =
+                            checked_add(stats.retained_candidates, 1, "retained candidate count")?;
+                        stats.retained_bytes = checked_add(
+                            stats.retained_bytes,
+                            record.size,
+                            "retained candidate bytes",
+                        )?;
+                    }
+                    Err(GcInventoryError::ObjectStore(object_store::Error::NotFound {
+                        ..
+                    })) => {
+                        stats.already_absent =
+                            checked_add(stats.already_absent, 1, "already absent candidate count")?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            candidates.finish().await?;
+            while marks_reader.next().await?.is_some() {}
+            let mark_result = marks_reader.finish().await?;
+            if mark_result.count != marks.segment_count
+                || encode_digest(mark_result.checksum) != marks.checksum
+            {
+                return Err(GcInventoryError::Corrupt(format!(
+                    "second observation mark shard {shard} disagrees with its descriptor"
+                )));
+            }
+            let result = writer.finish().await?;
+            shards.push(GcQuarantineShard {
+                shard,
+                location: output.to_string(),
+                checksum: encode_digest(result.checksum),
+                candidate_count: result.count,
+                candidate_bytes: result.bytes,
+            });
+        }
+        self.verify_shards(observation.id, digest, &shards).await?;
+        Ok(GcRevalidationBuild { shards, stats })
+    }
+
+    async fn read_identity(
+        &self,
+        path: &Path,
+        segid: Segid,
+    ) -> Result<InventoryRecord, GcInventoryError> {
+        let result = self.object_store.get(path).await?;
+        let mut record = InventoryRecord::from_meta(segid, &result.meta);
+        let mut stream = result.into_stream();
+        let mut hasher = Sha256::new();
+        let mut bytes = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            bytes = checked_add(bytes, chunk.len() as u64, "candidate content bytes")?;
+            hasher.update(&chunk);
+        }
+        if bytes != record.size {
+            return Err(GcInventoryError::Corrupt(format!(
+                "candidate {segid:?} body length disagrees with object metadata"
+            )));
+        }
+        record = record.with_content_digest(hasher.finalize().into());
+        Ok(record)
+    }
+
+    pub(crate) async fn verify_revalidation(
+        &self,
+        observation: &GcRevalidationRecord,
+    ) -> Result<(), GcInventoryError> {
+        self.verify_shards(
+            observation.id,
+            decode_digest(&observation.root_digest)?,
+            &observation.candidate_shards,
+        )
+        .await
+    }
+
+    async fn verify_shards(
+        &self,
+        run_id: Uuid,
+        digest: [u8; 32],
+        shards: &[GcQuarantineShard],
+    ) -> Result<(), GcInventoryError> {
         if shards.len() != 256 {
             return Err(GcInventoryError::Corrupt(
                 "authoritative quarantine set is incomplete".to_string(),
@@ -331,7 +539,7 @@ impl GcInventoryStore {
                 Arc::clone(&self.object_store),
                 &Path::from(descriptor.location.clone()),
                 QUARANTINE_MAGIC,
-                run.id,
+                run_id,
                 digest,
                 descriptor.shard,
             )
@@ -656,6 +864,7 @@ fn encode_record(record: InventoryRecord) -> [u8; RECORD_LEN] {
     encoded[16..24].copy_from_slice(&record.size.to_le_bytes());
     encoded[24..32].copy_from_slice(&record.modified_seconds.to_le_bytes());
     encoded[32..36].copy_from_slice(&record.modified_nanos.to_le_bytes());
+    encoded[36..68].copy_from_slice(&record.content_digest);
     encoded
 }
 
@@ -668,6 +877,7 @@ fn decode_record(encoded: [u8; RECORD_LEN]) -> Result<InventoryRecord, GcInvento
         size: u64::from_le_bytes(encoded[16..24].try_into().expect("fixed slice")),
         modified_seconds: i64::from_le_bytes(encoded[24..32].try_into().expect("fixed slice")),
         modified_nanos: u32::from_le_bytes(encoded[32..36].try_into().expect("fixed slice")),
+        content_digest: encoded[36..68].try_into().expect("fixed slice"),
     };
     record.modified_at()?;
     Ok(record)
@@ -718,6 +928,12 @@ fn inventory_final_path(run_id: Uuid, shard: u8) -> Path {
     Path::from(format!("__zerofs_gc/{run_id}/inventory/{shard:02x}.bin"))
 }
 
+fn revalidation_path(run_id: Uuid, observation_id: Uuid, shard: u8) -> Path {
+    Path::from(format!(
+        "__zerofs_gc/{run_id}/revalidation/{observation_id}/{shard:02x}.bin"
+    ))
+}
+
 fn quarantine_path(run_id: Uuid, shard: u8) -> Path {
     Path::from(format!("__zerofs_gc/{run_id}/quarantine/{shard:02x}.bin"))
 }
@@ -742,7 +958,98 @@ pub(crate) enum GcInventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+
+    #[derive(Debug)]
+    struct FixedTimestampStore {
+        inner: Arc<dyn ObjectStore>,
+        timestamp: DateTime<Utc>,
+    }
+
+    impl std::fmt::Display for FixedTimestampStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "fixed-timestamp")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FixedTimestampStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let mut result = self.inner.get_opts(location, options).await?;
+            result.meta.last_modified = self.timestamp;
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let timestamp = self.timestamp;
+            self.inner
+                .list(prefix)
+                .map(move |result| {
+                    result.map(|mut meta| {
+                        meta.last_modified = timestamp;
+                        meta
+                    })
+                })
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            let mut result = self.inner.list_with_delimiter(prefix).await?;
+            for meta in &mut result.objects {
+                meta.last_modified = self.timestamp;
+            }
+            Ok(result)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn record(counter: u64) -> InventoryRecord {
         InventoryRecord {
@@ -750,7 +1057,42 @@ mod tests {
             size: counter + 1,
             modified_seconds: 1_700_000_000,
             modified_nanos: 0,
+            content_digest: [0; 32],
         }
+    }
+
+    #[test]
+    fn same_size_same_timestamp_replacement_has_a_different_identity() {
+        let original = record(1).with_content_digest(Sha256::digest(b"original").into());
+        let replacement = record(1).with_content_digest(Sha256::digest(b"replaced").into());
+        assert!(original.metadata_matches(replacement));
+        assert_ne!(original, replacement);
+        assert_ne!(encode_record(original), encode_record(replacement));
+    }
+
+    #[tokio::test]
+    async fn streamed_identity_rejects_same_size_same_timestamp_changed_content() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let timestamp = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FixedTimestampStore { inner, timestamp });
+        let path = Path::from("candidate");
+        store
+            .put(&path, bytes::Bytes::from_static(b"original").into())
+            .await
+            .unwrap();
+        let inventory = GcInventoryStore {
+            object_store: Arc::clone(&store),
+        };
+        let segid = Segid::new(1, 1);
+        let original = inventory.read_identity(&path, segid).await.unwrap();
+        store
+            .put(&path, bytes::Bytes::from_static(b"replaced").into())
+            .await
+            .unwrap();
+        let replacement = inventory.read_identity(&path, segid).await.unwrap();
+        assert!(original.metadata_matches(replacement));
+        assert_ne!(original.content_digest, replacement.content_digest);
+        assert_ne!(original, replacement);
     }
 
     #[test]

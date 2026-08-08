@@ -1,16 +1,18 @@
 use super::gc_inventory::{GcInventoryError, GcInventoryStore};
 use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
-    Catalog, CatalogError, GcBlockerKind, GcQuarantinePublication, GcRootKind, GcRunPhase,
-    GcRunRecord, ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp,
-    gc_root_digest,
+    Catalog, CatalogError, GcBlockerKind, GcQuarantinePublication, GcRevalidationCapture,
+    GcRevalidationPublication, GcRevalidationRecord, GcRootKind, GcRunPhase, GcRunRecord,
+    ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp, gc_root_digest,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
 use std::sync::Arc;
 use uuid::Uuid;
 
 const ROOT_VERIFY_CONCURRENCY: usize = 16;
+/// Five-minute maximum lease + 30-second skew + one-minute propagation bound.
+pub(crate) const MIN_REVALIDATION_GRACE_SECONDS: u64 = 390;
 
 #[derive(Clone)]
 pub struct RootCaptureLifecycle {
@@ -77,6 +79,7 @@ impl RootCaptureLifecycle {
             inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
+            revalidation: None,
             created_at: inventory_cutoff,
             updated_at: inventory_cutoff,
         };
@@ -248,6 +251,254 @@ impl RootCaptureLifecycle {
         }
     }
 
+    /// After the mandatory grace, capture and authenticate a fresh catalog
+    /// generation, independently mark it, then retain only candidates still
+    /// unreachable and byte-for-byte unchanged in the physical pool.
+    pub async fn revalidate(
+        &self,
+        run_id: Uuid,
+        grace: Duration,
+    ) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        self.revalidate_at(run_id, grace, catalog_timestamp(Utc::now()))
+            .await
+    }
+
+    async fn revalidate_at(
+        &self,
+        run_id: Uuid,
+        grace: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let grace_seconds = grace.num_seconds();
+        if grace_seconds < MIN_REVALIDATION_GRACE_SECONDS as i64
+            || grace != Duration::seconds(grace_seconds)
+        {
+            return Err(CatalogError::Invalid(format!(
+                "GC revalidation grace must be at least {MIN_REVALIDATION_GRACE_SECONDS} whole seconds"
+            ))
+            .into());
+        }
+        let grace_seconds = u64::try_from(grace_seconds)
+            .map_err(|_| CatalogError::Invalid("GC revalidation grace is invalid".to_string()))?;
+        let mut run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        if run
+            .revalidation
+            .as_ref()
+            .is_some_and(|observation| observation.grace_seconds != grace_seconds)
+        {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let marks = GcMarkStore::new(self.roots.clone());
+        let inventory = GcInventoryStore::new(&self.roots);
+        if run.phase == GcRunPhase::Validated {
+            let observation = run.revalidation.as_ref().ok_or_else(|| {
+                CatalogError::Corrupt("validated GC run has no revalidation".to_string())
+            })?;
+            marks
+                .verify_all(
+                    observation.id,
+                    decode_digest(&observation.root_digest)?,
+                    &observation.mark_shards,
+                )
+                .await?;
+            inventory.verify_revalidation(observation).await?;
+            return Ok(run);
+        }
+        if run.phase == GcRunPhase::Quarantined {
+            let quarantine_at = run.quarantine_at.ok_or_else(|| {
+                CatalogError::Corrupt("quarantined GC run has no timestamp".to_string())
+            })?;
+            let not_before = quarantine_at
+                .checked_add_signed(grace)
+                .ok_or_else(|| CatalogError::Invalid("GC grace overflows time".to_string()))?;
+            if now < not_before {
+                return Err(RootCaptureLifecycleError::GracePeriod {
+                    not_before,
+                    observed_at: now,
+                });
+            }
+            let snapshot = self.catalog.snapshot().await?;
+            let pins = snapshot.gc_root_pins();
+            let root_store = self.roots.clone();
+            let mut verification = stream::iter(pins.iter().cloned())
+                .map(move |pin| {
+                    let root_store = root_store.clone();
+                    async move {
+                        match pin.kind {
+                            GcRootKind::Branch => root_store.verify(&pin.root).await,
+                            GcRootKind::Checkpoint => {
+                                let checkpoint = ImmutableCheckpoint::from_durable_root(&pin.root)?;
+                                root_store.verify_checkpoint(&checkpoint).await
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(ROOT_VERIFY_CONCURRENCY);
+            while let Some(result) = verification.next().await {
+                result?;
+            }
+            drop(verification);
+            let observation = GcRevalidationRecord {
+                id: Uuid::new_v4(),
+                catalog_generation: snapshot.generation,
+                grace_seconds,
+                not_before,
+                inventory_cutoff: now,
+                roots: pins.clone(),
+                root_digest: gc_root_digest(&pins)?,
+                mark_shards: Vec::new(),
+                mark_stats: None,
+                candidate_shards: Vec::new(),
+                stats: None,
+                captured_at: now,
+                completed_at: None,
+            };
+            let captured = self
+                .catalog
+                .begin_gc_revalidation(GcRevalidationCapture {
+                    run_id,
+                    expected_revision: run.revision,
+                    expected_generation: snapshot.generation,
+                    observation: observation.clone(),
+                    updated_at: now,
+                })
+                .await;
+            run = match captured {
+                Ok(run) => run,
+                Err(error) => {
+                    if let Some(existing) = self.catalog.gc_run(run_id).await?
+                        && matches!(
+                            existing.phase,
+                            GcRunPhase::Revalidating | GcRunPhase::Validated
+                        )
+                        && existing.revalidation.as_ref().is_some_and(|stored| {
+                            stored.id == observation.id
+                                && stored.catalog_generation == observation.catalog_generation
+                                && stored.grace_seconds == observation.grace_seconds
+                                && stored.not_before == observation.not_before
+                                && stored.inventory_cutoff == observation.inventory_cutoff
+                                && stored.roots == observation.roots
+                                && stored.root_digest == observation.root_digest
+                                && stored.captured_at == observation.captured_at
+                        })
+                    {
+                        existing
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+            };
+        }
+        if run.phase == GcRunPhase::Validated {
+            let stored = run.revalidation.as_ref().ok_or_else(|| {
+                CatalogError::Corrupt("validated GC run has no revalidation".to_string())
+            })?;
+            marks
+                .verify_all(
+                    stored.id,
+                    decode_digest(&stored.root_digest)?,
+                    &stored.mark_shards,
+                )
+                .await?;
+            inventory.verify_revalidation(stored).await?;
+            return Ok(run);
+        }
+        if run.phase != GcRunPhase::Revalidating || run.revision != 4 {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let observation = run.revalidation.clone().ok_or_else(|| {
+            CatalogError::Corrupt("revalidating GC run has no observation".to_string())
+        })?;
+        let build = match marks
+            .build_observation(observation.id, &observation.root_digest, &observation.roots)
+            .await
+        {
+            Ok(build) => build,
+            Err(error) => {
+                self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let candidates = match inventory
+            .revalidate(&run, &observation, &build.shards)
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.record_blocker(run.id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let completed_at = catalog_timestamp(Utc::now()).max(now);
+        let published = self
+            .catalog
+            .publish_gc_revalidation(GcRevalidationPublication {
+                run_id,
+                expected_revision: run.revision,
+                expected_generation: observation.catalog_generation,
+                observation_id: observation.id,
+                root_digest: observation.root_digest.clone(),
+                mark_shards: build.shards.clone(),
+                mark_stats: build.stats.clone(),
+                candidate_shards: candidates.shards.clone(),
+                stats: candidates.stats.clone(),
+                completed_at,
+            })
+            .await;
+        match published {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                if let Some(existing) = self.catalog.gc_run(run_id).await?
+                    && existing.phase == GcRunPhase::Validated
+                    && existing.revalidation.as_ref().is_some_and(|stored| {
+                        stored.id == observation.id
+                            && stored.catalog_generation == observation.catalog_generation
+                            && stored.root_digest == observation.root_digest
+                            && stored.mark_shards == build.shards
+                            && stored.mark_stats.as_ref() == Some(&build.stats)
+                            && stored.candidate_shards == candidates.shards
+                            && stored.stats.as_ref() == Some(&candidates.stats)
+                            && stored.completed_at == Some(completed_at)
+                    })
+                {
+                    let stored = existing.revalidation.as_ref().expect("checked above");
+                    marks
+                        .verify_all(
+                            stored.id,
+                            decode_digest(&stored.root_digest)?,
+                            &stored.mark_shards,
+                        )
+                        .await?;
+                    inventory.verify_revalidation(stored).await?;
+                    return Ok(existing);
+                }
+                if self
+                    .catalog
+                    .snapshot()
+                    .await
+                    .is_ok_and(|snapshot| snapshot.generation != observation.catalog_generation)
+                {
+                    self.record_blocker(
+                        run_id,
+                        GcBlockerKind::GenerationChanged,
+                        format!(
+                            "catalog generation changed during revalidation at {}",
+                            observation.catalog_generation
+                        ),
+                    )
+                    .await;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
     async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
         if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
             let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
@@ -305,6 +556,13 @@ pub enum RootCaptureLifecycleError {
     Mark(String),
     #[error("GC inventory failed: {0}")]
     Inventory(String),
+    #[error(
+        "GC revalidation grace has not elapsed: not before {not_before}, observed {observed_at}"
+    )]
+    GracePeriod {
+        not_before: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    },
 }
 
 impl From<GcMarkError> for RootCaptureLifecycleError {
@@ -430,6 +688,7 @@ mod tests {
             inventory_stats: None,
             phase: GcRunPhase::Completed,
             quarantine_at: None,
+            revalidation: None,
             created_at: now,
             updated_at: now,
         };
@@ -552,6 +811,7 @@ mod tests {
             inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
+            revalidation: None,
             created_at: now,
             updated_at: now,
         };
@@ -563,6 +823,230 @@ mod tests {
             })
         ));
         assert!(catalog.gc_run(id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revalidation_enforces_grace_and_filters_absent_candidates_without_deleting() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let data_path = Path::from("gc-revalidation-data");
+        let db = Db::builder(data_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let reachable = Segid::new(11, 0);
+        db.put(
+            KeyCodec::new().extent_key(1, 0),
+            FrameLoc {
+                segid: reachable,
+                frame_index: 0,
+                byte_offset: 0,
+                byte_len: 1,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+        let root = ImmutableCheckpoint {
+            database_path: data_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        }
+        .durable_root();
+        let pins = vec![GcRootPin {
+            kind: GcRootKind::Checkpoint,
+            root,
+        }];
+        let segment_pool = Path::from("gc-revalidation-pool");
+        let became_reachable = Segid::new(12, 256);
+        let absent = Segid::new(12, 512);
+        let retained = Segid::new(12, 768);
+        for segment in [reachable, became_reachable, absent, retained] {
+            store
+                .put(
+                    &Path::from(format!("{segment_pool}/{}", segment.object_key())),
+                    bytes::Bytes::from_static(b"x").into(),
+                )
+                .await
+                .unwrap();
+        }
+        let now = catalog_timestamp(Utc::now());
+        let inventory_cutoff = now + Duration::seconds(1);
+        let run = GcRunRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            catalog_generation: 0,
+            inventory_cutoff,
+            root_digest: gc_root_digest(&pins).unwrap(),
+            segment_pool: segment_pool.to_string(),
+            roots: pins,
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
+            phase: GcRunPhase::Captured,
+            quarantine_at: None,
+            revalidation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-revalidation-catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        catalog.begin_gc_run(0, run.clone()).await.unwrap();
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(Arc::clone(&store), Path::from("gc-revalidation-branches"))
+                .with_segment_pool_root(segment_pool.clone()),
+        );
+        lifecycle.mark(run.id).await.unwrap();
+        let quarantined = lifecycle.quarantine(run.id).await.unwrap();
+        assert_eq!(
+            quarantined
+                .inventory_stats
+                .as_ref()
+                .unwrap()
+                .candidate_objects,
+            3
+        );
+        store
+            .delete(&Path::from(format!(
+                "{segment_pool}/{}",
+                absent.object_key()
+            )))
+            .await
+            .unwrap();
+        let new_data_path = Path::from("gc-revalidation-new-root");
+        let db = Db::builder(new_data_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        db.put(
+            KeyCodec::new().extent_key(2, 0),
+            FrameLoc {
+                segid: became_reachable,
+                frame_index: 0,
+                byte_offset: 0,
+                byte_len: 1,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        let new_checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+        let new_pins = vec![GcRootPin {
+            kind: GcRootKind::Checkpoint,
+            root: ImmutableCheckpoint {
+                database_path: new_data_path,
+                checkpoint_id: new_checkpoint.id,
+                manifest_id: new_checkpoint.manifest_id,
+            }
+            .durable_root(),
+        }];
+        catalog
+            .begin_gc_run(
+                0,
+                GcRunRecord {
+                    id: Uuid::new_v4(),
+                    revision: 1,
+                    catalog_generation: 0,
+                    inventory_cutoff: now,
+                    root_digest: gc_root_digest(&new_pins).unwrap(),
+                    segment_pool: segment_pool.to_string(),
+                    roots: new_pins,
+                    mark_shards: Vec::new(),
+                    mark_stats: None,
+                    quarantine_shards: Vec::new(),
+                    inventory_stats: None,
+                    phase: GcRunPhase::Captured,
+                    quarantine_at: None,
+                    revalidation: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        let quarantine_at = quarantined.quarantine_at.unwrap();
+        assert!(matches!(
+            lifecycle
+                .revalidate_at(
+                    run.id,
+                    Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64),
+                    quarantine_at + Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64 - 1),
+                )
+                .await,
+            Err(RootCaptureLifecycleError::GracePeriod { .. })
+        ));
+        let validated = lifecycle
+            .revalidate_at(
+                run.id,
+                Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64),
+                quarantine_at + Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64),
+            )
+            .await
+            .unwrap();
+        assert_eq!(validated.phase, GcRunPhase::Validated);
+        assert_eq!(validated.revision, 5);
+        let stats = validated
+            .revalidation
+            .as_ref()
+            .unwrap()
+            .stats
+            .as_ref()
+            .unwrap();
+        assert_eq!(stats.first_observation_candidates, 3);
+        assert_eq!(stats.became_reachable, 1);
+        assert_eq!(stats.already_absent, 1);
+        assert_eq!(stats.retained_candidates, 1);
+        let mut malformed = validated.clone();
+        malformed
+            .revalidation
+            .as_mut()
+            .unwrap()
+            .stats
+            .as_mut()
+            .unwrap()
+            .first_observation_candidates = 2;
+        assert!(matches!(
+            malformed.validate(),
+            Err(CatalogError::Invalid(_))
+        ));
+        assert!(
+            store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    retained.object_key()
+                )))
+                .await
+                .is_ok(),
+            "revalidation must not physically delete retained candidates"
+        );
+        assert_eq!(
+            lifecycle
+                .revalidate(
+                    run.id,
+                    Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64)
+                )
+                .await
+                .unwrap(),
+            validated
+        );
         catalog.close().await.unwrap();
     }
 
@@ -657,6 +1141,7 @@ mod tests {
             inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
+            revalidation: None,
             created_at: now,
             updated_at: now,
         };

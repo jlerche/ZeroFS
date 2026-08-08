@@ -1,4 +1,4 @@
-use super::{GcMarkShard, GcMarkStats, GcRunRecord, SlateDbRootStore};
+use super::{GcMarkShard, GcMarkStats, GcRootPin, GcRunRecord, SlateDbRootStore};
 use crate::fs::key_codec::{KeyCodec, KeyPrefix};
 use crate::segment::{FrameLoc, Segid};
 use object_store::buffered::{BufReader, BufWriter};
@@ -38,7 +38,17 @@ impl GcMarkStore {
     }
 
     pub(crate) async fn build(&self, run: &GcRunRecord) -> Result<GcMarkBuild, GcMarkError> {
-        let digest = decode_digest(&run.root_digest)?;
+        self.build_observation(run.id, &run.root_digest, &run.roots)
+            .await
+    }
+
+    pub(crate) async fn build_observation(
+        &self,
+        run_id: Uuid,
+        root_digest: &str,
+        roots: &[GcRootPin],
+    ) -> Result<GcMarkBuild, GcMarkError> {
+        let digest = decode_digest(root_digest)?;
         let mut buffers: [Vec<Segid>; 256] = array::from_fn(|_| Vec::new());
         let mut run_paths: [OnlineRuns; 256] = array::from_fn(|_| OnlineRuns::default());
         let mut buffered = 0usize;
@@ -48,7 +58,7 @@ impl GcMarkStore {
         let codec = KeyCodec::new();
         let (start, end) = codec.prefix_range(KeyPrefix::Extent);
 
-        for pin in &run.roots {
+        for pin in roots {
             let reader = self.roots.checkpoint_reader(&pin.root).await?;
             let mut entries = reader.scan(start.clone()..end.clone()).await?;
             while let Some(entry) = entries.next().await? {
@@ -66,7 +76,7 @@ impl GcMarkStore {
                 buffered += 1;
                 if buffered >= ENUMERATION_BUFFER_SEGMENTS {
                     self.flush_buffers(
-                        run.id,
+                        run_id,
                         digest,
                         sequence,
                         &mut buffers,
@@ -85,7 +95,7 @@ impl GcMarkStore {
         }
         if buffered != 0 {
             self.flush_buffers(
-                run.id,
+                run_id,
                 digest,
                 sequence,
                 &mut buffers,
@@ -99,7 +109,7 @@ impl GcMarkStore {
         for shard in 0u8..=u8::MAX {
             shards.push(
                 self.merge_shard(
-                    run.id,
+                    run_id,
                     digest,
                     shard,
                     std::mem::take(&mut run_paths[shard as usize]).into_paths(),
@@ -107,7 +117,7 @@ impl GcMarkStore {
                 .await?,
             );
         }
-        self.verify_all(run.id, digest, &shards).await?;
+        self.verify_all(run_id, digest, &shards).await?;
         let unique_segments = shards.iter().try_fold(0u64, |total, shard| {
             total
                 .checked_add(shard.segment_count)
@@ -116,7 +126,7 @@ impl GcMarkStore {
         Ok(GcMarkBuild {
             shards,
             stats: GcMarkStats {
-                roots_enumerated: run.roots.len() as u64,
+                roots_enumerated: roots.len() as u64,
                 references_enumerated,
                 intermediate_runs,
                 unique_segments,

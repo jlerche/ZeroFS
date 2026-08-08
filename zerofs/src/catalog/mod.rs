@@ -45,7 +45,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 9;
+pub const CATALOG_SCHEMA_VERSION: u32 = 10;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -505,15 +505,16 @@ pub enum GcRunPhase {
     Marking,
     Quarantined,
     Revalidating,
+    Validated,
     Completed,
     Aborted,
 }
 
 impl GcRunPhase {
     fn retains_roots(self) -> bool {
-        // Through schema v9 even a quarantined first observation retains every
-        // captured root. A later independently reviewed revalidation protocol
-        // is the only place that may release them; uncertainty always retains.
+        // Every implemented phase retains both observations' captured roots.
+        // Physical deletion may only release them in a later durable terminal
+        // transition; unknown or unsupported phases therefore fail closed.
         let _ = self;
         true
     }
@@ -541,6 +542,10 @@ pub struct GcRunRecord {
     pub inventory_stats: Option<GcInventoryStats>,
     pub phase: GcRunPhase,
     pub quarantine_at: Option<DateTime<Utc>>,
+    /// Durable fresh-generation observation used to prove that first-pass
+    /// candidates remained unreachable after the configured grace period.
+    #[serde(default)]
+    pub revalidation: Option<GcRevalidationRecord>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -578,6 +583,59 @@ pub struct GcInventoryStats {
     pub candidate_objects: u64,
     pub candidate_bytes: u64,
     pub intermediate_runs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcRevalidationRecord {
+    pub id: Uuid,
+    pub catalog_generation: u64,
+    pub grace_seconds: u64,
+    pub not_before: DateTime<Utc>,
+    pub inventory_cutoff: DateTime<Utc>,
+    pub roots: Vec<GcRootPin>,
+    pub root_digest: String,
+    #[serde(default)]
+    pub mark_shards: Vec<GcMarkShard>,
+    #[serde(default)]
+    pub mark_stats: Option<GcMarkStats>,
+    #[serde(default)]
+    pub candidate_shards: Vec<GcQuarantineShard>,
+    #[serde(default)]
+    pub stats: Option<GcRevalidationStats>,
+    pub captured_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcRevalidationStats {
+    pub first_observation_candidates: u64,
+    pub became_reachable: u64,
+    pub already_absent: u64,
+    pub retained_candidates: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GcRevalidationCapture {
+    pub(crate) run_id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) expected_generation: u64,
+    pub(crate) observation: GcRevalidationRecord,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GcRevalidationPublication {
+    pub(crate) run_id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) expected_generation: u64,
+    pub(crate) observation_id: Uuid,
+    pub(crate) root_digest: String,
+    pub(crate) mark_shards: Vec<GcMarkShard>,
+    pub(crate) mark_stats: GcMarkStats,
+    pub(crate) candidate_shards: Vec<GcQuarantineShard>,
+    pub(crate) stats: GcRevalidationStats,
+    pub(crate) completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -644,14 +702,16 @@ impl GcRunRecord {
                     && self.mark_stats.is_none()
                     && self.quarantine_shards.is_empty()
                     && self.inventory_stats.is_none()
-                    && self.quarantine_at.is_none() => {}
+                    && self.quarantine_at.is_none()
+                    && self.revalidation.is_none() => {}
             GcRunPhase::Marking
                 if self.revision == 2
                     && self.mark_shards.len() == 256
                     && self.mark_stats.is_some()
                     && self.quarantine_shards.is_empty()
                     && self.inventory_stats.is_none()
-                    && self.quarantine_at.is_none() => {}
+                    && self.quarantine_at.is_none()
+                    && self.revalidation.is_none() => {}
             GcRunPhase::Quarantined
                 if self.revision == 3
                     && !self.segment_pool.is_empty()
@@ -659,11 +719,30 @@ impl GcRunRecord {
                     && self.mark_stats.is_some()
                     && self.quarantine_shards.len() == 256
                     && self.inventory_stats.is_some()
-                    && self.quarantine_at.is_some() => {}
+                    && self.quarantine_at.is_some()
+                    && self.revalidation.is_none() => {}
+            GcRunPhase::Revalidating
+                if self.revision == 4
+                    && self.revalidation.as_ref().is_some_and(|observation| {
+                        observation.mark_shards.is_empty()
+                            && observation.mark_stats.is_none()
+                            && observation.candidate_shards.is_empty()
+                            && observation.stats.is_none()
+                            && observation.completed_at.is_none()
+                            && observation.captured_at == self.updated_at
+                    }) => {}
+            GcRunPhase::Validated
+                if self.revision == 5
+                    && self.revalidation.as_ref().is_some_and(|observation| {
+                        observation.mark_shards.len() == 256
+                            && observation.mark_stats.is_some()
+                            && observation.candidate_shards.len() == 256
+                            && observation.stats.is_some()
+                            && observation.completed_at == Some(self.updated_at)
+                    }) => {}
             _ => {
                 return Err(CatalogError::Invalid(
-                    "GC schema v9 supports captured, marking, and quarantined revisions"
-                        .to_string(),
+                    "GC schema v10 supports captured through validated revisions".to_string(),
                 ));
             }
         }
@@ -793,8 +872,157 @@ impl GcRunRecord {
                 ));
             }
         }
+        if let Some(observation) = &self.revalidation {
+            observation.validate(self.quarantine_at.ok_or_else(|| {
+                CatalogError::Invalid("GC revalidation requires quarantine time".to_string())
+            })?)?;
+            if let Some(stats) = &observation.stats
+                && self.inventory_stats.as_ref().is_none_or(|inventory| {
+                    stats.first_observation_candidates != inventory.candidate_objects
+                })
+            {
+                return Err(CatalogError::Invalid(
+                    "GC revalidation did not classify every first-observation candidate"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+impl GcRevalidationRecord {
+    fn validate(&self, quarantine_at: DateTime<Utc>) -> Result<(), CatalogError> {
+        validate_id(self.id, "GC revalidation")?;
+        if self.grace_seconds < gc::MIN_REVALIDATION_GRACE_SECONDS {
+            return Err(CatalogError::Invalid(
+                "GC revalidation grace is below the safety minimum".to_string(),
+            ));
+        }
+        for timestamp in [self.not_before, self.inventory_cutoff, self.captured_at] {
+            validate_timestamp(timestamp, "GC revalidation timestamp")?;
+        }
+        if self.not_before
+            != quarantine_at
+                .checked_add_signed(chrono::Duration::seconds(
+                    i64::try_from(self.grace_seconds).map_err(|_| {
+                        CatalogError::Invalid("GC revalidation grace is too large".to_string())
+                    })?,
+                ))
+                .ok_or_else(|| {
+                    CatalogError::Invalid("GC revalidation grace overflows time".to_string())
+                })?
+            || self.captured_at < self.not_before
+            || self.inventory_cutoff != self.captured_at
+        {
+            return Err(CatalogError::Invalid(
+                "GC revalidation did not observe the configured grace boundary".to_string(),
+            ));
+        }
+        let mut roots = self.roots.clone();
+        for pin in &roots {
+            validate_root(&pin.root)?;
+        }
+        canonicalize_gc_root_pins(&mut roots);
+        if roots != self.roots || gc_root_digest(&self.roots)? != self.root_digest {
+            return Err(CatalogError::Invalid(
+                "GC revalidation roots or digest are not canonical".to_string(),
+            ));
+        }
+        validate_gc_mark_descriptors(&self.mark_shards)?;
+        validate_gc_quarantine_descriptors(&self.candidate_shards)?;
+        if let Some(stats) = &self.mark_stats {
+            let unique_segments = self.mark_shards.iter().try_fold(0u64, |total, shard| {
+                total.checked_add(shard.segment_count).ok_or_else(|| {
+                    CatalogError::Invalid("GC revalidation mark count overflow".to_string())
+                })
+            })?;
+            if stats.roots_enumerated != self.roots.len() as u64
+                || stats.unique_segments != unique_segments
+                || stats.unique_segments > stats.references_enumerated
+            {
+                return Err(CatalogError::Invalid(
+                    "GC revalidation mark statistics are inconsistent".to_string(),
+                ));
+            }
+        }
+        if let Some(stats) = &self.stats {
+            let (objects, bytes) = self.candidate_shards.iter().try_fold(
+                (0u64, 0u64),
+                |(objects, bytes), shard| {
+                    Ok::<_, CatalogError>((
+                        objects.checked_add(shard.candidate_count).ok_or_else(|| {
+                            CatalogError::Invalid(
+                                "GC revalidated candidate count overflow".to_string(),
+                            )
+                        })?,
+                        bytes.checked_add(shard.candidate_bytes).ok_or_else(|| {
+                            CatalogError::Invalid(
+                                "GC revalidated candidate bytes overflow".to_string(),
+                            )
+                        })?,
+                    ))
+                },
+            )?;
+            let classified = stats
+                .became_reachable
+                .checked_add(stats.already_absent)
+                .and_then(|value| value.checked_add(stats.retained_candidates))
+                .ok_or_else(|| {
+                    CatalogError::Invalid("GC revalidation count overflow".to_string())
+                })?;
+            if stats.first_observation_candidates != classified
+                || stats.retained_candidates != objects
+                || stats.retained_bytes != bytes
+            {
+                return Err(CatalogError::Invalid(
+                    "GC revalidation statistics disagree with candidate shards".to_string(),
+                ));
+            }
+        }
+        if let Some(completed_at) = self.completed_at {
+            validate_timestamp(completed_at, "GC revalidation completion")?;
+            if completed_at < self.captured_at {
+                return Err(CatalogError::Invalid(
+                    "GC revalidation completion precedes capture".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_gc_mark_descriptors(shards: &[GcMarkShard]) -> Result<(), CatalogError> {
+    for (expected_shard, shard) in (0u8..=u8::MAX).zip(shards) {
+        if shard.shard != expected_shard
+            || shard.location.is_empty()
+            || shard.location.len() > MAX_ROOT_IDENTIFIER_BYTES
+            || shard.checksum.len() != 64
+            || !shard.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "GC mark shards must be complete, ordered, bounded, and checksummed".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gc_quarantine_descriptors(shards: &[GcQuarantineShard]) -> Result<(), CatalogError> {
+    for (expected_shard, shard) in (0u8..=u8::MAX).zip(shards) {
+        if shard.shard != expected_shard
+            || shard.location.is_empty()
+            || shard.location.len() > MAX_ROOT_IDENTIFIER_BYTES
+            || shard.checksum.len() != 64
+            || !shard.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "GC quarantine shards must be complete, ordered, bounded, and checksummed"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl TombstoneRecord {
@@ -1058,6 +1286,13 @@ impl CatalogSnapshot {
                 .filter(|run| run.phase.retains_roots())
                 .flat_map(|run| run.roots.iter().map(|pin| &pin.root)),
         );
+        roots.extend(
+            self.gc_runs
+                .values()
+                .filter(|run| run.phase.retains_roots())
+                .filter_map(|run| run.revalidation.as_ref())
+                .flat_map(|observation| observation.roots.iter().map(|pin| &pin.root)),
+        );
         roots
     }
 
@@ -1111,6 +1346,11 @@ impl CatalogSnapshot {
         {
             for pin in &run.roots {
                 push(pin.kind, &pin.root);
+            }
+            if let Some(observation) = &run.revalidation {
+                for pin in &observation.roots {
+                    push(pin.kind, &pin.root);
+                }
             }
         }
         canonicalize_gc_root_pins(&mut pins);
@@ -1307,6 +1547,27 @@ pub(crate) trait Catalog: Send + Sync {
         &self,
         publication: GcQuarantinePublication,
     ) -> Result<GcRunRecord, CatalogError>;
+    /// Pin a fresh root snapshot after the first-observation grace period. The
+    /// bookkeeping write is generation-neutral and succeeds only at the exact
+    /// newly observed catalog generation.
+    async fn begin_gc_revalidation(
+        &self,
+        _capture: GcRevalidationCapture,
+    ) -> Result<GcRunRecord, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support GC revalidation".to_string(),
+        ))
+    }
+    /// Accept the independently rebuilt mark and surviving candidate sets only
+    /// if the catalog still has the fresh generation captured above.
+    async fn publish_gc_revalidation(
+        &self,
+        _publication: GcRevalidationPublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support GC revalidation".to_string(),
+        ))
+    }
     async fn record_gc_blocker(
         &self,
         run_id: Uuid,

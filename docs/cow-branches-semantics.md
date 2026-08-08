@@ -340,6 +340,8 @@ An object may be deleted only when every condition below is proven:
   acceptance;
 - it remains absent in a second independent, generation-fenced observation after
   a grace period exceeding lease duration, propagation delay, and clock skew;
+- its portable content digest and physical metadata still match the exact
+  first-observation object identity;
 - it is not protected by an active lease, recovery record, replication root, or
   pinned GC run; and
 - no relevant metadata was missing, corrupt, unreadable, unauthenticated, or
@@ -386,16 +388,23 @@ duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
 4. Stream physical inventory by the same partitions, exclude objects newer than
    the cutoff, and join with complete mark shards.
 5. Persist first-observation candidates in quarantine; do not delete them.
+   Each candidate carries a streamed SHA-256 of its bytes as portable strong
+   identity; size, timestamp, ETag, or provider version alone is insufficient.
 6. Re-read the catalog, require `G`, and accept or abort the mark. Catalog change
    aborts safely rather than attempting speculative reconciliation.
 7. After the grace period, perform a second complete observation with a new
-   generation fence. Remove any reachable or uncertain candidate.
+   generation fence. Durably pin that fresh root list before marking it, then
+   remove every newly reachable, missing, changed, or otherwise uncertain
+   candidate. This transition still performs no physical deletion.
 8. Delete proven candidates in bounded idempotent batches and durably checkpoint
    batch progress.
 
 The run record contains only run UUID, generation, cutoff, segment-pool
-identity, immutable root-list identity/digest, mark and quarantine shard
-locations/checksums, bounded work statistics, phase, and quarantine time.
+identity, both immutable observation root-list identities/digests, mark and
+candidate shard locations/checksums, bounded work statistics, phase, quarantine
+time, and the configured grace boundary. The second observation records only
+aggregate reachable/absent/retained counts and bytes, never unbounded
+per-object catalog metadata.
 Bounded per-kind blocker records retain the last reason and occurrence count for
 missing roots, corrupt metadata, generation changes, lease uncertainty, or
 storage unavailability. Missing state prevents deletion. Interrupted work

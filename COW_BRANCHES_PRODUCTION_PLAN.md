@@ -238,10 +238,10 @@
 
 ### Epic 4.4: Revalidate and delete
 
-- [ ] Re-read the catalog after marking and require generation `G` before accepting the run.
-- [ ] Wait a configurable grace period that exceeds relevant lease, propagation, and clock-skew bounds.
-- [ ] Perform a second independent reachability observation or equivalent generation-fenced validation.
-- [ ] Remove candidates that became reachable or cannot be proven unreachable.
+- [x] Re-read the catalog after marking and require generation `G` before accepting the run.
+- [x] Wait a configurable grace period that exceeds relevant lease, propagation, and clock-skew bounds.
+- [x] Perform a second independent reachability observation or equivalent generation-fenced validation.
+- [x] Remove candidates that became reachable or cannot be proven unreachable.
 - [ ] Delete remaining objects in bounded idempotent batches.
 - [ ] Persist batch progress so crashes resume safely.
 - [ ] Retain deletion audit metrics without retaining unbounded per-object metadata.
@@ -444,3 +444,10 @@
 - First observation: each sorted inventory shard is merge-joined once against its independently verified authoritative mark shard. Reachable objects are counted, while older unmarked objects are written—with size and immutable modification time—to exactly 256 sorted, checksummed quarantine shards bound to the run UUID and root digest. No physical segment delete exists on this transition.
 - Acceptance fence: the `marking` to `quarantined` revision-three publication is one durable SlateDB write and succeeds only while the catalog remains at captured generation `G`. Exact retries verify both mark and quarantine artifacts. Missing roots, corrupt metadata/artifacts, generation changes, lease uncertainty, and storage unavailability have bounded per-kind durable blocker records in SlateDB; they never enter customer projections or authorize deletion.
 - Executable proof: the focused lifecycle test inventories 10,001 physical objects, excludes one post-cutoff object, classifies 1,000 reachable segments, externally sorts and quarantines 9,000 one-byte candidates across 256 verifiable shards, proves the candidate still exists, reconciles an exact retry, and records corrupt-artifact blockers. A catalog test proves a generation change rejects quarantine publication and that all blocker categories persist without changing the run revision. Runtime tests reserve 256 unique pool epochs concurrently, read a shallow-cloned extent through the shared pool, reject pre-genesis segments and wrong-key genesis, reject unmarked or forged pool epochs, reject an exact manual legacy-key copy, and prove two legacy databases with the same segment ID cannot join one pool.
+
+### 2026-08-08: generation-fenced GC revalidation
+
+- Grace fence: catalog schema v10 records the configured whole-second grace and its exact `quarantine_at + grace` boundary. Revalidation is rejected before 390 seconds, covering the five-minute maximum lease, 30-second conservative skew, and one-minute propagation allowance. Waiting is caller-scheduled; the lifecycle never blocks a worker by sleeping.
+- Independent observation: after the boundary, the coordinator captures and authenticates a fresh complete root set at generation `H`, durably pins it in a generation-neutral revision-four record, and independently rebuilds all 256 mark shards under a new observation UUID and root digest. Both the capture and the final revision-five publication require the catalog still to equal `H`; generation uncertainty retains every candidate.
+- Candidate proof: each checksummed first-observation candidate shard is merge-joined with the fresh mark shard. Artifact format v2 streams every first-pass candidate body into a portable SHA-256 identity alongside its size and modification timestamp. Newly reachable candidates are removed. Every still-unmarked object is streamed again at its canonical shared-pool key and retained only if its byte digest and metadata exactly match the first observation; absent objects are recorded as already gone, while changed or unreadable data aborts. The surviving 256 shards and bounded aggregate metrics are verified before atomic publication and must classify exactly the original candidate total. This transition performs no physical deletes and both observations' roots remain authoritative pins.
+- Executable proof: focused lifecycle coverage rejects early revalidation, introduces a candidate into a newly pinned independent checkpoint before the second mark, removes another candidate externally, retains a third unchanged candidate without deleting it, verifies exact retry behavior, and checks the reachable/absent/retained accounting. PostgreSQL and JSON remain identical root-free projections and contain no GC state.
