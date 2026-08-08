@@ -7,6 +7,7 @@
 
 mod json;
 mod postgres;
+mod root_store;
 #[path = "slatedb.rs"]
 mod slate;
 
@@ -23,6 +24,7 @@ use uuid::Uuid;
 
 pub use json::JsonCatalogProjection;
 pub use postgres::PostgresCatalogProjection;
+pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub use slate::SlateDbCatalog;
 
 pub const CATALOG_SCHEMA_VERSION: u32 = 2;

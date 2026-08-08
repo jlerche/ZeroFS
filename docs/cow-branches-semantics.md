@@ -82,6 +82,60 @@ If SlateDB’s native clone/final-checkpoint mechanism does not establish all fo
 properties, the implementation adds the smallest pin manifest that does. A
 catalog record alone is not proof that storage is durable.
 
+For the pinned SlateDB revision, the production adapter therefore treats a root
+as the destination database path plus an operation-scoped internal checkpoint
+UUID and its exact manifest number. That destination checkpoint pins the branch
+manifest. The adapter derives the destination path as the configured private
+branch-database prefix plus the destination UUID; callers cannot select an
+arbitrary object-store namespace. The fully derived path is bounded and must be
+disjoint from the source namespace: equality and either ancestor/descendant
+relationship are rejected before storage I/O. A publishable source and
+destination root must be fully flushed: an exact manifest with an outstanding
+WAL range is rejected rather than treating a separately configured WAL store as
+an implicit root dependency. Each external
+database entry in the destination manifest names physical source SSTs and an
+unnamed, non-expiring final checkpoint that pins them. Root authentication
+requires the exact canonical operation result, checks every pin's checkpoint
+manifest covers the SST IDs attributed to that physical source, enumerates the
+unsegmented and segmented manifest trees, and confirms every resolved SST object
+exists with bounded concurrent metadata requests. Missing or unreadable
+evidence fails closed. SlateDB validates SST
+checksums when content is read; any later corruption fails the open/read and
+retains data rather than authorizing GC. The customer-named source checkpoint
+and catalog ancestry may be deleted after publication; physical source
+namespaces and final pins remain immutable storage dependencies until SlateDB
+compaction and detach remove every external SST reference.
+
+Before clone I/O, the adapter conditionally creates an immutable owner descriptor
+inside the destination namespace. It binds the operation UUID, destination UUID
+and path, and exact source path/checkpoint/manifest, preventing retries or
+concurrent callers from adopting storage created for different inputs. An
+immutable result descriptor elects one exact destination checkpoint when
+identical calls race. If every racer dies before election, the retry
+deterministically chooses the first `(manifest number, checkpoint UUID)` among
+the exact operation-name checkpoints; the immutable result creation remains the
+linearization point. Losing checkpoints are never valid roots and are removed
+best-effort on every retry. Applied writes with lost responses are reconciled by
+exact descriptor contents and authenticated storage state.
+
+These two descriptors are the single invariant-required storage proof for one
+clone, not customer projections or lifecycle authority. Their locations are
+derived from the destination root. The authoritative catalog operation in
+`reserved` phase owns the owner descriptor and conservatively roots the source
+plus destination namespace; in `root_created` phase it stores the exact
+`DurableRoot`, which must equal the immutable result descriptor. A live branch or
+lease root likewise owns that derived proof. Only a catalog batch may make the
+branch `Ready`, and a descriptor without the matching catalog operation/live
+root cannot do so. Additional sequential step receipts remain prohibited.
+
+Noncanonical operation checkpoints are best-effort cleanup targets and are
+retained on uncertainty. The owner descriptor, canonical result descriptor,
+canonical checkpoint, and branch database namespace remain root metadata until
+the catalog has tombstoned or aborted the exact destination, all leases and
+incomplete-operation holds are gone, and generation-fenced GC has established
+the namespace is unreachable. Cleanup is idempotent; failures leak storage and
+are retried by exact-operation reconciliation or later GC.
+
 ## Branch state machine
 
 `Deleted` is represented by removal of the live record plus a tombstone. The
@@ -131,11 +185,14 @@ a different operation ID conflicts. An authorized repair request for the exact
 UUID may resume the recorded operation, but no unbounded global recovery sweep
 is required.
 
-The recovery record is deliberately small: operation UUID, destination UUID and
-name, exact source UUID/manifest, optional parent UUID, and phase (`reserved` or
-`root_created` with the resulting destination root). Per-step receipts,
-takeover generations, activity fences, and recovery sweeps are prohibited until
-a demonstrated failure case cannot be reconciled from these fields.
+The authoritative catalog recovery record is deliberately small: operation
+UUID, destination UUID and name, exact source UUID/manifest, optional parent
+UUID, and phase (`reserved` or `root_created` with the resulting destination
+root). The derived immutable storage owner/result proof described above is the
+minimum conditional-write evidence required by ROOT-1 and PUB-1; it does not add
+catalog phases. Additional per-step receipts, takeover generations, activity
+fences, and recovery sweeps are prohibited until a demonstrated failure case
+cannot be reconciled from these fields.
 
 ## Checkpoint state and deletion
 

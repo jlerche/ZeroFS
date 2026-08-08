@@ -65,7 +65,7 @@
 - [x] Define a ready branch as independently mountable without its parent branch or source checkpoint.
   - [x] Require the branch's durable root to exist before publishing `Ready`.
   - [x] Require the durable root to pin every immutable object the branch may read.
-  - [ ] Verify that the SlateDB clone/final-checkpoint mechanism provides this property or add the smallest required pinning layer.
+  - [x] Verify that the SlateDB clone/final-checkpoint mechanism provides this property or add the smallest required pinning layer.
 - [x] Define ancestry behavior after deletion.
   - [x] Decide whether `parent_id` continues to reference a tombstoned UUID, becomes optional, or is reparented for display purposes.
   - [x] Ensure ancestry representation does not control physical liveness.
@@ -131,7 +131,7 @@
 - [ ] Create a branch from an exact immutable checkpoint identity.
   - [ ] Resolve checkpoint name to stable UUID and manifest identity once.
   - [ ] Prevent deletion or replacement of that exact source while clone publication is incomplete.
-  - [ ] Create the destination's independent durable root.
+  - [x] Create the destination's independent durable root.
   - [ ] Publish the branch as `Ready` only after the root is durable.
 - [ ] Support creation from live head only if it can be reduced to the same checkpoint-based primitive.
   - [ ] Flush the parent to a durable point.
@@ -385,3 +385,11 @@
 - Normative contract: `docs/cow-branches-semantics.md` defines stable identity/name reuse, the branch state machine, publication and deletion linearization points, exact retry behavior, minimal create recovery, bounded leases, authoritative GC roots, two-observation deletion eligibility, and fail-closed behavior.
 - Research reuse: the contract maps research registry, manager, mount, GC, CLI/RPC, and documentation artifacts to specific reusable scenarios while explicitly rejecting the monolithic registry, broad fencing, receipt, takeover, and candidate-by-view designs.
 - Review policy: storage, catalog, lifecycle, lease, GC, API, and rollout work remain separate coherent changes. Production code and focused tests land together, and each subtask requires an independent pre-commit review.
+
+### 2026-08-08: durable SlateDB root adapter
+
+- Native mechanism finding: SlateDB clones remain shallow while their manifests reference external SSTs. Clone creation installs unnamed final checkpoints in the physical source namespaces; deleting a customer-named source checkpoint is safe, while deleting those internal pins is not.
+- Root representation: `SlateDbRootStore` derives a destination below a configured private branch prefix, creates one operation-scoped internal checkpoint, and records its exact checkpoint/manifest identity as the branch root. Verification requires the canonical immutable operation result, a fully flushed manifest with no outstanding WAL range, final-pin manifest coverage, and existence of every SST resolved across unsegmented and segmented trees without consulting catalog ancestry or customer projections.
+- Retry boundary: immutable owner and result descriptors in the private destination namespace are the one storage proof rooted by the matching catalog operation/live root. They bind exact operation/source/destination inputs, reconcile applied writes with lost responses, and elect one canonical root. A crash leaving duplicate operation checkpoints is recovered by deterministic election and best-effort loser cleanup. Descriptors never publish lifecycle state; the authoritative catalog remains the only `Ready` authority.
+- Cleanup boundary: the proof descriptors, canonical checkpoint, and destination namespace remain root metadata while referenced by an incomplete operation, live branch, or lease. Noncanonical checkpoints are cleaned on retries; final cleanup waits for exact tombstone/abort state, lease drain, and generation-fenced GC. Uncertainty retains.
+- Executable proof: focused in-memory tests clone from an exact checkpoint identity, reject mismatched manifests and WAL-dependent roots before clone I/O, reject unowned, overlapping, oversized, or malformed destinations, converge concurrent retries, recover duplicate checkpoints after every creator crashes before result publication, reject noncanonical losing roots, detect missing reachable SSTs in ordinary and segmented manifests, reconcile injected lost responses, delete the named source checkpoint, read and write the child independently, verify the parent remains unchanged, and fail closed after removal of an external final pin.
