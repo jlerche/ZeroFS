@@ -1032,14 +1032,18 @@ pub async fn run_server(
 
     let gc_handle = if !db_mode.is_read_only() {
         let tuning = crate::fs::gc::GcTuning::from(settings.gc.unwrap_or_default());
-        let gc = Arc::new(GarbageCollector::new(
+        let mut gc = GarbageCollector::new(
             Arc::clone(&fs.db),
             fs.tombstone_store.clone(),
             fs.extent_store.clone(),
             Arc::clone(&fs.stats),
             gc_admin,
             tuning,
-        ));
+        );
+        if settings.storage.segment_pool_path.is_some() {
+            gc = gc.without_segment_reclamation();
+        }
+        let gc = Arc::new(gc);
         Some(gc.start(shutdown.clone(), maintenance_runtime.clone()))
     } else {
         None

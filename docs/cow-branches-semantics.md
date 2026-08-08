@@ -349,6 +349,39 @@ An object may be deleted only when every condition below is proven:
 
 Failure to prove any condition retains the object.
 
+After the accepted second observation, every valid root transition is
+forward-closed: it may inherit segment IDs only from an authoritative root that
+was already captured at that observation, or publish newly allocated IDs from a
+permanent pool epoch reservation. It may never manufacture a reference to an
+older unreachable segment ID. This follows from clone/source holds, active
+writer and recovery roots, and pool-global non-reuse. Without that invariant,
+physical deletion would require an atomic catalog-wide mutation barrier rather
+than the generation preflight used here, and must fail closed.
+
+The authority boundary enforces this rule rather than relying on caller
+discipline. Production catalog mutations expose no generic branch/checkpoint
+root insertion or root-replacement operation: roots are published only by the
+dedicated authenticated lifecycle transitions. Checkpoint creation and branch
+head advancement remain unavailable through the production catalog until their
+dedicated transitions enforce the same source-hold/new-allocation rule. Generic
+root-bearing mutations exist only as unit-test fixtures, where branch
+replacement is additionally forbidden from changing the root.
+
+Every legitimate segment writer also treats `segments/...` keys as immutable.
+Small seals use conditional create. Multipart seals upload to a unique
+non-authoritative staging key and atomically copy-if-absent into the segment
+namespace. A lost response or exact retry succeeds only after streaming
+byte-for-byte reconciliation; a different payload at the same key fails closed.
+Thus an admitted writer cannot replace a candidate between GC's immediate
+identity check and delete.
+
+The legacy per-database segment reclaimer, compactor source deletion, and orphan
+sweep are disabled whenever a shared segment pool is configured. Their liveness
+view covers only one database and therefore cannot prove that a sibling branch
+has released a segment. Metadata/tombstone GC continues independently; physical
+shared-pool deletion belongs exclusively to the authoritative catalog protocol
+until a future local-GC proof establishes exact private ownership.
+
 ### Streaming mark, inventory, quarantine, and delete
 
 All branches of one volume resolve `FrameLoc` segment IDs in one immutable,
@@ -396,8 +429,11 @@ duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
    generation fence. Durably pin that fresh root list before marking it, then
    remove every newly reachable, missing, changed, or otherwise uncertain
    candidate. This transition still performs no physical deletion.
-8. Delete proven candidates in bounded idempotent batches and durably checkpoint
-   batch progress.
+8. Delete proven candidates in explicitly enabled batches of at most 4,096.
+   Re-stream and match the strong object identity immediately before each
+   delete, confirm absence, then durably checkpoint the shard/record cursor and
+   aggregate counts. A crash before cursor publication replays an already
+   absent object safely.
 
 The run record contains only run UUID, generation, cutoff, segment-pool
 identity, both immutable observation root-list identities/digests, mark and
@@ -407,7 +443,9 @@ aggregate reachable/absent/retained counts and bytes, never unbounded
 per-object catalog metadata.
 Bounded per-kind blocker records retain the last reason and occurrence count for
 missing roots, corrupt metadata, generation changes, lease uncertainty, or
-storage unavailability. Missing state prevents deletion. Interrupted work
+storage unavailability. Missing state prevents deletion. The deletion record is
+bounded to a cursor, immutable batch size, timestamps, and aggregate object/byte
+counts; it never stores an unbounded per-object receipt list. Interrupted work
 resumes exactly or aborts and leaks storage. Delete retries are idempotent.
 
 ### Private fast path and cleanup

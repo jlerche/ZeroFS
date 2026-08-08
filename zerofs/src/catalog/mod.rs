@@ -32,7 +32,7 @@ pub use deletion::{
     BranchDeleteRequest, BranchDeleteResult, CheckpointDeleteRequest, DeletionLifecycle,
     DeletionLifecycleError,
 };
-pub use gc::{RootCaptureLifecycle, RootCaptureLifecycleError};
+pub use gc::{GcDeletionPolicy, RootCaptureLifecycle, RootCaptureLifecycleError};
 pub use json::JsonCatalogProjection;
 pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
@@ -45,7 +45,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 10;
+pub const CATALOG_SCHEMA_VERSION: u32 = 11;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -506,18 +506,9 @@ pub enum GcRunPhase {
     Quarantined,
     Revalidating,
     Validated,
+    Deleting,
     Completed,
     Aborted,
-}
-
-impl GcRunPhase {
-    fn retains_roots(self) -> bool {
-        // Every implemented phase retains both observations' captured roots.
-        // Physical deletion may only release them in a later durable terminal
-        // transition; unknown or unsupported phases therefore fail closed.
-        let _ = self;
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -546,6 +537,8 @@ pub struct GcRunRecord {
     /// candidates remained unreachable after the configured grace period.
     #[serde(default)]
     pub revalidation: Option<GcRevalidationRecord>,
+    #[serde(default)]
+    pub deletion: Option<GcDeletionProgress>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -613,6 +606,28 @@ pub struct GcRevalidationStats {
     pub already_absent: u64,
     pub retained_candidates: u64,
     pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcDeletionProgress {
+    pub batch_size: u32,
+    /// 0..=256; 256 is the durable end-of-stream sentinel.
+    pub next_shard: u16,
+    pub next_record: u64,
+    pub deleted_objects: u64,
+    pub deleted_bytes: u64,
+    pub already_absent: u64,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GcDeletionPublication {
+    pub(crate) run_id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) expected_generation: u64,
+    pub(crate) progress: GcDeletionProgress,
+    pub(crate) updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +707,12 @@ impl GcBlockerRecord {
 }
 
 impl GcRunRecord {
+    fn retains_roots(&self) -> bool {
+        // Only a fully schema-valid completed deletion releases pins. A
+        // fabricated, partial, future, or corrupt terminal record retains.
+        self.phase != GcRunPhase::Completed || self.validate().is_err()
+    }
+
     pub fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "GC run")?;
         validate_revision(self.revision, "GC run")?;
@@ -703,7 +724,8 @@ impl GcRunRecord {
                     && self.quarantine_shards.is_empty()
                     && self.inventory_stats.is_none()
                     && self.quarantine_at.is_none()
-                    && self.revalidation.is_none() => {}
+                    && self.revalidation.is_none()
+                    && self.deletion.is_none() => {}
             GcRunPhase::Marking
                 if self.revision == 2
                     && self.mark_shards.len() == 256
@@ -711,7 +733,8 @@ impl GcRunRecord {
                     && self.quarantine_shards.is_empty()
                     && self.inventory_stats.is_none()
                     && self.quarantine_at.is_none()
-                    && self.revalidation.is_none() => {}
+                    && self.revalidation.is_none()
+                    && self.deletion.is_none() => {}
             GcRunPhase::Quarantined
                 if self.revision == 3
                     && !self.segment_pool.is_empty()
@@ -720,7 +743,8 @@ impl GcRunRecord {
                     && self.quarantine_shards.len() == 256
                     && self.inventory_stats.is_some()
                     && self.quarantine_at.is_some()
-                    && self.revalidation.is_none() => {}
+                    && self.revalidation.is_none()
+                    && self.deletion.is_none() => {}
             GcRunPhase::Revalidating
                 if self.revision == 4
                     && self.revalidation.as_ref().is_some_and(|observation| {
@@ -730,7 +754,8 @@ impl GcRunRecord {
                             && observation.stats.is_none()
                             && observation.completed_at.is_none()
                             && observation.captured_at == self.updated_at
-                    }) => {}
+                    })
+                    && self.deletion.is_none() => {}
             GcRunPhase::Validated
                 if self.revision == 5
                     && self.revalidation.as_ref().is_some_and(|observation| {
@@ -739,10 +764,38 @@ impl GcRunRecord {
                             && observation.candidate_shards.len() == 256
                             && observation.stats.is_some()
                             && observation.completed_at == Some(self.updated_at)
-                    }) => {}
+                    })
+                    && self.deletion.is_none() => {}
+            GcRunPhase::Deleting
+                if self.revision >= 6
+                    && self.revalidation.as_ref().is_some_and(|observation| {
+                        observation.mark_shards.len() == 256
+                            && observation.mark_stats.is_some()
+                            && observation.candidate_shards.len() == 256
+                            && observation.stats.is_some()
+                            && observation.completed_at.is_some()
+                    })
+                    && self
+                        .deletion
+                        .as_ref()
+                        .is_some_and(|progress| progress.completed_at.is_none()) => {}
+            GcRunPhase::Completed
+                if self.revision >= 7
+                    && self.revalidation.as_ref().is_some_and(|observation| {
+                        observation.mark_shards.len() == 256
+                            && observation.mark_stats.is_some()
+                            && observation.candidate_shards.len() == 256
+                            && observation.stats.is_some()
+                            && observation.completed_at.is_some()
+                    })
+                    && self
+                        .deletion
+                        .as_ref()
+                        .is_some_and(|progress| progress.completed_at == Some(self.updated_at)) => {
+            }
             _ => {
                 return Err(CatalogError::Invalid(
-                    "GC schema v10 supports captured through validated revisions".to_string(),
+                    "GC schema v11 supports captured through completed revisions".to_string(),
                 ));
             }
         }
@@ -884,6 +937,87 @@ impl GcRunRecord {
                 return Err(CatalogError::Invalid(
                     "GC revalidation did not classify every first-observation candidate"
                         .to_string(),
+                ));
+            }
+        }
+        if let Some(progress) = &self.deletion {
+            progress.validate(self)?;
+        }
+        Ok(())
+    }
+}
+
+impl GcDeletionProgress {
+    fn validate(&self, run: &GcRunRecord) -> Result<(), CatalogError> {
+        if self.batch_size == 0 || self.batch_size > gc::MAX_DELETE_BATCH_SIZE {
+            return Err(CatalogError::Invalid(
+                "GC delete batch size is outside the safety bound".to_string(),
+            ));
+        }
+        if self.next_shard > 256 || (self.next_shard == 256 && self.next_record != 0) {
+            return Err(CatalogError::Invalid(
+                "GC deletion cursor is invalid".to_string(),
+            ));
+        }
+        validate_timestamp(self.started_at, "GC deletion start")?;
+        let revalidation_stats = run
+            .revalidation
+            .as_ref()
+            .and_then(|observation| observation.stats.as_ref())
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC deletion requires revalidation".to_string())
+            })?;
+        let revalidation_completed = run
+            .revalidation
+            .as_ref()
+            .and_then(|observation| observation.completed_at)
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC deletion requires completed revalidation".to_string())
+            })?;
+        let retained = revalidation_stats.retained_candidates;
+        let candidate_shards = &run
+            .revalidation
+            .as_ref()
+            .expect("checked above")
+            .candidate_shards;
+        if self.next_shard < 256
+            && self.next_record > candidate_shards[self.next_shard as usize].candidate_count
+        {
+            return Err(CatalogError::Invalid(
+                "GC deletion cursor exceeds its candidate shard".to_string(),
+            ));
+        }
+        let processed = candidate_shards
+            .iter()
+            .take(self.next_shard as usize)
+            .try_fold(0u64, |total, shard| {
+                total.checked_add(shard.candidate_count).ok_or_else(|| {
+                    CatalogError::Invalid("GC deletion cursor count overflow".to_string())
+                })
+            })?
+            .checked_add(self.next_record)
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC deletion cursor count overflow".to_string())
+            })?;
+        let classified = self
+            .deleted_objects
+            .checked_add(self.already_absent)
+            .ok_or_else(|| CatalogError::Invalid("GC deletion count overflow".to_string()))?;
+        if self.started_at < revalidation_completed
+            || self.deleted_bytes > revalidation_stats.retained_bytes
+            || classified != processed
+            || classified > retained
+            || (self.completed_at.is_some() && (self.next_shard != 256 || classified != retained))
+        {
+            return Err(CatalogError::Invalid(
+                "GC deletion progress disagrees with retained candidates".to_string(),
+            ));
+        }
+        if let Some(completed_at) = self.completed_at {
+            validate_timestamp(completed_at, "GC deletion completion")?;
+            if completed_at < self.started_at {
+                return Err(CatalogError::Invalid(
+                    "GC deletion completion precedes its start".to_string(),
                 ));
             }
         }
@@ -1283,13 +1417,13 @@ impl CatalogSnapshot {
         roots.extend(
             self.gc_runs
                 .values()
-                .filter(|run| run.phase.retains_roots())
+                .filter(|run| run.retains_roots())
                 .flat_map(|run| run.roots.iter().map(|pin| &pin.root)),
         );
         roots.extend(
             self.gc_runs
                 .values()
-                .filter(|run| run.phase.retains_roots())
+                .filter(|run| run.retains_roots())
                 .filter_map(|run| run.revalidation.as_ref())
                 .flat_map(|observation| observation.roots.iter().map(|pin| &pin.root)),
         );
@@ -1339,11 +1473,7 @@ impl CatalogSnapshot {
             };
             push(kind, &lease.root);
         }
-        for run in self
-            .gc_runs
-            .values()
-            .filter(|run| run.phase.retains_roots())
-        {
+        for run in self.gc_runs.values().filter(|run| run.retains_roots()) {
             for pin in &run.roots {
                 push(pin.kind, &pin.root);
             }
@@ -1422,12 +1552,19 @@ pub(crate) enum CatalogMutation {
         expected_revision: u64,
         updated_at: DateTime<Utc>,
     },
+    /// Test-only fixture insertion. Production root publication must use an
+    /// authenticated lifecycle transition; there is intentionally no generic
+    /// root-bearing create escape hatch.
+    #[cfg(test)]
     CreateBranch(BranchRecord),
+    #[cfg(test)]
     ReplaceBranch {
         expected_revision: u64,
         record: BranchRecord,
     },
+    #[cfg(test)]
     CreateCheckpoint(CheckpointRecord),
+    #[cfg(test)]
     ReplaceCheckpoint {
         expected_revision: u64,
         record: CheckpointRecord,
@@ -1566,6 +1703,16 @@ pub(crate) trait Catalog: Send + Sync {
     ) -> Result<GcRunRecord, CatalogError> {
         Err(CatalogError::Invalid(
             "catalog backend does not support GC revalidation".to_string(),
+        ))
+    }
+    /// Persist a deletion cursor transition while the catalog still has the
+    /// second observation's exact generation.
+    async fn publish_gc_deletion(
+        &self,
+        _publication: GcDeletionPublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support GC deletion".to_string(),
         ))
     }
     async fn record_gc_blocker(

@@ -16,8 +16,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use slatedb::object_store::{
-    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    path::Path,
+    CopyMode, CopyOptions, GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt,
+    PutMode, PutOptions, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -32,6 +32,7 @@ const SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 1;
 const SEGMENT_POOL_GENESIS_PATH: &str = "segment-pool-genesis.json";
 const SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
 const SEGMENT_POOL_AUTH_INFO: &[u8] = b"zerofs-v1-segment-pool-authority";
+const SEGMENT_UPLOAD_PREFIX: &str = "segment-uploads";
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SegmentPoolGenesis {
@@ -437,10 +438,7 @@ impl SegmentStore {
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
         if bytes.len() < SEAL_PART_SIZE {
-            self.object_store
-                .put(&path, bytes.clone().into())
-                .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            self.put_segment_create(&path, &bytes).await?;
         } else {
             self.put_segment_multipart(&path, &bytes).await?;
         }
@@ -453,6 +451,74 @@ impl SegmentStore {
         Ok(())
     }
 
+    /// Atomically create an immutable segment key. A retried request whose
+    /// success response was lost is accepted only when the existing bytes are
+    /// exactly the bytes this writer intended to publish.
+    async fn put_segment_create(&self, path: &Path, bytes: &Bytes) -> Result<()> {
+        match self
+            .object_store
+            .put_opts(
+                path,
+                bytes.clone().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => self.reconcile_segment_create(path, bytes, error).await,
+        }
+    }
+
+    async fn reconcile_segment_create(
+        &self,
+        path: &Path,
+        bytes: &Bytes,
+        create_error: slatedb::object_store::Error,
+    ) -> Result<()> {
+        match self.existing_segment_matches(path, bytes).await {
+            Ok(true) => Ok(()),
+            Ok(false)
+                if matches!(
+                    &create_error,
+                    slatedb::object_store::Error::AlreadyExists { .. }
+                ) =>
+            {
+                Err(SegmentStoreError::ObjectStore(format!(
+                    "immutable segment key {path} already contains different bytes"
+                )))
+            }
+            Ok(false) | Err(_) => Err(SegmentStoreError::ObjectStore(create_error.to_string())),
+        }
+    }
+
+    /// Compare an existing object without buffering another segment-sized
+    /// allocation. `false` means either absent or byte-different.
+    async fn existing_segment_matches(&self, path: &Path, expected: &Bytes) -> Result<bool> {
+        let result = match self.object_store.get(path).await {
+            Ok(result) => result,
+            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+        };
+        if result.meta.size != expected.len() as u64 {
+            return Ok(false);
+        }
+        let mut offset = 0usize;
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            let end = offset.checked_add(chunk.len()).ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "segment object {path} exceeded addressable size while reconciling create"
+                ))
+            })?;
+            if end > expected.len() || chunk.as_ref() != &expected[offset..end] {
+                return Ok(false);
+            }
+            offset = end;
+        }
+        Ok(offset == expected.len())
+    }
+
     /// Multipart PUT of `bytes` in `SEAL_PART_SIZE` parts, at most
     /// `SEAL_UPLOAD_CONCURRENCY` in flight. Any failure aborts the upload before
     /// the error propagates: parts of an unfinished multipart upload are
@@ -460,9 +526,13 @@ impl SegmentStore {
     /// aborted, and each retried seal targets a fresh upload, so leaks would
     /// accrete per failure.
     async fn put_segment_multipart(&self, path: &Path, bytes: &Bytes) -> Result<()> {
+        // Multipart APIs do not expose Create semantics. Upload under a unique
+        // non-authoritative temporary key, then atomically copy-if-absent into
+        // the immutable segment namespace.
+        let upload_path = Path::from(format!("{SEGMENT_UPLOAD_PREFIX}/{}", uuid::Uuid::new_v4()));
         let mut upload = self
             .object_store
-            .put_multipart(path)
+            .put_multipart(&upload_path)
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         // Parts run as spawned tasks, so upload progress never waits on this
@@ -492,11 +562,31 @@ impl SegmentStore {
             // itself fails (leaving the parts to the backend's lifecycle rule).
             parts.shutdown().await;
             if let Err(abort_err) = upload.abort().await {
-                tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+                tracing::warn!(
+                    "segment seal: aborting failed upload of {upload_path}: {abort_err}"
+                );
             }
             return Err(SegmentStoreError::ObjectStore(e.to_string()));
         }
-        Ok(())
+        let copy_result = self
+            .object_store
+            .copy_opts(
+                &upload_path,
+                path,
+                CopyOptions {
+                    mode: CopyMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let result = match copy_result {
+            Ok(()) => Ok(()),
+            Err(error) => self.reconcile_segment_create(path, bytes, error).await,
+        };
+        if let Err(error) = self.object_store.delete(&upload_path).await {
+            tracing::warn!("segment seal: deleting temporary upload {upload_path}: {error}");
+        }
+        result
     }
 
     /// Seal `frames` (each `(inode, extent, full-extent plaintext)`) into one new
@@ -1434,6 +1524,94 @@ mod tests {
             let got = store.read_extent(*loc, *id, *extent).await.unwrap();
             assert_eq!(&got, data);
         }
+    }
+
+    #[tokio::test]
+    async fn segment_put_is_immutable_and_exact_retry_is_idempotent() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let segid = store.next_segid();
+        let first = Bytes::from_static(b"first immutable segment bytes");
+
+        store.put_segment(segid, first.clone()).await.unwrap();
+        store.put_segment(segid, first.clone()).await.unwrap();
+        let error = store
+            .put_segment(segid, Bytes::from_static(b"other immutable segment bytes"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("immutable segment key"));
+        assert_eq!(
+            os.get(&Path::from(segid.object_key()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            first
+        );
+    }
+
+    // This is the writer-side half of GC's identity-check/delete contract:
+    // even concurrent legitimate writers cannot replace an existing segment
+    // key between those operations. Exactly one different payload can win.
+    #[tokio::test]
+    async fn concurrent_segment_puts_cannot_replace_the_winner() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let codec = || FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let first_store = SegmentStore::new(os.clone(), codec(), 5, None);
+        let second_store = SegmentStore::new(os.clone(), codec(), 5, None);
+        let segid = Segid::new(5, 99);
+        let first = Bytes::from_static(b"first concurrent segment");
+        let second = Bytes::from_static(b"other concurrent segment");
+
+        let (first_result, second_result) = tokio::join!(
+            first_store.put_segment(segid, first.clone()),
+            second_store.put_segment(segid, second.clone())
+        );
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let stored = os
+            .get(&Path::from(segid.object_key()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(stored == first || stored == second);
+    }
+
+    #[tokio::test]
+    async fn multipart_segment_copy_is_create_only() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let segid = store.next_segid();
+        let first = noise(1, SEAL_PART_SIZE);
+        let different = noise(2, SEAL_PART_SIZE);
+
+        store.put_segment(segid, first.clone()).await.unwrap();
+        store.put_segment(segid, first.clone()).await.unwrap();
+        let error = store.put_segment(segid, different).await.unwrap_err();
+
+        assert!(error.to_string().contains("immutable segment key"));
+        assert_eq!(
+            os.get(&Path::from(segid.object_key()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            first
+        );
+        assert!(
+            os.list(Some(&Path::from(SEGMENT_UPLOAD_PREFIX)))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty(),
+            "completed multipart staging objects are cleaned up"
+        );
     }
 
     // A part failing mid-multipart must abort the upload on the way out: an

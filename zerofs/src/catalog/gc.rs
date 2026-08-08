@@ -1,9 +1,10 @@
 use super::gc_inventory::{GcInventoryError, GcInventoryStore};
 use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
-    Catalog, CatalogError, GcBlockerKind, GcQuarantinePublication, GcRevalidationCapture,
-    GcRevalidationPublication, GcRevalidationRecord, GcRootKind, GcRunPhase, GcRunRecord,
-    ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp, gc_root_digest,
+    Catalog, CatalogError, GcBlockerKind, GcDeletionProgress, GcDeletionPublication,
+    GcQuarantinePublication, GcRevalidationCapture, GcRevalidationPublication,
+    GcRevalidationRecord, GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint, RootStoreError,
+    SlateDbRootStore, catalog_timestamp, gc_root_digest,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
@@ -13,6 +14,22 @@ use uuid::Uuid;
 const ROOT_VERIFY_CONCURRENCY: usize = 16;
 /// Five-minute maximum lease + 30-second skew + one-minute propagation bound.
 pub(crate) const MIN_REVALIDATION_GRACE_SECONDS: u64 = 390;
+pub(crate) const MAX_DELETE_BATCH_SIZE: u32 = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcDeletionPolicy {
+    pub enabled: bool,
+    pub batch_size: u32,
+}
+
+impl Default for GcDeletionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 256,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RootCaptureLifecycle {
@@ -80,6 +97,7 @@ impl RootCaptureLifecycle {
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: inventory_cutoff,
             updated_at: inventory_cutoff,
         };
@@ -499,6 +517,146 @@ impl RootCaptureLifecycle {
         }
     }
 
+    /// Delete at most one explicitly enabled, bounded batch and durably publish
+    /// its next cursor. Repeated calls resume from catalog authority.
+    pub async fn delete_batch(
+        &self,
+        run_id: Uuid,
+        policy: GcDeletionPolicy,
+    ) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        if !policy.enabled {
+            return Err(CatalogError::Invalid(
+                "physical GC deletion is disabled by policy".to_string(),
+            )
+            .into());
+        }
+        if policy.batch_size == 0 || policy.batch_size > MAX_DELETE_BATCH_SIZE {
+            return Err(CatalogError::Invalid(format!(
+                "GC delete batch size must be between 1 and {MAX_DELETE_BATCH_SIZE}"
+            ))
+            .into());
+        }
+        let mut run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        if run.phase == GcRunPhase::Completed {
+            return Ok(run);
+        }
+        let observation = run.revalidation.clone().ok_or_else(|| {
+            CatalogError::OperationConflict(format!("{run_id}: revalidation is incomplete"))
+        })?;
+        // Valid root publication is forward-closed: it can inherit only from
+        // roots captured at H or allocate a globally fresh pool segment ID.
+        // Thus a post-H mutation cannot resurrect one of H's unreachable IDs;
+        // the preflight still rejects known drift conservatively.
+        let current_generation = self.catalog.snapshot().await?.generation;
+        if current_generation != observation.catalog_generation {
+            self.record_blocker(
+                run_id,
+                GcBlockerKind::GenerationChanged,
+                format!(
+                    "catalog generation changed after second observation at {}",
+                    observation.catalog_generation
+                ),
+            )
+            .await;
+            return Err(CatalogError::RevisionConflict {
+                expected: observation.catalog_generation,
+                actual: current_generation,
+            }
+            .into());
+        }
+        let inventory = GcInventoryStore::new(&self.roots);
+        if let Err(error) = inventory.verify_revalidation(&observation).await {
+            self.record_blocker(run_id, classify_inventory_error(&error), error.to_string())
+                .await;
+            return Err(error.into());
+        }
+        if run.phase == GcRunPhase::Validated {
+            let started_at = catalog_timestamp(Utc::now()).max(run.updated_at);
+            let initial = GcDeletionProgress {
+                batch_size: policy.batch_size,
+                next_shard: 0,
+                next_record: 0,
+                deleted_objects: 0,
+                deleted_bytes: 0,
+                already_absent: 0,
+                started_at,
+                completed_at: None,
+            };
+            run = self
+                .catalog
+                .publish_gc_deletion(GcDeletionPublication {
+                    run_id,
+                    expected_revision: run.revision,
+                    expected_generation: observation.catalog_generation,
+                    progress: initial,
+                    updated_at: started_at,
+                })
+                .await?;
+        }
+        if run.phase != GcRunPhase::Deleting {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let previous = run
+            .deletion
+            .clone()
+            .ok_or_else(|| CatalogError::Corrupt("deleting GC run has no progress".to_string()))?;
+        if previous.batch_size != policy.batch_size {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let batch = match inventory
+            .delete_batch(
+                &run.segment_pool,
+                &observation,
+                previous.next_shard,
+                previous.next_record,
+                policy.batch_size,
+            )
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.record_blocker(run_id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let updated_at = catalog_timestamp(Utc::now()).max(run.updated_at);
+        let completed_at = (batch.next_shard == 256).then_some(updated_at);
+        let progress = GcDeletionProgress {
+            batch_size: previous.batch_size,
+            next_shard: batch.next_shard,
+            next_record: batch.next_record,
+            deleted_objects: previous
+                .deleted_objects
+                .checked_add(batch.deleted_objects)
+                .ok_or_else(|| CatalogError::Corrupt("GC deleted count overflow".to_string()))?,
+            deleted_bytes: previous
+                .deleted_bytes
+                .checked_add(batch.deleted_bytes)
+                .ok_or_else(|| CatalogError::Corrupt("GC deleted bytes overflow".to_string()))?,
+            already_absent: previous
+                .already_absent
+                .checked_add(batch.already_absent)
+                .ok_or_else(|| CatalogError::Corrupt("GC absent count overflow".to_string()))?,
+            started_at: previous.started_at,
+            completed_at,
+        };
+        self.catalog
+            .publish_gc_deletion(GcDeletionPublication {
+                run_id,
+                expected_revision: run.revision,
+                expected_generation: observation.catalog_generation,
+                progress,
+                updated_at,
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
         if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
             let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
@@ -689,6 +847,7 @@ mod tests {
             phase: GcRunPhase::Completed,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: now,
             updated_at: now,
         };
@@ -812,6 +971,7 @@ mod tests {
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: now,
             updated_at: now,
         };
@@ -868,7 +1028,8 @@ mod tests {
         let became_reachable = Segid::new(12, 256);
         let absent = Segid::new(12, 512);
         let retained = Segid::new(12, 768);
-        for segment in [reachable, became_reachable, absent, retained] {
+        let retained_two = Segid::new(12, 1_024);
+        for segment in [reachable, became_reachable, absent, retained, retained_two] {
             store
                 .put(
                     &Path::from(format!("{segment_pool}/{}", segment.object_key())),
@@ -894,6 +1055,7 @@ mod tests {
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: now,
             updated_at: now,
         };
@@ -916,7 +1078,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .candidate_objects,
-            3
+            4
         );
         store
             .delete(&Path::from(format!(
@@ -976,6 +1138,7 @@ mod tests {
                     phase: GcRunPhase::Captured,
                     quarantine_at: None,
                     revalidation: None,
+                    deletion: None,
                     created_at: now,
                     updated_at: now,
                 },
@@ -1010,10 +1173,10 @@ mod tests {
             .stats
             .as_ref()
             .unwrap();
-        assert_eq!(stats.first_observation_candidates, 3);
+        assert_eq!(stats.first_observation_candidates, 4);
         assert_eq!(stats.became_reachable, 1);
         assert_eq!(stats.already_absent, 1);
-        assert_eq!(stats.retained_candidates, 1);
+        assert_eq!(stats.retained_candidates, 2);
         let mut malformed = validated.clone();
         malformed
             .revalidation
@@ -1022,7 +1185,7 @@ mod tests {
             .stats
             .as_mut()
             .unwrap()
-            .first_observation_candidates = 2;
+            .first_observation_candidates = 3;
         assert!(matches!(
             malformed.validate(),
             Err(CatalogError::Invalid(_))
@@ -1046,6 +1209,68 @@ mod tests {
                 .await
                 .unwrap(),
             validated
+        );
+        assert!(matches!(
+            lifecycle
+                .delete_batch(run.id, GcDeletionPolicy::default())
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
+        let policy = GcDeletionPolicy {
+            enabled: true,
+            batch_size: 1,
+        };
+        let partial = lifecycle.delete_batch(run.id, policy).await.unwrap();
+        assert_eq!(partial.phase, GcRunPhase::Deleting);
+        assert_eq!(partial.revision, 7);
+        assert_eq!(partial.deletion.as_ref().unwrap().deleted_objects, 1);
+        let mut skipped = partial.clone();
+        skipped.deletion.as_mut().unwrap().next_record += 1;
+        assert!(matches!(skipped.validate(), Err(CatalogError::Invalid(_))));
+        assert_eq!(
+            catalog
+                .publish_gc_deletion(GcDeletionPublication {
+                    run_id: run.id,
+                    expected_revision: 6,
+                    expected_generation: 0,
+                    progress: partial.deletion.clone().unwrap(),
+                    updated_at: partial.updated_at,
+                })
+                .await
+                .unwrap(),
+            partial,
+            "an exact retry must reconcile a lost progress response"
+        );
+        let completed = lifecycle.delete_batch(run.id, policy).await.unwrap();
+        assert_eq!(completed.phase, GcRunPhase::Completed);
+        assert_eq!(completed.revision, 8);
+        let deletion = completed.deletion.as_ref().unwrap();
+        assert_eq!(deletion.next_shard, 256);
+        assert_eq!(deletion.deleted_objects, 2);
+        assert_eq!(deletion.deleted_bytes, 2);
+        assert_eq!(deletion.already_absent, 0);
+        assert!(deletion.completed_at.is_some());
+        assert!(matches!(
+            store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    retained.object_key()
+                )))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    retained_two.object_key()
+                )))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert_eq!(
+            lifecycle.delete_batch(run.id, policy).await.unwrap(),
+            completed
         );
         catalog.close().await.unwrap();
     }
@@ -1142,6 +1367,7 @@ mod tests {
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: now,
             updated_at: now,
         };

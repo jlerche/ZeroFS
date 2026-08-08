@@ -311,6 +311,11 @@ pub struct GarbageCollector {
     /// reclamation. `None` disables the check (tests).
     checkpoint_admin: Option<Admin>,
     tuning: GcTuning,
+    /// Legacy per-database segment reclamation is unsound when segment objects
+    /// live in a volume-wide shared pool: this database cannot prove that a
+    /// sibling root no longer references one of them. Metadata/tombstone GC is
+    /// independent and remains enabled.
+    segment_reclamation_enabled: bool,
 }
 
 impl GarbageCollector {
@@ -329,7 +334,15 @@ impl GarbageCollector {
             stats,
             checkpoint_admin,
             tuning,
+            segment_reclamation_enabled: true,
         }
+    }
+
+    /// Disable every legacy physical segment-deletion path while retaining
+    /// metadata/tombstone GC. Shared pools must use authoritative catalog GC.
+    pub fn without_segment_reclamation(mut self) -> Self {
+        self.segment_reclamation_enabled = false;
+        self
     }
 
     /// Reclaim dead segment objects, unless a checkpoint pins an older manifest
@@ -339,6 +352,9 @@ impl GarbageCollector {
         &self,
         keep_going: impl Fn(usize) -> bool,
     ) -> Option<PassOutcome> {
+        if !self.segment_reclamation_enabled {
+            return None;
+        }
         // The gate runs inside reclaim_segments_gated, after its durable
         // barrier, see that method for the checkpoint race this ordering
         // closes. `floor` is sampled there too, so it covers in-flight reads
@@ -407,6 +423,9 @@ impl GarbageCollector {
     /// [`ExtentStore::sweep_orphans_if_due`]; this just supplies the interval
     /// and logs the outcome.
     async fn maybe_sweep_orphans(&self) {
+        if !self.segment_reclamation_enabled {
+            return;
+        }
         let interval = chrono::Duration::seconds(ORPHAN_SWEEP_INTERVAL_SECS);
         match self.extent_store.sweep_orphans_if_due(interval).await {
             Ok(Some(n)) => {
@@ -428,11 +447,11 @@ impl GarbageCollector {
     ) -> Vec<JoinHandle<()>> {
         // Read replicas and checkpoint mounts never start GC, so reads never
         // track nominations there; `read_directed = false` works the same way.
-        if self.tuning.read_directed {
+        if self.segment_reclamation_enabled && self.tuning.read_directed {
             self.extent_store.enable_nominations();
         }
 
-        let reclaim_handle = {
+        let reclaim_handle = self.segment_reclamation_enabled.then(|| {
             let gc = Arc::clone(&self);
             let shutdown = shutdown.clone();
             let reclaim = async move {
@@ -512,7 +531,12 @@ impl GarbageCollector {
                 Some(rt) => spawn_named_on("segment-gc", reclaim, rt),
                 None => spawn_named("segment-gc", reclaim),
             }
-        };
+        });
+        if reclaim_handle.is_none() {
+            info!(
+                "Legacy per-database segment reclamation disabled for shared segment pool; authoritative catalog GC owns physical deletion"
+            );
+        }
 
         let fut = async move {
             info!("Starting garbage collection task (runs continuously)");
@@ -544,7 +568,10 @@ impl GarbageCollector {
         } else {
             spawn_named("gc", fut)
         };
-        vec![reclaim_handle, tombstone_handle]
+        reclaim_handle
+            .into_iter()
+            .chain(std::iter::once(tombstone_handle))
+            .collect()
     }
 
     pub async fn run(&self) -> Result<(), FsError> {
@@ -683,9 +710,18 @@ impl GarbageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_transformer::ZeroFsBlockTransformer;
+    use crate::config::CompressionConfig;
+    use crate::db::SlateDbHandle;
+    use crate::frame_codec::FrameCodec;
     use crate::fs::ZeroFS;
     use crate::fs::key_codec::KeyCodec;
     use crate::fs::store::tombstone::TombstoneEntry;
+    use crate::object_trace::ObjectTracer;
+    use crate::segment::SEGMENT_INFO;
+    use futures::TryStreamExt;
+    use slatedb::object_store::{ObjectStore, memory::InMemory, path::Path};
+    use slatedb::{BlockTransformer, DbBuilder};
 
     fn no_wait() -> WriteOptions {
         WriteOptions {
@@ -973,6 +1009,110 @@ mod tests {
             None,
             GcTuning::default(),
         )
+    }
+
+    async fn shared_pool_fs(
+        db_path: &str,
+        metadata: Arc<dyn ObjectStore>,
+        pool: Arc<dyn ObjectStore>,
+    ) -> ZeroFS {
+        let key = [0u8; 32];
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&key, CompressionConfig::default());
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from(db_path), metadata)
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        ZeroFS::new_with_slatedb_and_lease(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            false,
+            false,
+            None,
+            None,
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            ObjectTracer::new(),
+            pool,
+            FrameCodec::new(&key, SEGMENT_INFO, CompressionConfig::default()),
+            Some(u64::from_be_bytes(
+                uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap(),
+            )),
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_pool_local_gc_preserves_a_sibling_branches_segment() {
+        let metadata: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let branch_a = shared_pool_fs("branch-a", metadata.clone(), pool.clone()).await;
+        let branch_b = shared_pool_fs("branch-b", metadata, pool.clone()).await;
+
+        let mut txn = branch_b.db.new_transaction().unwrap();
+        branch_b
+            .extent_store
+            .write(
+                &mut txn,
+                77,
+                0,
+                &Bytes::from_static(b"owned only by branch b"),
+                0,
+            )
+            .await
+            .unwrap();
+        branch_b.write_coordinator.commit(txn).await.unwrap();
+        branch_b.extent_store.seal_open().await.unwrap();
+        branch_b.flush_coordinator.flush().await.unwrap();
+
+        let segment_paths = || {
+            let pool = pool.clone();
+            async move {
+                pool.list(Some(&Path::from("segments")))
+                    .map_ok(|meta| meta.location)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let before = segment_paths().await;
+        assert_eq!(before.len(), 1, "branch B published one shared segment");
+
+        let gc = GarbageCollector::new(
+            Arc::clone(&branch_a.db),
+            branch_a.tombstone_store.clone(),
+            branch_a.extent_store.clone(),
+            Arc::clone(&branch_a.stats),
+            None,
+            GcTuning::default(),
+        )
+        .without_segment_reclamation();
+        assert!(gc.maybe_reclaim_segments(|_| true).await.is_none());
+        gc.maybe_sweep_orphans().await;
+        gc.run().await.unwrap();
+        assert_eq!(segment_paths().await, before);
+
+        let shutdown = CancellationToken::new();
+        let handles = Arc::new(gc).start(shutdown.clone(), None);
+        assert_eq!(
+            handles.len(),
+            1,
+            "shared-pool mode starts metadata GC but no legacy segment task"
+        );
+        shutdown.cancel();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(segment_paths().await, before);
     }
 
     async fn tombstones(store: &TombstoneStore) -> Vec<TombstoneEntry> {

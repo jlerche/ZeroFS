@@ -72,6 +72,14 @@ pub(crate) struct GcRevalidationBuild {
     pub(crate) stats: GcRevalidationStats,
 }
 
+pub(crate) struct GcDeleteBatch {
+    pub(crate) next_shard: u16,
+    pub(crate) next_record: u64,
+    pub(crate) deleted_objects: u64,
+    pub(crate) deleted_bytes: u64,
+    pub(crate) already_absent: u64,
+}
+
 pub(crate) struct GcInventoryStore {
     object_store: Arc<dyn ObjectStore>,
 }
@@ -521,6 +529,133 @@ impl GcInventoryStore {
             &observation.candidate_shards,
         )
         .await
+    }
+
+    pub(crate) async fn delete_batch(
+        &self,
+        segment_pool: &str,
+        observation: &GcRevalidationRecord,
+        mut next_shard: u16,
+        mut next_record: u64,
+        limit: u32,
+    ) -> Result<GcDeleteBatch, GcInventoryError> {
+        if next_shard > 256 || limit == 0 {
+            return Err(GcInventoryError::Corrupt(
+                "invalid GC deletion cursor or batch limit".to_string(),
+            ));
+        }
+        let digest = decode_digest(&observation.root_digest)?;
+        let mut deleted_objects = 0u64;
+        let mut deleted_bytes = 0u64;
+        let mut already_absent = 0u64;
+        let mut processed = 0u32;
+        while next_shard < 256 && processed < limit {
+            let descriptor = &observation.candidate_shards[next_shard as usize];
+            if next_record > descriptor.candidate_count {
+                return Err(GcInventoryError::Corrupt(
+                    "GC deletion cursor exceeds its candidate shard".to_string(),
+                ));
+            }
+            if next_record == descriptor.candidate_count {
+                next_shard += 1;
+                next_record = 0;
+                continue;
+            }
+            let mut reader = InventoryReader::open_with_magic(
+                Arc::clone(&self.object_store),
+                &Path::from(descriptor.location.clone()),
+                QUARANTINE_MAGIC,
+                observation.id,
+                digest,
+                descriptor.shard,
+            )
+            .await?;
+            let remaining = (limit - processed) as usize;
+            let mut selected = Vec::with_capacity(remaining);
+            let mut index = 0u64;
+            while let Some(candidate) = reader.next().await? {
+                if index >= next_record && selected.len() < remaining {
+                    selected.push(candidate);
+                }
+                index = checked_add(index, 1, "candidate artifact record count")?;
+            }
+            let verified = reader.finish().await?;
+            if verified.count != descriptor.candidate_count
+                || verified.bytes != descriptor.candidate_bytes
+                || encode_digest(verified.checksum) != descriptor.checksum
+            {
+                return Err(GcInventoryError::Corrupt(format!(
+                    "candidate shard {} changed before deletion",
+                    descriptor.shard
+                )));
+            }
+            if next_record > index || selected.is_empty() {
+                return Err(GcInventoryError::Corrupt(
+                    "GC deletion cursor cannot select its next candidate".to_string(),
+                ));
+            }
+            // Delete only records collected from the same fully checksummed
+            // stream snapshot; never re-read an artifact after verification.
+            for candidate in selected {
+                let path = Path::from(format!("{segment_pool}/{}", candidate.segid.object_key()));
+                match self.read_identity(&path, candidate.segid).await {
+                    Ok(identity) => {
+                        if identity != candidate {
+                            return Err(GcInventoryError::Corrupt(format!(
+                                "candidate {:?} changed before physical deletion",
+                                candidate.segid
+                            )));
+                        }
+                        self.object_store.delete(&path).await?;
+                        match self.object_store.head(&path).await {
+                            Err(object_store::Error::NotFound { .. }) => {}
+                            Ok(_) => {
+                                return Err(GcInventoryError::Corrupt(format!(
+                                    "candidate {:?} remained after delete",
+                                    candidate.segid
+                                )));
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        deleted_objects =
+                            checked_add(deleted_objects, 1, "physically deleted candidate count")?;
+                        deleted_bytes = checked_add(
+                            deleted_bytes,
+                            candidate.size,
+                            "physically deleted candidate bytes",
+                        )?;
+                    }
+                    Err(GcInventoryError::ObjectStore(object_store::Error::NotFound {
+                        ..
+                    })) => {
+                        already_absent = checked_add(
+                            already_absent,
+                            1,
+                            "already absent deletion candidate count",
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+                processed += 1;
+                next_record += 1;
+            }
+            if next_record == descriptor.candidate_count {
+                next_shard += 1;
+                next_record = 0;
+            }
+        }
+        while next_shard < 256
+            && observation.candidate_shards[next_shard as usize].candidate_count == 0
+        {
+            next_shard += 1;
+        }
+        Ok(GcDeleteBatch {
+            next_shard,
+            next_record,
+            deleted_objects,
+            deleted_bytes,
+            already_absent,
+        })
     }
 
     async fn verify_shards(
@@ -1093,6 +1228,84 @@ mod tests {
         assert!(original.metadata_matches(replacement));
         assert_ne!(original.content_digest, replacement.content_digest);
         assert_ne!(original, replacement);
+    }
+
+    #[tokio::test]
+    async fn deletion_batch_is_bounded_and_replay_treats_prior_delete_as_absent() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let timestamp = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FixedTimestampStore { inner, timestamp });
+        let pool = "pool";
+        let segid = Segid::new(4, 0);
+        let object = Path::from(format!("{pool}/{}", segid.object_key()));
+        store
+            .put(&object, bytes::Bytes::from_static(b"candidate").into())
+            .await
+            .unwrap();
+        let inventory = GcInventoryStore {
+            object_store: Arc::clone(&store),
+        };
+        let candidate = inventory.read_identity(&object, segid).await.unwrap();
+        let observation_id = Uuid::new_v4();
+        let digest = [7u8; 32];
+        let artifact = Path::from("candidate-shard");
+        let mut writer = InventoryWriter::new(
+            Arc::clone(&store),
+            artifact.clone(),
+            QUARANTINE_MAGIC,
+            observation_id,
+            digest,
+            0,
+        )
+        .await
+        .unwrap();
+        writer.push(candidate).await.unwrap();
+        let result = writer.finish().await.unwrap();
+        let mut shards = (0u8..=u8::MAX)
+            .map(|shard| GcQuarantineShard {
+                shard,
+                location: format!("unused-{shard}"),
+                checksum: "00".repeat(32),
+                candidate_count: 0,
+                candidate_bytes: 0,
+            })
+            .collect::<Vec<_>>();
+        shards[0] = GcQuarantineShard {
+            shard: 0,
+            location: artifact.to_string(),
+            checksum: encode_digest(result.checksum),
+            candidate_count: 1,
+            candidate_bytes: candidate.size,
+        };
+        let observation = GcRevalidationRecord {
+            id: observation_id,
+            catalog_generation: 0,
+            grace_seconds: 390,
+            not_before: timestamp,
+            inventory_cutoff: timestamp,
+            roots: Vec::new(),
+            root_digest: encode_digest(digest),
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            candidate_shards: shards,
+            stats: None,
+            captured_at: timestamp,
+            completed_at: Some(timestamp),
+        };
+        let first = inventory
+            .delete_batch(pool, &observation, 0, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.next_shard, 256);
+        assert_eq!(first.deleted_objects, 1);
+        assert_eq!(first.already_absent, 0);
+        let replay = inventory
+            .delete_batch(pool, &observation, 0, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(replay.next_shard, 256);
+        assert_eq!(replay.deleted_objects, 0);
+        assert_eq!(replay.already_absent, 1);
     }
 
     #[test]

@@ -2,10 +2,11 @@ use super::lease::LEASE_CLOCK_SKEW;
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
-    CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcMarkShard, GcMarkStats,
-    GcQuarantinePublication, GcRevalidationCapture, GcRevalidationPublication, GcRunPhase,
-    GcRunRecord, LeaseAccessMode, LeaseRecord, LeaseSubjectKind, LeaseTombstone, TombstoneKind,
-    TombstoneRecord, validate_name, validate_root, validate_timestamp,
+    CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcDeletionPublication,
+    GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
+    GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
+    LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
+    validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,6 +43,7 @@ const BRANCH_DELETION_SCHEMA_VERSION: u32 = 6;
 const GC_CAPTURE_SCHEMA_VERSION: u32 = 7;
 const GC_MARK_SCHEMA_VERSION: u32 = 8;
 const GC_QUARANTINE_SCHEMA_VERSION: u32 = 9;
+const GC_REVALIDATION_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -142,6 +144,7 @@ impl SlateDbCatalog {
             GC_CAPTURE_SCHEMA_VERSION,
             GC_MARK_SCHEMA_VERSION,
             GC_QUARANTINE_SCHEMA_VERSION,
+            GC_REVALIDATION_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -837,6 +840,7 @@ impl SlateDbCatalog {
                 )?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
             }
+            #[cfg(test)]
             CatalogMutation::CreateBranch(record) => {
                 record.validate()?;
                 if record.state != BranchState::Ready {
@@ -867,6 +871,7 @@ impl SlateDbCatalog {
                 put_json(&mut batch, branch_key(record.id), &record)?;
                 batch.put(branch_name_key(&record.name), record.id.to_string());
             }
+            #[cfg(test)]
             CatalogMutation::ReplaceBranch {
                 expected_revision,
                 record,
@@ -881,6 +886,7 @@ impl SlateDbCatalog {
                     || old.state != record.state
                     || old.parent_id != record.parent_id
                     || old.origin_checkpoint_id != record.origin_checkpoint_id
+                    || old.root != record.root
                 {
                     return Err(CatalogError::Invalid(
                         "branch lifecycle and lineage require dedicated mutations".to_string(),
@@ -911,6 +917,7 @@ impl SlateDbCatalog {
                 }
                 put_json(&mut batch, branch_key(record.id), &record)?;
             }
+            #[cfg(test)]
             CatalogMutation::CreateCheckpoint(record) => {
                 record.validate()?;
                 ensure_initial_revision(record.revision)?;
@@ -937,6 +944,7 @@ impl SlateDbCatalog {
                     record.id.to_string(),
                 );
             }
+            #[cfg(test)]
             CatalogMutation::ReplaceCheckpoint {
                 expected_revision,
                 record,
@@ -1429,6 +1437,82 @@ impl Catalog for SlateDbCatalog {
         Ok(run)
     }
 
+    async fn publish_gc_deletion(
+        &self,
+        publication: GcDeletionPublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        let GcDeletionPublication {
+            run_id,
+            expected_revision,
+            expected_generation,
+            progress,
+            updated_at,
+        } = publication;
+        let _guard = self.lock.lock().await;
+        validate_timestamp(updated_at, "GC deletion progress")?;
+        let state = self.state_unlocked().await?;
+        let mut run = self
+            .get_record::<GcRunRecord>(gc_run_key(run_id))
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        run.validate()?;
+        if matches!(run.phase, GcRunPhase::Deleting | GcRunPhase::Completed)
+            && run.deletion.as_ref() == Some(&progress)
+            && run.updated_at == updated_at
+        {
+            return Ok(run);
+        }
+        ensure_expected_revision(expected_revision, run.revision)?;
+        ensure_expected_revision(expected_generation, state.generation)?;
+        let observation = run
+            .revalidation
+            .as_ref()
+            .ok_or_else(|| CatalogError::Corrupt("missing GC revalidation".to_string()))?;
+        if observation.catalog_generation != expected_generation || updated_at < run.updated_at {
+            return Err(CatalogError::OperationConflict(run_id.to_string()));
+        }
+        match (&run.phase, &run.deletion) {
+            (GcRunPhase::Validated, None)
+                if progress.next_shard == 0
+                    && progress.next_record == 0
+                    && progress.deleted_objects == 0
+                    && progress.deleted_bytes == 0
+                    && progress.already_absent == 0
+                    && progress.completed_at.is_none()
+                    && progress.started_at == updated_at => {}
+            (GcRunPhase::Deleting, Some(previous))
+                if progress.batch_size == previous.batch_size
+                    && progress.started_at == previous.started_at
+                    && (progress.next_shard, progress.next_record)
+                        >= (previous.next_shard, previous.next_record)
+                    && progress.deleted_objects >= previous.deleted_objects
+                    && progress.deleted_bytes >= previous.deleted_bytes
+                    && progress.already_absent >= previous.already_absent => {}
+            _ => return Err(CatalogError::OperationConflict(run_id.to_string())),
+        }
+        run.revision = run
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::Corrupt("GC run revision overflow".to_string()))?;
+        run.phase = if progress.completed_at.is_some() {
+            GcRunPhase::Completed
+        } else {
+            GcRunPhase::Deleting
+        };
+        run.deletion = Some(progress);
+        run.updated_at = updated_at;
+        run.validate()?;
+        self.db
+            .put_with_options(
+                gc_run_key(run.id),
+                serde_json::to_vec(&run)?,
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await?;
+        Ok(run)
+    }
+
     async fn record_gc_blocker(
         &self,
         run_id: Uuid,
@@ -1672,6 +1756,7 @@ fn ensure_expected_revision(expected: u64, actual: u64) -> Result<(), CatalogErr
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_revision_change(expected: u64, actual: u64, next: u64) -> Result<(), CatalogError> {
     ensure_expected_revision(expected, actual)?;
     let required = actual
@@ -2330,6 +2415,21 @@ mod tests {
                 .await,
             Err(CatalogError::Invalid(_))
         ));
+        let mut changed_root = owner.clone();
+        changed_root.revision = 2;
+        changed_root.root = Some(DurableRoot {
+            identity: "root/forged-forward-reference".to_string(),
+            manifest_id: "manifest/forged-forward-reference".to_string(),
+        });
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ReplaceBranch {
+                    expected_revision: 1,
+                    record: changed_root,
+                })
+                .await,
+            Err(CatalogError::Invalid(_))
+        ));
 
         let original_checkpoint = checkpoint(Uuid::new_v4(), owner.id, "stable");
         catalog
@@ -2414,7 +2514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v9_catalogs_to_gc_revalidation_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v10_catalogs_to_gc_deletion_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -2424,6 +2524,7 @@ mod tests {
             GC_CAPTURE_SCHEMA_VERSION,
             GC_MARK_SCHEMA_VERSION,
             GC_QUARANTINE_SCHEMA_VERSION,
+            GC_REVALIDATION_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let path = Path::from(format!("migration-v{prior_version}-v5"));
@@ -2482,6 +2583,7 @@ mod tests {
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             revalidation: None,
+            deletion: None,
             created_at: now,
             updated_at: now,
         };
@@ -2593,6 +2695,7 @@ mod tests {
                     phase: GcRunPhase::Captured,
                     quarantine_at: None,
                     revalidation: None,
+                    deletion: None,
                     created_at: now,
                     updated_at: now,
                 },
