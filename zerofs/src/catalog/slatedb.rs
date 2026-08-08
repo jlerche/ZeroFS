@@ -2,9 +2,10 @@ use super::lease::LEASE_CLOCK_SKEW;
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
-    CatalogSnapshot, CheckpointRecord, GcMarkShard, GcMarkStats, GcRunPhase, GcRunRecord,
-    LeaseAccessMode, LeaseRecord, LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord,
-    validate_name, validate_root, validate_timestamp,
+    CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcMarkShard, GcMarkStats,
+    GcQuarantinePublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
+    LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
+    validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,6 +29,7 @@ const TOMBSTONE_PREFIX: &[u8] = b"catalog/tombstone/";
 const BRANCH_CREATE_OPERATION_PREFIX: &[u8] = b"catalog/branch-create-operation/";
 const BRANCH_DELETE_OPERATION_PREFIX: &[u8] = b"catalog/branch-delete-operation/";
 const GC_RUN_PREFIX: &[u8] = b"catalog/gc-run/";
+const GC_BLOCKER_PREFIX: &[u8] = b"catalog/gc-blocker/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
@@ -38,6 +40,7 @@ const LEASE_SCHEMA_VERSION: u32 = 4;
 const DELETION_SCHEMA_VERSION: u32 = 5;
 const BRANCH_DELETION_SCHEMA_VERSION: u32 = 6;
 const GC_CAPTURE_SCHEMA_VERSION: u32 = 7;
+const GC_MARK_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -136,6 +139,7 @@ impl SlateDbCatalog {
             DELETION_SCHEMA_VERSION,
             BRANCH_DELETION_SCHEMA_VERSION,
             GC_CAPTURE_SCHEMA_VERSION,
+            GC_MARK_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -1100,7 +1104,30 @@ impl Catalog for SlateDbCatalog {
 
     async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
-        self.get_record(gc_run_key(id)).await
+        let run = self.get_record::<GcRunRecord>(gc_run_key(id)).await?;
+        if let Some(run) = &run {
+            run.validate()?;
+        }
+        Ok(run)
+    }
+
+    async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        let prefix = gc_blocker_run_prefix(run_id);
+        let mut iterator = self.db.scan_prefix(&prefix, ..).await?;
+        let mut blockers = Vec::new();
+        while let Some(entry) = iterator.next().await? {
+            let blocker = serde_json::from_slice::<GcBlockerRecord>(&entry.value)?;
+            blocker.validate()?;
+            if blocker.run_id != run_id {
+                return Err(CatalogError::Corrupt(
+                    "GC blocker key disagrees with its run".to_string(),
+                ));
+            }
+            blockers.push(blocker);
+        }
+        blockers.sort_by_key(|blocker| blocker.kind);
+        Ok(blockers)
     }
 
     async fn begin_gc_run(
@@ -1151,6 +1178,7 @@ impl Catalog for SlateDbCatalog {
             .get_record::<GcRunRecord>(gc_run_key(id))
             .await?
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        run.validate()?;
         if run.phase == GcRunPhase::Marking {
             if run.root_digest == root_digest
                 && run.mark_shards == mark_shards
@@ -1185,6 +1213,120 @@ impl Catalog for SlateDbCatalog {
             )
             .await?;
         Ok(run)
+    }
+
+    async fn publish_gc_quarantine(
+        &self,
+        publication: GcQuarantinePublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        let GcQuarantinePublication {
+            id,
+            expected_revision,
+            expected_generation,
+            root_digest,
+            quarantine_shards,
+            inventory_stats,
+            quarantine_at,
+        } = publication;
+        let _guard = self.lock.lock().await;
+        validate_timestamp(quarantine_at, "GC quarantine timestamp")?;
+        let state = self.state_unlocked().await?;
+        let mut run = self
+            .get_record::<GcRunRecord>(gc_run_key(id))
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        run.validate()?;
+        if run.phase == GcRunPhase::Quarantined {
+            if run.catalog_generation == expected_generation
+                && run.root_digest == root_digest
+                && run.quarantine_shards == quarantine_shards
+                && run.inventory_stats.as_ref() == Some(&inventory_stats)
+                && run.quarantine_at == Some(quarantine_at)
+            {
+                return Ok(run);
+            }
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        ensure_expected_revision(expected_revision, run.revision)?;
+        ensure_expected_revision(expected_generation, state.generation)?;
+        if run.phase != GcRunPhase::Marking
+            || run.catalog_generation != expected_generation
+            || run.root_digest != root_digest
+            || run.segment_pool.is_empty()
+            || quarantine_at < run.updated_at
+        {
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        run.revision = run
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::Corrupt("GC run revision overflow".to_string()))?;
+        run.phase = GcRunPhase::Quarantined;
+        run.quarantine_shards = quarantine_shards;
+        run.inventory_stats = Some(inventory_stats);
+        run.quarantine_at = Some(quarantine_at);
+        run.updated_at = quarantine_at;
+        run.validate()?;
+        self.db
+            .put_with_options(
+                gc_run_key(run.id),
+                serde_json::to_vec(&run)?,
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await?;
+        Ok(run)
+    }
+
+    async fn record_gc_blocker(
+        &self,
+        run_id: Uuid,
+        kind: GcBlockerKind,
+        detail: String,
+        observed_at: DateTime<Utc>,
+    ) -> Result<GcBlockerRecord, CatalogError> {
+        let _guard = self.lock.lock().await;
+        validate_timestamp(observed_at, "GC blocker observation")?;
+        if self
+            .get_record::<GcRunRecord>(gc_run_key(run_id))
+            .await?
+            .is_none()
+        {
+            return Err(CatalogError::NotFound(run_id.to_string()));
+        }
+        let key = gc_blocker_key(run_id, kind);
+        let blocker = match self.get_record::<GcBlockerRecord>(key.clone()).await? {
+            Some(mut existing) => {
+                existing.validate()?;
+                if observed_at < existing.last_observed_at {
+                    return Err(CatalogError::OperationConflict(run_id.to_string()));
+                }
+                existing.occurrences = existing.occurrences.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("GC blocker occurrence overflow".to_string())
+                })?;
+                existing.detail = detail;
+                existing.last_observed_at = observed_at;
+                existing
+            }
+            None => GcBlockerRecord {
+                run_id,
+                kind,
+                occurrences: 1,
+                detail,
+                first_observed_at: observed_at,
+                last_observed_at: observed_at,
+            },
+        };
+        blocker.validate()?;
+        self.db
+            .put_with_options(
+                key,
+                serde_json::to_vec(&blocker)?,
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await?;
+        Ok(blocker)
     }
 
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
@@ -1243,6 +1385,25 @@ fn branch_delete_operation_key(id: Uuid) -> Bytes {
 
 fn gc_run_key(id: Uuid) -> Bytes {
     joined_key(GC_RUN_PREFIX, id.to_string().as_bytes())
+}
+
+fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
+    let mut suffix = run_id.to_string().into_bytes();
+    suffix.push(b'/');
+    joined_key(GC_BLOCKER_PREFIX, &suffix)
+}
+
+fn gc_blocker_key(run_id: Uuid, kind: GcBlockerKind) -> Bytes {
+    let suffix = match kind {
+        GcBlockerKind::MissingRoot => b"missing-root".as_slice(),
+        GcBlockerKind::CorruptMetadata => b"corrupt-metadata".as_slice(),
+        GcBlockerKind::GenerationChanged => b"generation-changed".as_slice(),
+        GcBlockerKind::LeaseUncertainty => b"lease-uncertainty".as_slice(),
+        GcBlockerKind::StorageUnavailable => b"storage-unavailable".as_slice(),
+    };
+    let mut key = gc_blocker_run_prefix(run_id).to_vec();
+    key.extend_from_slice(suffix);
+    Bytes::from(key)
 }
 
 fn lease_key(id: Uuid) -> Bytes {
@@ -1376,7 +1537,10 @@ fn validate_revision_change(expected: u64, actual: u64, next: u64) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{BranchState, DurableRoot, catalog_timestamp, lease::LEASE_CLOCK_SKEW};
+    use crate::catalog::{
+        BranchState, DurableRoot, GcInventoryStats, GcQuarantineShard, catalog_timestamp,
+        lease::LEASE_CLOCK_SKEW,
+    };
     use chrono::Utc;
     use slatedb::object_store::memory::InMemory;
 
@@ -2099,7 +2263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v7_catalogs_to_gc_mark_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v8_catalogs_to_gc_quarantine_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -2107,6 +2271,7 @@ mod tests {
             DELETION_SCHEMA_VERSION,
             BRANCH_DELETION_SCHEMA_VERSION,
             GC_CAPTURE_SCHEMA_VERSION,
+            GC_MARK_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let path = Path::from(format!("migration-v{prior_version}-v5"));
@@ -2140,6 +2305,112 @@ mod tests {
             assert!(snapshot.lease_tombstones.is_empty());
             catalog.close().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn quarantine_requires_capture_generation_and_blockers_are_durable_and_bounded() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("gc-quarantine-fence"), store)
+            .await
+            .unwrap();
+        let now = catalog_timestamp(Utc::now());
+        let root_digest = crate::catalog::gc_root_digest(&[]).unwrap();
+        let run = GcRunRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            catalog_generation: 0,
+            inventory_cutoff: now,
+            roots: Vec::new(),
+            root_digest: root_digest.clone(),
+            segment_pool: ".zerofs/segment-pool".to_string(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
+            phase: GcRunPhase::Captured,
+            quarantine_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        catalog.begin_gc_run(0, run.clone()).await.unwrap();
+        let mark_shards = (0u8..=u8::MAX)
+            .map(|shard| GcMarkShard {
+                shard,
+                location: format!("marks/{shard:02x}"),
+                checksum: "00".repeat(32),
+                segment_count: 0,
+            })
+            .collect::<Vec<_>>();
+        catalog
+            .publish_gc_marks(
+                run.id,
+                1,
+                root_digest.clone(),
+                mark_shards,
+                GcMarkStats {
+                    roots_enumerated: 0,
+                    references_enumerated: 0,
+                    intermediate_runs: 0,
+                    unique_segments: 0,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch("generation-change")))
+            .await
+            .unwrap();
+        let quarantine_shards = (0u8..=u8::MAX)
+            .map(|shard| GcQuarantineShard {
+                shard,
+                location: format!("quarantine/{shard:02x}"),
+                checksum: "00".repeat(32),
+                candidate_count: 0,
+                candidate_bytes: 0,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            catalog
+                .publish_gc_quarantine(GcQuarantinePublication {
+                    id: run.id,
+                    expected_revision: 2,
+                    expected_generation: 0,
+                    root_digest,
+                    quarantine_shards,
+                    inventory_stats: GcInventoryStats {
+                        objects_seen: 0,
+                        objects_newer_than_cutoff: 0,
+                        reachable_objects: 0,
+                        candidate_objects: 0,
+                        candidate_bytes: 0,
+                        intermediate_runs: 0,
+                    },
+                    quarantine_at: now,
+                })
+                .await,
+            Err(CatalogError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        for kind in [
+            GcBlockerKind::MissingRoot,
+            GcBlockerKind::CorruptMetadata,
+            GcBlockerKind::GenerationChanged,
+            GcBlockerKind::LeaseUncertainty,
+            GcBlockerKind::StorageUnavailable,
+        ] {
+            catalog
+                .record_gc_blocker(run.id, kind, format!("blocked by {kind:?}"), now)
+                .await
+                .unwrap();
+        }
+        let blockers = catalog.gc_blockers(run.id).await.unwrap();
+        assert_eq!(blockers.len(), 5);
+        assert!(blockers.iter().all(|blocker| blocker.occurrences == 1));
+        assert_eq!(catalog.gc_run(run.id).await.unwrap().unwrap().revision, 2);
+        catalog.close().await.unwrap();
     }
 
     #[tokio::test]

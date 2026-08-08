@@ -75,6 +75,7 @@ pub struct SlateDbRootStore {
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     branch_database_root: Path,
+    segment_pool_root: Path,
 }
 
 impl std::fmt::Debug for SlateDbRootStore {
@@ -91,6 +92,7 @@ impl SlateDbRootStore {
             object_store,
             wal_object_store: None,
             branch_database_root,
+            segment_pool_root: Path::default(),
         }
     }
 
@@ -99,8 +101,17 @@ impl SlateDbRootStore {
         self
     }
 
+    pub fn with_segment_pool_root(mut self, segment_pool_root: Path) -> Self {
+        self.segment_pool_root = segment_pool_root;
+        self
+    }
+
     pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.object_store)
+    }
+
+    pub(crate) fn segment_pool_root(&self) -> &Path {
+        &self.segment_pool_root
     }
 
     /// Open the immutable checkpoint encoded by an already-authenticated root.
@@ -817,12 +828,18 @@ pub enum RootStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CompressionConfig;
     use crate::fault_store::FaultStore;
+    use crate::frame_codec::FrameCodec;
+    use crate::fs::key_codec::KeyCodec;
+    use crate::segment::{FrameLoc, SEGMENT_INFO};
+    use crate::segment_store::SegmentStore;
     use bytes::Bytes;
     use futures::StreamExt;
     use slatedb::Db;
     use slatedb::config::{CheckpointOptions, CheckpointScope};
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::prefix::PrefixStore;
 
     #[test]
     fn rejects_overlapping_catalog_and_branch_namespaces_without_io() {
@@ -848,6 +865,68 @@ mod tests {
             &Path::from("zerofs/branches"),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shallow_clone_reads_inherited_data_from_the_shared_segment_pool() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let pool_path = Path::from("volume/segment-pool");
+        let pool: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(Arc::clone(&raw), pool_path.clone()));
+        let authority = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[9u8; 32],
+            "source",
+            true,
+        )
+        .await
+        .unwrap();
+        let epoch = SegmentStore::reserve_epoch(Arc::clone(&pool), &authority, "source")
+            .await
+            .unwrap();
+        let segments = SegmentStore::new(
+            Arc::clone(&pool),
+            FrameCodec::new(&[9u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            epoch,
+            None,
+        );
+        let locations = segments
+            .seal(&[(1, 0, Bytes::from_static(b"shared-data"))])
+            .await
+            .unwrap();
+        let source_path = Path::from("volume/source");
+        let source = Db::builder(source_path.clone(), Arc::clone(&raw))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let key = KeyCodec::new().extent_key(1, 0);
+        source.put(&key, locations[0].2.encode()).await.unwrap();
+        source.flush().await.unwrap();
+        let checkpoint = source
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let exact_source = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let roots = SlateDbRootStore::new(Arc::clone(&raw), Path::from("volume/branches"))
+            .with_segment_pool_root(pool_path);
+        let root = roots
+            .create_from_checkpoint(Uuid::new_v4(), Uuid::new_v4(), &exact_source)
+            .await
+            .unwrap();
+        let reader = roots.checkpoint_reader(&root).await.unwrap();
+        let encoded = reader.get(&key).await.unwrap().unwrap();
+        let inherited = FrameLoc::decode(&encoded).unwrap();
+        assert_eq!(
+            segments.read_extent(inherited, 1, 0).await.unwrap(),
+            Bytes::from_static(b"shared-data")
+        );
+        reader.close().await.unwrap();
+        source.close().await.unwrap();
     }
 
     #[tokio::test]

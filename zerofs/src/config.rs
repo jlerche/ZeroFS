@@ -353,6 +353,14 @@ pub struct StorageConfig {
         deserialize_with = "deserialize_optional_expandable_string"
     )]
     pub storage_class: Option<String>,
+    /// Opt-in volume-wide segment pool required by CoW branches. When absent,
+    /// legacy single-database volumes retain their per-database namespace.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_string"
+    )]
+    pub segment_pool_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1059,6 +1067,7 @@ impl Settings {
                 url: "s3://your-bucket/zerofs-data".to_string(),
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
                 storage_class: None,
+                segment_pool_path: None,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
@@ -1105,7 +1114,8 @@ impl Settings {
         toml_string = toml_string.replace(
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
-             # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n"
+             # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n\
+             # segment_pool_path = \".zerofs/segment-pool\"   # Required shared data plane for new CoW volumes; legacy migration is not yet supported.\n"
         );
 
         // Document warm_metadata in place (the [cache] table is not last, so the
@@ -2053,6 +2063,30 @@ storage_class = "${ZEROFS_TEST_STORAGE_CLASS}"
         assert_eq!(
             settings.storage.storage_class.as_deref(),
             Some("INTELLIGENT_TIERING")
+        );
+    }
+
+    #[test]
+    fn test_segment_pool_path_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_SEGMENT_POOL", "volume/segment-pool");
+        }
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+segment_pool_path = "${ZEROFS_TEST_SEGMENT_POOL}"
+
+[servers]
+"#;
+        let settings = write_and_load(content).unwrap();
+        assert_eq!(
+            settings.storage.segment_pool_path.as_deref(),
+            Some("volume/segment-pool")
         );
     }
 

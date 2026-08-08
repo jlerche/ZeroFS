@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use slatedb::object_store::{
     GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
     path::Path,
@@ -23,6 +26,135 @@ use crate::segment::{
     DirEntry, FOOTER_LEN, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
     seal_compressed_batch,
 };
+
+const SEGMENT_EPOCH_PREFIX: &str = "segment-epochs";
+const SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 1;
+const SEGMENT_POOL_GENESIS_PATH: &str = "segment-pool-genesis.json";
+const SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
+const SEGMENT_POOL_AUTH_INFO: &[u8] = b"zerofs-v1-segment-pool-authority";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SegmentPoolGenesis {
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    creator_database_identity: String,
+    auth_tag: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct SegmentPoolAuthority {
+    pool_id: uuid::Uuid,
+    auth_key: [u8; 32],
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SegmentEpochReservation {
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    epoch: u64,
+    reservation_id: uuid::Uuid,
+    database_identity: String,
+    auth_tag: [u8; 32],
+}
+
+fn derive_pool_auth_key(master_key: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, master_key);
+    let mut key = [0u8; 32];
+    hk.expand(SEGMENT_POOL_AUTH_INFO, &mut key)
+        .expect("valid HKDF output length");
+    key
+}
+
+fn authentication_tag(key: &[u8; 32], fields: &[&[u8]]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    for field in fields {
+        mac.update(&(field.len() as u64).to_be_bytes());
+        mac.update(field);
+    }
+    mac.finalize().into_bytes().into()
+}
+
+fn authentication_tag_is_valid(key: &[u8; 32], fields: &[&[u8]], tag: &[u8; 32]) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    for field in fields {
+        mac.update(&(field.len() as u64).to_be_bytes());
+        mac.update(field);
+    }
+    mac.verify_slice(tag).is_ok()
+}
+
+fn genesis_tag(key: &[u8; 32], pool_id: uuid::Uuid, database_identity: &str) -> [u8; 32] {
+    authentication_tag(
+        key,
+        &[
+            b"genesis",
+            &SEGMENT_POOL_GENESIS_VERSION.to_be_bytes(),
+            pool_id.as_bytes(),
+            database_identity.as_bytes(),
+        ],
+    )
+}
+
+fn reservation_tag(
+    authority: &SegmentPoolAuthority,
+    epoch: u64,
+    reservation_id: uuid::Uuid,
+    database_identity: &str,
+) -> [u8; 32] {
+    authentication_tag(
+        &authority.auth_key,
+        &[
+            b"epoch",
+            &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+            authority.pool_id.as_bytes(),
+            &epoch.to_be_bytes(),
+            reservation_id.as_bytes(),
+            database_identity.as_bytes(),
+        ],
+    )
+}
+
+async fn load_pool_authority(
+    object_store: &Arc<dyn ObjectStore>,
+    auth_key: [u8; 32],
+) -> Result<Option<SegmentPoolAuthority>> {
+    let bytes = match object_store
+        .get(&Path::from(SEGMENT_POOL_GENESIS_PATH))
+        .await
+    {
+        Ok(result) => result
+            .bytes()
+            .await
+            .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?,
+        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+    };
+    let genesis: SegmentPoolGenesis = serde_json::from_slice(&bytes).map_err(|error| {
+        SegmentStoreError::ObjectStore(format!("invalid shared segment-pool genesis: {error}"))
+    })?;
+    let valid_tag = authentication_tag_is_valid(
+        &auth_key,
+        &[
+            b"genesis",
+            &SEGMENT_POOL_GENESIS_VERSION.to_be_bytes(),
+            genesis.pool_id.as_bytes(),
+            genesis.creator_database_identity.as_bytes(),
+        ],
+        &genesis.auth_tag,
+    );
+    if genesis.schema_version != SEGMENT_POOL_GENESIS_VERSION
+        || genesis.pool_id.is_nil()
+        || !valid_tag
+    {
+        return Err(SegmentStoreError::ObjectStore(
+            "shared segment-pool genesis is unauthenticated or unsupported".to_string(),
+        ));
+    }
+    Ok(Some(SegmentPoolAuthority {
+        pool_id: genesis.pool_id,
+        auth_key,
+    }))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentStoreError {
@@ -75,6 +207,200 @@ pub struct SegmentStore {
 }
 
 impl SegmentStore {
+    /// Open the authenticated authority for an existing pool, or establish it
+    /// with an immutable create only while the pool contains no data-plane or
+    /// control-plane object other than its newly initialized wrapped key.
+    pub async fn open_or_create_pool_authority(
+        object_store: Arc<dyn ObjectStore>,
+        master_key: &[u8; 32],
+        database_identity: &str,
+        allow_create: bool,
+    ) -> Result<SegmentPoolAuthority> {
+        if database_identity.len() > 4 * 1024 {
+            return Err(SegmentStoreError::ObjectStore(
+                "segment-pool database identity must contain at most 4096 bytes".to_string(),
+            ));
+        }
+        let auth_key = derive_pool_auth_key(master_key);
+        if let Some(authority) = load_pool_authority(&object_store, auth_key).await? {
+            return Ok(authority);
+        }
+        if !allow_create {
+            return Err(SegmentStoreError::ObjectStore(
+                "shared segment-pool genesis is absent and read-only startup cannot create it"
+                    .to_string(),
+            ));
+        }
+
+        let mut objects = object_store.list(None);
+        while let Some(object) = objects.next().await {
+            let object =
+                object.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            if object.location.as_ref() != "zerofs.key" {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "cannot establish shared segment-pool genesis because {} already exists",
+                    object.location
+                )));
+            }
+        }
+
+        let pool_id = uuid::Uuid::new_v4();
+        let genesis = SegmentPoolGenesis {
+            schema_version: SEGMENT_POOL_GENESIS_VERSION,
+            pool_id,
+            creator_database_identity: database_identity.to_string(),
+            auth_tag: genesis_tag(&auth_key, pool_id, database_identity),
+        };
+        let create = object_store
+            .put_opts(
+                &Path::from(SEGMENT_POOL_GENESIS_PATH),
+                serde_json::to_vec(&genesis)
+                    .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?
+                    .into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await;
+        if create.is_ok() {
+            return Ok(SegmentPoolAuthority { pool_id, auth_key });
+        }
+        if let Some(authority) = load_pool_authority(&object_store, auth_key).await? {
+            return Ok(authority);
+        }
+        Err(SegmentStoreError::ObjectStore(format!(
+            "failed to establish shared segment-pool genesis: {}",
+            create.expect_err("successful create returned above")
+        )))
+    }
+
+    /// Prove that every physical segment already present in this pool belongs
+    /// to an epoch that was reserved before counter zero was written. This
+    /// deliberately rejects manually copied legacy segments: supporting those
+    /// requires a separately reviewed migration manifest or an ID rewrite.
+    pub async fn validate_epoch_reservations(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+    ) -> Result<()> {
+        let mut segments = object_store.list(Some(&Path::from("segments")));
+        let mut verified = HashSet::new();
+        while let Some(object) = segments.next().await {
+            let object = object.map_err(|error| {
+                SegmentStoreError::ObjectStore(format!(
+                    "failed to inventory shared segment pool: {error}"
+                ))
+            })?;
+            let key = object.location.to_string();
+            let segid = Segid::from_object_key(&key).filter(|segid| segid.object_key() == key);
+            let segid = segid.ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "shared segment pool contains a noncanonical segment key: {key}"
+                ))
+            })?;
+            if !verified.insert(segid.epoch) {
+                continue;
+            }
+            let marker_path =
+                Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{:016x}.json", segid.epoch));
+            let marker = object_store
+                .get(&marker_path)
+                .await
+                .map_err(|error| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "shared segment epoch {} has no readable permanent reservation: {error}",
+                        segid.epoch
+                    ))
+                })?
+                .bytes()
+                .await
+                .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            let marker: SegmentEpochReservation =
+                serde_json::from_slice(&marker).map_err(|error| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "shared segment epoch {} has an invalid reservation marker: {error}",
+                        segid.epoch
+                    ))
+                })?;
+            let valid_tag = authentication_tag_is_valid(
+                &authority.auth_key,
+                &[
+                    b"epoch",
+                    &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+                    authority.pool_id.as_bytes(),
+                    &marker.epoch.to_be_bytes(),
+                    marker.reservation_id.as_bytes(),
+                    marker.database_identity.as_bytes(),
+                ],
+                &marker.auth_tag,
+            );
+            if marker.schema_version != SEGMENT_EPOCH_RESERVATION_VERSION
+                || marker.pool_id != authority.pool_id
+                || marker.epoch != segid.epoch
+                || marker.reservation_id.is_nil()
+                || !valid_tag
+            {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "shared segment epoch {} has a mismatched reservation marker",
+                    segid.epoch
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserve a never-reused writer epoch in the exact segment pool using an
+    /// immutable conditional-create marker. All writers sharing the pool use
+    /// this before allocating counter-zero, so shallow clones cannot collide
+    /// merely because their independent SlateDB manifests reuse an epoch.
+    pub async fn reserve_epoch(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_identity: &str,
+    ) -> Result<u64> {
+        if database_identity.len() > 4 * 1024 {
+            return Err(SegmentStoreError::ObjectStore(
+                "segment epoch database identity must contain at most 4096 bytes".to_string(),
+            ));
+        }
+        for _ in 0..64 {
+            let reservation_id = uuid::Uuid::new_v4();
+            let epoch = u64::from_be_bytes(
+                reservation_id.as_bytes()[..8]
+                    .try_into()
+                    .expect("UUID prefix is eight bytes"),
+            );
+            if epoch == 0 {
+                continue;
+            }
+            let marker = SegmentEpochReservation {
+                schema_version: SEGMENT_EPOCH_RESERVATION_VERSION,
+                pool_id: authority.pool_id,
+                epoch,
+                reservation_id,
+                database_identity: database_identity.to_string(),
+                auth_tag: reservation_tag(authority, epoch, reservation_id, database_identity),
+            };
+            let path = Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json"));
+            match object_store
+                .put_opts(
+                    &path,
+                    serde_json::to_vec(&marker)
+                        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?
+                        .into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+            {
+                Ok(_) => return Ok(epoch),
+                Err(slatedb::object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => {
+                    return Err(SegmentStoreError::ObjectStore(error.to_string()));
+                }
+            }
+        }
+        Err(SegmentStoreError::ObjectStore(
+            "failed to reserve a globally unique segment epoch after 64 attempts".to_string(),
+        ))
+    }
+
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
         codec: FrameCodec,
@@ -606,6 +932,178 @@ mod tests {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
         SegmentStore::new(os, codec, 5, None)
+    }
+
+    #[tokio::test]
+    async fn shared_pool_reservations_make_clone_writer_epochs_unique() {
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let authority = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[1u8; 32],
+            "source",
+            true,
+        )
+        .await
+        .unwrap();
+        let epochs = futures::future::join_all((0..256).map(|index| {
+            let pool = Arc::clone(&pool);
+            let authority = authority.clone();
+            async move {
+                SegmentStore::reserve_epoch(pool, &authority, &format!("branch-{index}")).await
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        let unique = epochs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), epochs.len());
+
+        let codec = || FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let first = SegmentStore::new(Arc::clone(&pool), codec(), epochs[0], None);
+        let second = SegmentStore::new(Arc::clone(&pool), codec(), epochs[1], None);
+        let first_locs = first
+            .seal(&[(1, 0, Bytes::from_static(b"first"))])
+            .await
+            .unwrap();
+        let second_locs = second
+            .seal(&[(1, 0, Bytes::from_static(b"second"))])
+            .await
+            .unwrap();
+        assert_ne!(first_locs[0].2.segid, second_locs[0].2.segid);
+        assert_eq!(
+            first.read_extent(first_locs[0].2, 1, 0).await.unwrap(),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            second.read_extent(second_locs[0].2, 1, 0).await.unwrap(),
+            Bytes::from_static(b"second")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_pool_genesis_is_key_authenticated_and_empty_only() {
+        let fresh_read_only: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        assert!(
+            SegmentStore::open_or_create_pool_authority(
+                fresh_read_only,
+                &[3u8; 32],
+                "reader",
+                false,
+            )
+            .await
+            .err()
+            .expect("read-only startup must not establish genesis")
+            .to_string()
+            .contains("read-only startup")
+        );
+
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        pool.put(
+            &Path::from("zerofs.key"),
+            Bytes::from_static(b"wrapped-key-placeholder").into(),
+        )
+        .await
+        .unwrap();
+        let authority = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[3u8; 32],
+            "source",
+            true,
+        )
+        .await
+        .unwrap();
+        let reopened = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[3u8; 32],
+            "another-branch",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(authority.pool_id, reopened.pool_id);
+        assert!(
+            SegmentStore::open_or_create_pool_authority(pool, &[4u8; 32], "wrong-key", false)
+                .await
+                .err()
+                .expect("a different volume key must not authenticate the genesis")
+                .to_string()
+                .contains("unauthenticated")
+        );
+
+        let prepopulated: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        prepopulated
+            .put(
+                &Path::from(Segid::new(7, 0).object_key()),
+                Bytes::from_static(b"legacy").into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            SegmentStore::open_or_create_pool_authority(
+                prepopulated,
+                &[3u8; 32],
+                "legacy-source",
+                true,
+            )
+            .await
+            .err()
+            .expect("a nonempty pool must not gain new-volume genesis")
+            .to_string()
+            .contains("cannot establish")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_pool_rejects_segments_without_exact_epoch_reservations() {
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let authority = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[1u8; 32],
+            "source",
+            true,
+        )
+        .await
+        .unwrap();
+        let segid = Segid::new(7, 0);
+        pool.put(
+            &Path::from(segid.object_key()),
+            Bytes::from_static(b"manually-copied-legacy-segment").into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            SegmentStore::validate_epoch_reservations(Arc::clone(&pool), &authority)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no readable permanent reservation")
+        );
+
+        let marker = SegmentEpochReservation {
+            schema_version: SEGMENT_EPOCH_RESERVATION_VERSION,
+            pool_id: authority.pool_id,
+            epoch: 7,
+            reservation_id: uuid::Uuid::new_v4(),
+            database_identity: "forged-migration".to_string(),
+            auth_tag: [0u8; 32],
+        };
+        pool.put(
+            &Path::from(format!("{SEGMENT_EPOCH_PREFIX}/0000000000000007.json")),
+            serde_json::to_vec(&marker).unwrap().into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            SegmentStore::validate_epoch_reservations(pool, &authority)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched reservation marker")
+        );
     }
 
     /// `len` bytes of keyed xorshift noise: incompressible, so a seal built

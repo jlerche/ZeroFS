@@ -312,9 +312,9 @@ impl OnlineRuns {
 }
 
 #[derive(Clone, Copy)]
-struct MarkResult {
-    count: u64,
-    checksum: [u8; 32],
+pub(crate) struct MarkResult {
+    pub(crate) count: u64,
+    pub(crate) checksum: [u8; 32],
 }
 
 struct MarkWriter {
@@ -379,7 +379,7 @@ impl MarkWriter {
     }
 }
 
-struct MarkReader {
+pub(crate) struct MarkReader {
     reader: BufReader,
     hasher: Sha256,
     remaining: u64,
@@ -388,7 +388,7 @@ struct MarkReader {
 }
 
 impl MarkReader {
-    async fn open(
+    pub(crate) async fn open(
         store: Arc<dyn ObjectStore>,
         path: &Path,
         run_id: Uuid,
@@ -425,7 +425,7 @@ impl MarkReader {
         })
     }
 
-    async fn next(&mut self) -> Result<Option<Segid>, GcMarkError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<Segid>, GcMarkError> {
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -443,7 +443,7 @@ impl MarkReader {
         Ok(Some(value))
     }
 
-    async fn finish(mut self) -> Result<MarkResult, GcMarkError> {
+    pub(crate) async fn finish(mut self) -> Result<MarkResult, GcMarkError> {
         if self.remaining != 0 {
             return Err(GcMarkError::Corrupt(
                 "mark reader finished before consuming every record".to_string(),
@@ -552,7 +552,7 @@ fn decode_segid(bytes: [u8; 16]) -> Segid {
     )
 }
 
-fn decode_digest(value: &str) -> Result<[u8; 32], GcMarkError> {
+pub(crate) fn decode_digest(value: &str) -> Result<[u8; 32], GcMarkError> {
     if value.len() != 64 {
         return Err(GcMarkError::Corrupt("invalid root digest".to_string()));
     }
@@ -564,7 +564,7 @@ fn decode_digest(value: &str) -> Result<[u8; 32], GcMarkError> {
     Ok(output)
 }
 
-fn encode_digest(value: [u8; 32]) -> String {
+pub(crate) fn encode_digest(value: [u8; 32]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

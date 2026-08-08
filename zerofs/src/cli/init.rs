@@ -21,6 +21,7 @@ use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use slatedb::BlockTransformer;
 use slatedb::object_store::path::Path;
 use slatedb_common::metrics::DefaultMetricsRecorder;
@@ -38,6 +39,8 @@ struct StartupContext {
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
     object_tracer: ObjectTracer,
     actual_db_path: String,
+    segment_pool_path: Option<String>,
+    segment_pool_authority: Option<crate::segment_store::SegmentPoolAuthority>,
     block_transformer: Arc<dyn BlockTransformer>,
     segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
@@ -81,6 +84,37 @@ struct ReconciledDb {
     open: DbOpen,
     lineage_proof: Option<LineageProof>,
     retry_grace_proof: Option<PromotionRetryGraceProof>,
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    fn contains(parent: &str, child: &str) -> bool {
+        child == parent
+            || child
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+    let left = left.to_string();
+    let right = right.to_string();
+    contains(&left, &right) || contains(&right, &left)
+}
+
+async fn ensure_shared_pool_has_no_legacy_segments(
+    store: Arc<dyn object_store::ObjectStore>,
+    database_path: &str,
+    segment_pool_path: &str,
+) -> Result<()> {
+    let legacy_prefix = Path::from(format!("{database_path}/segments"));
+    let mut legacy = store.list(Some(&legacy_prefix));
+    if let Some(entry) = legacy.next().await {
+        let entry = entry.context("Failed to inspect legacy per-database segments")?;
+        anyhow::bail!(
+            "CoW shared segment pool cannot open database {database_path}: legacy segment {} \
+             remains; legacy migration is not yet supported, so do not set \
+             storage.segment_pool_path={segment_pool_path} for this database",
+            entry.location,
+        );
+    }
+    Ok(())
 }
 
 enum ClaimOutcome {
@@ -143,6 +177,29 @@ impl StartupContext {
         );
 
         let actual_db_path = path_from_url.to_string();
+        let segment_pool_path = settings
+            .storage
+            .segment_pool_path
+            .as_deref()
+            .map(Path::parse)
+            .transpose()
+            .context("Invalid storage.segment_pool_path")?
+            .map(|path| path.to_string());
+        if let Some(pool) = &segment_pool_path {
+            let database = Path::from(actual_db_path.clone());
+            let pool_path = Path::from(pool.clone());
+            if paths_overlap(&database, &pool_path) {
+                anyhow::bail!(
+                    "storage.segment_pool_path must be disjoint from the SlateDB database path"
+                );
+            }
+            ensure_shared_pool_has_no_legacy_segments(
+                Arc::clone(&object_store),
+                &actual_db_path,
+                pool,
+            )
+            .await?;
+        }
 
         info!("Starting ZeroFS server with {} backend", object_store);
         info!("DB Path: {}", actual_db_path);
@@ -178,14 +235,48 @@ impl StartupContext {
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
+        let encryption_key_root = match &segment_pool_path {
+            Some(pool) => {
+                let pool = Path::from(pool.clone());
+                key_management::ensure_shared_key_compatibility(&object_store, &db_path, &pool)
+                    .await
+                    .context("CoW shared encryption-key compatibility check failed")?;
+                pool
+            }
+            None => db_path.clone(),
+        };
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
-            &db_path,
+            &encryption_key_root,
             &password,
             db_mode.is_read_only(),
         )
         .await
         .context("Failed to load or initialize encryption key")?;
+        let segment_pool_authority = match &segment_pool_path {
+            Some(pool) => {
+                let pool_store: Arc<dyn object_store::ObjectStore> =
+                    Arc::new(object_store::prefix::PrefixStore::new(
+                        Arc::clone(&object_store),
+                        Path::from(pool.clone()),
+                    ));
+                let authority = crate::segment_store::SegmentStore::open_or_create_pool_authority(
+                    Arc::clone(&pool_store),
+                    &encryption_key,
+                    &actual_db_path,
+                    !db_mode.is_read_only(),
+                )
+                .await
+                .context("Failed to authenticate CoW shared segment-pool genesis")?;
+                crate::segment_store::SegmentStore::validate_epoch_reservations(
+                    pool_store, &authority,
+                )
+                .await
+                .context("CoW shared segment pool contains unreserved identities")?;
+                Some(authority)
+            }
+            None => None,
+        };
 
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
@@ -234,6 +325,8 @@ impl StartupContext {
             wal_object_store,
             object_tracer,
             actual_db_path,
+            segment_pool_path,
+            segment_pool_authority,
             block_transformer,
             segment_codec: crate::frame_codec::FrameCodec::new(
                 &encryption_key,
@@ -707,9 +800,9 @@ impl StartupContext {
         // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
         // by path); the seal-cache still serves same-process read-after-write.
         //
-        // Segments are namespaced under the db path, so databases sharing one
-        // bucket don't collide on a global `segments/` keyspace. The prefix
-        // sits outside the prefetcher so the cache keys are db-distinct too.
+        // CoW-enabled volumes explicitly share one segment pool; legacy
+        // single-database volumes retain their database-local prefix. Writer
+        // epochs are reserved immutably inside whichever pool is selected.
         //
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
@@ -718,18 +811,22 @@ impl StartupContext {
             self.retrying_object_store.clone(),
             parts_cache,
         ));
-        let db_prefix = Path::from(self.actual_db_path.clone());
+        let segment_prefix = Path::from(
+            self.segment_pool_path
+                .clone()
+                .unwrap_or_else(|| self.actual_db_path.clone()),
+        );
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::prefix::PrefixStore::new(
                 Arc::clone(&prefetch) as Arc<dyn object_store::ObjectStore>,
-                db_prefix.clone(),
+                segment_prefix.clone(),
             ));
         // Warm the parts cache at seal time. `put_segment` passes the unprefixed
-        // object path, so prepend the db prefix exactly as PrefixStore would, giving
+        // object path, so prepend the selected prefix exactly as PrefixStore would, giving
         // the same cache key the read path derives.
         let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
             Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes| {
-                let full: Path = db_prefix.parts().chain(loc.parts()).collect();
+                let full: Path = segment_prefix.parts().chain(loc.parts()).collect();
                 prefetch.warm_object(&full, bytes);
             }));
 
@@ -844,6 +941,8 @@ impl ReconciledDb {
             wal_object_store,
             object_tracer,
             actual_db_path,
+            segment_pool_path: _,
+            segment_pool_authority,
             block_transformer: _,
             segment_codec,
             cache_config: _,
@@ -1021,6 +1120,18 @@ impl ReconciledDb {
         }
 
         let db_handle = slatedb.clone();
+        let segment_epoch = match (&slatedb, segment_pool_authority.as_ref()) {
+            (SlateDbHandle::ReadWrite(_), Some(authority)) => Some(
+                crate::segment_store::SegmentStore::reserve_epoch(
+                    Arc::clone(&segment_object_store),
+                    authority,
+                    &actual_db_path,
+                )
+                .await
+                .context("Failed to reserve a globally unique segment writer epoch")?,
+            ),
+            _ => None,
+        };
         let fs = ZeroFS::new_with_slatedb_and_lease(
             slatedb,
             settings.max_bytes(),
@@ -1034,6 +1145,7 @@ impl ReconciledDb {
             object_tracer.clone(),
             segment_object_store,
             segment_codec,
+            segment_epoch,
             segment_warm,
             None,
         )
@@ -1101,7 +1213,10 @@ pub async fn initialize_filesystem(
 
 #[cfg(test)]
 mod role_decision_tests {
-    use super::{ImmediateRoleDecision, StartupContext, immediate_role_decision};
+    use super::{
+        ImmediateRoleDecision, StartupContext, ensure_shared_pool_has_no_legacy_segments,
+        immediate_role_decision,
+    };
     use crate::config::{CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
     use crate::replication::ReplicationParams;
@@ -1122,6 +1237,83 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
+    async fn shared_pool_opt_in_fails_closed_when_legacy_segments_remain() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        ensure_shared_pool_has_no_legacy_segments(
+            Arc::clone(&store),
+            "volume/db",
+            "volume/segment-pool",
+        )
+        .await
+        .unwrap();
+        store
+            .put(
+                &Path::from("volume/db/segments/00/0000000000000001/0000000000000000"),
+                bytes::Bytes::from_static(b"legacy").into(),
+            )
+            .await
+            .unwrap();
+        let error =
+            ensure_shared_pool_has_no_legacy_segments(store, "volume/db", "volume/segment-pool")
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("legacy segment"));
+    }
+
+    #[tokio::test]
+    async fn two_legacy_databases_with_the_same_segid_cannot_join_one_pool() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let relative = "segments/00/0000000000000007/0000000000000000";
+        let mut legacy_paths = Vec::new();
+        for (database, contents) in [
+            ("volume/a", b"first".as_slice()),
+            ("volume/b", b"second".as_slice()),
+        ] {
+            let legacy_path = Path::from(format!("{database}/{relative}"));
+            store
+                .put(&legacy_path, bytes::Bytes::copy_from_slice(contents).into())
+                .await
+                .unwrap();
+            legacy_paths.push(legacy_path);
+            let error = ensure_shared_pool_has_no_legacy_segments(
+                Arc::clone(&store),
+                database,
+                "volume/segment-pool",
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("legacy segment"));
+        }
+
+        // Even a blind copy followed by removal of both source objects cannot
+        // manufacture the reservation authority required by shared-pool mode.
+        store
+            .put(
+                &Path::from(format!("volume/segment-pool/{relative}")),
+                bytes::Bytes::from_static(b"first").into(),
+            )
+            .await
+            .unwrap();
+        for path in legacy_paths {
+            store.delete(&path).await.unwrap();
+        }
+        let pool: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::clone(&store),
+            Path::from("volume/segment-pool"),
+        ));
+        assert!(
+            crate::segment_store::SegmentStore::open_or_create_pool_authority(
+                pool, &[1u8; 32], "volume/a", true,
+            )
+            .await
+            .err()
+            .expect("a pre-populated pool must not gain new-volume authority")
+            .to_string()
+            .contains("cannot establish shared segment-pool genesis")
+        );
+    }
+
+    #[tokio::test]
     async fn peer_silence_refreshes_ownership() {
         let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
         let store: Arc<dyn ObjectStore> = fault_store;
@@ -1139,6 +1331,8 @@ mod role_decision_tests {
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
+            segment_pool_path: None,
+            segment_pool_authority: None,
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
                 &[0; 32],
                 CompressionConfig::default(),

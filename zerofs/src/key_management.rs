@@ -168,6 +168,26 @@ fn wrapped_key_path(db_path: &Path) -> Path {
     path
 }
 
+/// A new CoW volume keeps encryption-key authority at the shared pool root.
+/// Legacy migration is intentionally unavailable until a reviewed protocol can
+/// preserve the exact key while reserving or rewriting every existing segment
+/// epoch. Merely copying the wrapped key must never make an old database look
+/// migrated.
+pub(crate) async fn ensure_shared_key_compatibility(
+    object_store: &Arc<dyn ObjectStore>,
+    database_path: &Path,
+    segment_pool_path: &Path,
+) -> Result<()> {
+    let legacy = load_wrapped_key_from_object_store(object_store, database_path).await?;
+    let _shared = load_wrapped_key_from_object_store(object_store, segment_pool_path).await?;
+    match legacy {
+        Some(_) => Err(anyhow::anyhow!(
+            "legacy database encryption key exists; CoW shared-pool migration is not yet supported, and manually copying the key or segments is unsafe"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Load wrapped key from object store
 pub async fn load_wrapped_key_from_object_store(
     object_store: &Arc<dyn ObjectStore>,
@@ -405,6 +425,46 @@ mod tests {
             .await
             .expect("later load");
         assert_eq!(ka, kc, "a later load must return the committed key");
+    }
+
+    #[tokio::test]
+    async fn shared_key_compatibility_rejects_even_an_exact_manual_legacy_copy() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let database = Path::from("volume/database");
+        let pool = Path::from("volume/segment-pool");
+        load_or_init_encryption_key(&store, &database, "password", false)
+            .await
+            .unwrap();
+        assert!(
+            ensure_shared_key_compatibility(&store, &database, &pool)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("migration is not yet supported")
+        );
+        let wrapped = store
+            .get(&wrapped_key_path(&database))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store
+            .put(&wrapped_key_path(&pool), wrapped.into())
+            .await
+            .unwrap();
+        assert!(
+            ensure_shared_key_compatibility(&store, &database, &pool)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("manually copying")
+        );
+
+        let new_database = Path::from("volume/new-database");
+        ensure_shared_key_compatibility(&store, &new_database, &pool)
+            .await
+            .unwrap();
     }
 
     fn store() -> Arc<dyn ObjectStore> {

@@ -49,6 +49,7 @@ impl ZeroFS {
             segment_codec,
             None,
             None,
+            None,
         )
         .await
     }
@@ -70,6 +71,9 @@ impl ZeroFS {
         object_tracer: ObjectTracer,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
+        // Pool-global immutable reservation for segment identity. Tests and
+        // legacy constructors may omit it and retain the SlateDB writer epoch.
+        segment_epoch: Option<u64>,
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         seal_threshold_override: Option<usize>,
     ) -> anyhow::Result<Self> {
@@ -90,6 +94,10 @@ impl ZeroFS {
             SlateDbHandle::ReadOnly(_) => (0, None),
         };
         let serving_writer_epoch = if ha_writer { writer_epoch } else { 0 };
+        let segment_epoch = match &slatedb {
+            SlateDbHandle::ReadWrite(_) => segment_epoch.unwrap_or(writer_epoch),
+            SlateDbHandle::ReadOnly(_) => 0,
+        };
 
         let db = Arc::new(match slatedb {
             SlateDbHandle::ReadWrite(db) => {
@@ -162,7 +170,7 @@ impl ZeroFS {
         let segment_store = Arc::new(SegmentStore::new(
             object_store,
             segment_codec,
-            writer_epoch,
+            segment_epoch,
             segment_warm,
         ));
         let extent_store = ExtentStore::new(

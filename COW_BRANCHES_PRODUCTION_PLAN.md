@@ -229,12 +229,12 @@
 
 ### Epic 4.3: Inventory and quarantine unreachable objects
 
-- [ ] Stream the physical segment inventory by the same stable shard key.
-- [ ] Join each inventory shard against its authoritative mark shard.
-- [ ] Exclude objects newer than the inventory cutoff.
-- [ ] Write unreachable candidates to a durable quarantine set.
-- [ ] Do not physically delete during the first unreachable observation.
-- [ ] Record reasons that prevent deletion, including missing roots, corrupt metadata, generation changes, and lease uncertainty.
+- [x] Stream the physical segment inventory by the same stable shard key.
+- [x] Join each inventory shard against its authoritative mark shard.
+- [x] Exclude objects newer than the inventory cutoff.
+- [x] Write unreachable candidates to a durable quarantine set.
+- [x] Do not physically delete during the first unreachable observation.
+- [x] Record reasons that prevent deletion, including missing roots, corrupt metadata, generation changes, and lease uncertainty.
 
 ### Epic 4.4: Revalidate and delete
 
@@ -301,6 +301,7 @@
 ### Epic 6.1: Ship lifecycle behavior safely
 
 - [ ] Release create, list, inspect, mount, checkpoint deletion, and descendant-preserving branch deletion behind feature controls where appropriate.
+- [ ] Provide a reviewed offline legacy-to-pool migration that preserves the exact volume key, reserves every imported epoch, rejects duplicate physical segment IDs across sources, and publishes authoritative completion; alternatively rewrite every colliding segment ID and `FrameLoc`.
 - [ ] Document exact semantics for logical deletion, active mounts, tombstones, name reuse, and asynchronous reclamation.
 - [ ] Provide administrative inspection for branch UUIDs, durable roots, leases, tombstones, and incomplete operations.
 - [ ] Provide bounded repair or cleanup operations for states that cannot recover automatically.
@@ -434,3 +435,12 @@
 - Verifiable authority: schema v8 publishes exactly 256 ordered final shards in the authoritative SlateDB run record. Each binary shard binds its format version, run UUID, root digest, shard number, sorted segment records, record count, and SHA-256 checksum. The coordinator verifies every final shard before the atomic `captured` to `marking` transition and re-verifies published shards on retries; missing, truncated, corrupt, reordered, duplicated, or descriptor-mismatched data fails closed. Bloom filters are not deletion authority.
 - Work accounting: the run persists root, reference, intermediate-run, and unique-segment counts. Validation ties those statistics to the immutable root list and final shard descriptors, while PostgreSQL and JSON remain identical root-free customer projections.
 - Executable proof: the focused test scans 9,000 checkpoint references through two bounded flushes, deduplicates them to 1,000 segments across 256 independently verifiable shards, excludes a post-checkpoint segment, preserves the catalog generation during mark publication, reconciles an exact retry, and rejects a subsequently corrupted authoritative shard. A million-flush stress test proves resident spill-path handles equal the binary population count and never exceed the logarithmic bound.
+
+### 2026-08-08: physical inventory and durable quarantine
+
+- Segment-pool identity: storage configuration names one volume-wide immutable segment pool, disjoint from the authoritative catalog and branch-database namespaces. Runtime readers, writers, replication replay, and GC use that same prefix. An HMAC-authenticated, conditional-create genesis binds the empty pool to its volume key and permanent pool UUID. Every read-write admission reserves a pool-global epoch with an immutable, genesis-authenticated conditional-create marker before counter zero, so independently cloned SlateDB writer epochs cannot collide. Every new GC run stores the canonical pool identity in SlateDB; pre-v9 active runs without it remain pinned and cannot inventory. PostgreSQL and JSON remain identical root-free projections and receive neither pool identity nor GC state.
+- Migration fence: the shared pool is also the volume encryption-key root because inherited external SSTs and segment frames must remain decryptable. This slice admits new CoW volumes only. Startup rejects any database with a legacy wrapped key or remaining per-database segment, refuses to establish genesis in a prepopulated pool, and independently proves that every segment already in an admitted pool has a valid permanent marker authenticated for that exact genesis and epoch. Copying or synthesizing shaped key, marker, or segment objects alone cannot manufacture authenticated admission. Legacy single-database mode remains available while the rollout phase designs an authoritative manifest that reserves every old epoch and rejects duplicate segment IDs, or rewrites all colliding IDs and `FrameLoc`s offline.
+- Order-independent inventory: schema v9 lists each of the same 256 physical segment prefixes without assuming backend LIST order. It validates every object key and shard, excludes immutable objects newer than the captured cutoff, emits bounded 8,192-object sorted runs, and uses online binary-carry plus two-reader streaming merges so data memory remains fixed and spill-path bookkeeping logarithmic.
+- First observation: each sorted inventory shard is merge-joined once against its independently verified authoritative mark shard. Reachable objects are counted, while older unmarked objects are written—with size and immutable modification time—to exactly 256 sorted, checksummed quarantine shards bound to the run UUID and root digest. No physical segment delete exists on this transition.
+- Acceptance fence: the `marking` to `quarantined` revision-three publication is one durable SlateDB write and succeeds only while the catalog remains at captured generation `G`. Exact retries verify both mark and quarantine artifacts. Missing roots, corrupt metadata/artifacts, generation changes, lease uncertainty, and storage unavailability have bounded per-kind durable blocker records in SlateDB; they never enter customer projections or authorize deletion.
+- Executable proof: the focused lifecycle test inventories 10,001 physical objects, excludes one post-cutoff object, classifies 1,000 reachable segments, externally sorts and quarantines 9,000 one-byte candidates across 256 verifiable shards, proves the candidate still exists, reconciles an exact retry, and records corrupt-artifact blockers. A catalog test proves a generation change rejects quarantine publication and that all blocker categories persist without changing the run revision. Runtime tests reserve 256 unique pool epochs concurrently, read a shallow-cloned extent through the shared pool, reject pre-genesis segments and wrong-key genesis, reject unmarked or forged pool epochs, reject an exact manual legacy-key copy, and prove two legacy databases with the same segment ID cannot join one pool.

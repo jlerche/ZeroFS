@@ -7,6 +7,7 @@
 
 mod deletion;
 mod gc;
+mod gc_inventory;
 mod gc_mark;
 mod json;
 mod lease;
@@ -44,7 +45,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 8;
+pub const CATALOG_SCHEMA_VERSION: u32 = 9;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -81,6 +82,7 @@ impl CatalogConfig {
         &self,
         object_store: Arc<dyn ObjectStore>,
         branch_database_root: slatedb::object_store::path::Path,
+        segment_pool_path: slatedb::object_store::path::Path,
     ) -> Result<BranchLifecycle, BranchLifecycleError> {
         let catalog_path = slatedb::object_store::path::Path::from(self.slatedb_path.as_str());
         root_store::ensure_database_namespaces_disjoint(
@@ -89,11 +91,24 @@ impl CatalogConfig {
             "branch root",
             &branch_database_root,
         )?;
+        root_store::ensure_database_namespaces_disjoint(
+            "catalog",
+            &catalog_path,
+            "segment pool",
+            &segment_pool_path,
+        )?;
+        root_store::ensure_database_namespaces_disjoint(
+            "branch root",
+            &branch_database_root,
+            "segment pool",
+            &segment_pool_path,
+        )?;
         let catalog: Arc<dyn Catalog> =
             Arc::new(SlateDbCatalog::open(catalog_path, Arc::clone(&object_store)).await?);
         Ok(BranchLifecycle::new(
             catalog,
-            SlateDbRootStore::new(object_store, branch_database_root),
+            SlateDbRootStore::new(object_store, branch_database_root)
+                .with_segment_pool_root(segment_pool_path),
         ))
     }
 }
@@ -496,9 +511,9 @@ pub enum GcRunPhase {
 
 impl GcRunPhase {
     fn retains_roots(self) -> bool {
-        // Terminal transitions are intentionally unsupported in schema v7.
-        // Until a separately reviewed proof protocol lands, uncertainty keeps
-        // every persisted run pinned regardless of its decoded phase.
+        // Through schema v9 even a quarantined first observation retains every
+        // captured root. A later independently reviewed revalidation protocol
+        // is the only place that may release them; uncertainty always retains.
         let _ = self;
         true
     }
@@ -512,10 +527,18 @@ pub struct GcRunRecord {
     pub inventory_cutoff: DateTime<Utc>,
     pub roots: Vec<GcRootPin>,
     pub root_digest: String,
+    /// Immutable volume-wide physical segment pool scanned by this run.
+    /// Empty is accepted only so pre-v9 active runs fail closed after migration.
+    #[serde(default)]
+    pub segment_pool: String,
     #[serde(default)]
     pub mark_shards: Vec<GcMarkShard>,
     #[serde(default)]
     pub mark_stats: Option<GcMarkStats>,
+    #[serde(default)]
+    pub quarantine_shards: Vec<GcQuarantineShard>,
+    #[serde(default)]
+    pub inventory_stats: Option<GcInventoryStats>,
     pub phase: GcRunPhase,
     pub quarantine_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -538,6 +561,78 @@ pub struct GcMarkStats {
     pub unique_segments: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcQuarantineShard {
+    pub shard: u8,
+    pub location: String,
+    pub checksum: String,
+    pub candidate_count: u64,
+    pub candidate_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcInventoryStats {
+    pub objects_seen: u64,
+    pub objects_newer_than_cutoff: u64,
+    pub reachable_objects: u64,
+    pub candidate_objects: u64,
+    pub candidate_bytes: u64,
+    pub intermediate_runs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GcQuarantinePublication {
+    pub(crate) id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) expected_generation: u64,
+    pub(crate) root_digest: String,
+    pub(crate) quarantine_shards: Vec<GcQuarantineShard>,
+    pub(crate) inventory_stats: GcInventoryStats,
+    pub(crate) quarantine_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcBlockerKind {
+    MissingRoot,
+    CorruptMetadata,
+    GenerationChanged,
+    LeaseUncertainty,
+    StorageUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcBlockerRecord {
+    pub run_id: Uuid,
+    pub kind: GcBlockerKind,
+    pub occurrences: u64,
+    pub detail: String,
+    pub first_observed_at: DateTime<Utc>,
+    pub last_observed_at: DateTime<Utc>,
+}
+
+impl GcBlockerRecord {
+    fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.run_id, "GC blocker run")?;
+        if self.occurrences == 0
+            || self.detail.is_empty()
+            || self.detail.len() > MAX_ROOT_IDENTIFIER_BYTES
+        {
+            return Err(CatalogError::Invalid(
+                "GC blocker count and bounded detail are required".to_string(),
+            ));
+        }
+        validate_timestamp(self.first_observed_at, "GC blocker first observation")?;
+        validate_timestamp(self.last_observed_at, "GC blocker last observation")?;
+        if self.last_observed_at < self.first_observed_at {
+            return Err(CatalogError::Invalid(
+                "GC blocker observations cannot move backwards".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl GcRunRecord {
     pub fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "GC run")?;
@@ -546,14 +641,28 @@ impl GcRunRecord {
             GcRunPhase::Captured
                 if self.revision == 1
                     && self.mark_shards.is_empty()
-                    && self.mark_stats.is_none() => {}
+                    && self.mark_stats.is_none()
+                    && self.quarantine_shards.is_empty()
+                    && self.inventory_stats.is_none()
+                    && self.quarantine_at.is_none() => {}
             GcRunPhase::Marking
                 if self.revision == 2
                     && self.mark_shards.len() == 256
-                    && self.mark_stats.is_some() => {}
+                    && self.mark_stats.is_some()
+                    && self.quarantine_shards.is_empty()
+                    && self.inventory_stats.is_none()
+                    && self.quarantine_at.is_none() => {}
+            GcRunPhase::Quarantined
+                if self.revision == 3
+                    && !self.segment_pool.is_empty()
+                    && self.mark_shards.len() == 256
+                    && self.mark_stats.is_some()
+                    && self.quarantine_shards.len() == 256
+                    && self.inventory_stats.is_some()
+                    && self.quarantine_at.is_some() => {}
             _ => {
                 return Err(CatalogError::Invalid(
-                    "GC schema v8 supports only captured revision one or marking revision two"
+                    "GC schema v9 supports captured, marking, and quarantined revisions"
                         .to_string(),
                 ));
             }
@@ -575,6 +684,22 @@ impl GcRunRecord {
             return Err(CatalogError::Invalid(
                 "GC root digest must be 64 hexadecimal bytes".to_string(),
             ));
+        }
+        if self.segment_pool.len() > MAX_ROOT_IDENTIFIER_BYTES {
+            return Err(CatalogError::Invalid(
+                "GC segment-pool identity exceeds the storage-identity bound".to_string(),
+            ));
+        }
+        if !self.segment_pool.is_empty() {
+            let parsed =
+                slatedb::object_store::path::Path::parse(&self.segment_pool).map_err(|error| {
+                    CatalogError::Invalid(format!("invalid GC segment pool: {error}"))
+                })?;
+            if parsed.to_string() != self.segment_pool {
+                return Err(CatalogError::Invalid(
+                    "GC segment-pool identity must be canonical".to_string(),
+                ));
+            }
         }
         for pin in &self.roots {
             validate_root(&pin.root)?;
@@ -604,6 +729,19 @@ impl GcRunRecord {
                 ));
             }
         }
+        for (expected_shard, shard) in (0u8..=u8::MAX).zip(&self.quarantine_shards) {
+            if shard.shard != expected_shard
+                || shard.location.is_empty()
+                || shard.location.len() > MAX_ROOT_IDENTIFIER_BYTES
+                || shard.checksum.len() != 64
+                || !shard.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(CatalogError::Invalid(
+                    "GC quarantine shards must be complete, ordered, bounded, and checksummed"
+                        .to_string(),
+                ));
+            }
+        }
         if let Some(stats) = &self.mark_stats {
             let unique_segments = self.mark_shards.iter().try_fold(0u64, |total, shard| {
                 total.checked_add(shard.segment_count).ok_or_else(|| {
@@ -619,6 +757,34 @@ impl GcRunRecord {
                 ));
             }
         }
+        if let Some(stats) = &self.inventory_stats {
+            let (candidate_objects, candidate_bytes) = self.quarantine_shards.iter().try_fold(
+                (0u64, 0u64),
+                |(objects, bytes), shard| {
+                    Ok::<_, CatalogError>((
+                        objects.checked_add(shard.candidate_count).ok_or_else(|| {
+                            CatalogError::Invalid("GC candidate count overflow".to_string())
+                        })?,
+                        bytes.checked_add(shard.candidate_bytes).ok_or_else(|| {
+                            CatalogError::Invalid("GC candidate byte count overflow".to_string())
+                        })?,
+                    ))
+                },
+            )?;
+            let classified = stats
+                .objects_newer_than_cutoff
+                .checked_add(stats.reachable_objects)
+                .and_then(|value| value.checked_add(stats.candidate_objects))
+                .ok_or_else(|| CatalogError::Invalid("GC inventory count overflow".to_string()))?;
+            if stats.objects_seen != classified
+                || stats.candidate_objects != candidate_objects
+                || stats.candidate_bytes != candidate_bytes
+            {
+                return Err(CatalogError::Invalid(
+                    "GC inventory statistics disagree with quarantine shards".to_string(),
+                ));
+            }
+        }
         if let Some(quarantine_at) = self.quarantine_at {
             validate_timestamp(quarantine_at, "GC quarantine timestamp")?;
             if quarantine_at < self.created_at {
@@ -626,11 +792,6 @@ impl GcRunRecord {
                     "GC quarantine cannot precede run creation".to_string(),
                 ));
             }
-        }
-        if self.quarantine_at.is_some() {
-            return Err(CatalogError::Invalid(
-                "GC schema v8 does not support quarantine artifacts".to_string(),
-            ));
         }
         Ok(())
     }
@@ -1122,6 +1283,7 @@ pub(crate) trait Catalog: Send + Sync {
         id: Uuid,
     ) -> Result<Option<BranchDeleteOperation>, CatalogError>;
     async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError>;
+    async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError>;
     /// Persist immutable root pins only if no root-affecting catalog mutation
     /// occurred since capture. The pins duplicate roots present at that same
     /// generation, so this bookkeeping write does not advance it.
@@ -1139,6 +1301,19 @@ pub(crate) trait Catalog: Send + Sync {
         mark_stats: GcMarkStats,
         updated_at: DateTime<Utc>,
     ) -> Result<GcRunRecord, CatalogError>;
+    /// Publish a verified first unreachable observation only if the catalog
+    /// still has the exact root generation captured by this run.
+    async fn publish_gc_quarantine(
+        &self,
+        publication: GcQuarantinePublication,
+    ) -> Result<GcRunRecord, CatalogError>;
+    async fn record_gc_blocker(
+        &self,
+        run_id: Uuid,
+        kind: GcBlockerKind,
+        detail: String,
+        observed_at: DateTime<Utc>,
+    ) -> Result<GcBlockerRecord, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
 

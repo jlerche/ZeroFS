@@ -349,6 +349,34 @@ Failure to prove any condition retains the object.
 
 ### Streaming mark, inventory, quarantine, and delete
 
+All branches of one volume resolve `FrameLoc` segment IDs in one immutable,
+volume-wide segment pool, separate from every SlateDB database namespace. A
+segment ID is globally unique within that pool; writer admission must allocate
+its epoch by conditionally creating a permanent reservation marker in shared
+pool storage rather than reuse a per-clone SlateDB writer epoch. A pool genesis
+is conditionally created only while the pool is empty and is authenticated by
+a subkey of the volume encryption key; every epoch marker authenticates its
+exact genesis UUID, epoch, reservation UUID, and database identity. The local
+counter starts at zero only after that marker succeeds. Runtime readers,
+writers, replication replay, and GC use the same configured prefix. The pool
+identity is captured in each GC run and cannot be changed between marking,
+quarantine, revalidation, and deletion. A legacy run without this identity, a
+per-branch segment namespace, or an ambiguous segment ID fails closed. This is
+storage authority in SlateDB/configuration and is never copied into PostgreSQL
+or JSON customer projections.
+
+The shared segment pool is also the volume encryption-key root. The initial
+implementation admits new CoW volumes only: any database-local wrapped key or
+legacy per-database segment prevents startup, genesis cannot be established in
+a prepopulated pool, and every segment already in an admitted pool must have a
+readable epoch marker authenticated for that exact genesis and epoch. Copying
+or synthesizing shaped key, marker, or segment objects alone cannot manufacture
+authenticated migration. Legacy
+single-database mode remains
+available until a separately reviewed offline protocol either publishes an
+authoritative completion manifest after reserving every old epoch and rejecting
+duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
+
 1. Capture generation `G`, immutable root list/digest, and an inventory cutoff;
    pin the list for the run.
 2. Enumerate each root once and emit segment IDs into memory-bounded sorted runs
@@ -365,10 +393,13 @@ Failure to prove any condition retains the object.
 8. Delete proven candidates in bounded idempotent batches and durably checkpoint
    batch progress.
 
-The run record contains only run UUID, generation, cutoff, immutable root-list
-identity/digest, mark-shard locations/checksums, phase, and quarantine time.
-Missing state prevents deletion. Interrupted work resumes exactly or aborts and
-leaks storage. Delete retries are idempotent.
+The run record contains only run UUID, generation, cutoff, segment-pool
+identity, immutable root-list identity/digest, mark and quarantine shard
+locations/checksums, bounded work statistics, phase, and quarantine time.
+Bounded per-kind blocker records retain the last reason and occurrence count for
+missing roots, corrupt metadata, generation changes, lease uncertainty, or
+storage unavailability. Missing state prevents deletion. Interrupted work
+resumes exactly or aborts and leaks storage. Delete retries are idempotent.
 
 ### Private fast path and cleanup
 

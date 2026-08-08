@@ -355,6 +355,12 @@ mod tests {
         ) -> Result<Option<crate::catalog::GcRunRecord>, CatalogError> {
             self.inner.gc_run(id).await
         }
+        async fn gc_blockers(
+            &self,
+            run_id: Uuid,
+        ) -> Result<Vec<crate::catalog::GcBlockerRecord>, CatalogError> {
+            self.inner.gc_blockers(run_id).await
+        }
         async fn begin_gc_run(
             &self,
             expected_generation: u64,
@@ -380,6 +386,23 @@ mod tests {
                     mark_stats,
                     updated_at,
                 )
+                .await
+        }
+        async fn publish_gc_quarantine(
+            &self,
+            publication: crate::catalog::GcQuarantinePublication,
+        ) -> Result<crate::catalog::GcRunRecord, CatalogError> {
+            self.inner.publish_gc_quarantine(publication).await
+        }
+        async fn record_gc_blocker(
+            &self,
+            run_id: Uuid,
+            kind: crate::catalog::GcBlockerKind,
+            detail: String,
+            observed_at: chrono::DateTime<Utc>,
+        ) -> Result<crate::catalog::GcBlockerRecord, CatalogError> {
+            self.inner
+                .record_gc_blocker(run_id, kind, detail, observed_at)
                 .await
         }
         async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {

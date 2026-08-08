@@ -1,7 +1,9 @@
+use super::gc_inventory::{GcInventoryError, GcInventoryStore};
 use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
-    Catalog, CatalogError, GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint,
-    RootStoreError, SlateDbRootStore, catalog_timestamp, gc_root_digest,
+    Catalog, CatalogError, GcBlockerKind, GcQuarantinePublication, GcRootKind, GcRunPhase,
+    GcRunRecord, ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp,
+    gc_root_digest,
 };
 use chrono::Utc;
 use futures::{StreamExt, stream};
@@ -67,9 +69,12 @@ impl RootCaptureLifecycle {
             catalog_generation: snapshot.generation,
             inventory_cutoff,
             root_digest: gc_root_digest(&pins)?,
+            segment_pool: self.roots.segment_pool_root().to_string(),
             roots: pins,
             mark_shards: Vec::new(),
             mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             created_at: inventory_cutoff,
@@ -101,15 +106,26 @@ impl RootCaptureLifecycle {
             .await?
             .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
         let store = GcMarkStore::new(self.roots.clone());
-        if run.phase == GcRunPhase::Marking {
+        if matches!(run.phase, GcRunPhase::Marking | GcRunPhase::Quarantined) {
             let digest = decode_digest(&run.root_digest)?;
-            store.verify_all(run.id, digest, &run.mark_shards).await?;
+            if let Err(error) = store.verify_all(run.id, digest, &run.mark_shards).await {
+                self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
             return Ok(run);
         }
         if run.phase != GcRunPhase::Captured || run.revision != 1 {
             return Err(CatalogError::OperationConflict(run_id.to_string()).into());
         }
-        let build = store.build(&run).await?;
+        let build = match store.build(&run).await {
+            Ok(build) => build,
+            Err(error) => {
+                self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
         let mark_shards = build.shards;
         let mark_stats = build.stats;
         let published = self
@@ -142,6 +158,129 @@ impl RootCaptureLifecycle {
             }
         }
     }
+
+    /// Stream the physical segment pool, exclude objects newer than the
+    /// captured cutoff, merge-join it against the authoritative mark shards,
+    /// and publish a durable first unreachable observation. No segment is
+    /// physically deleted by this transition.
+    pub async fn quarantine(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        let digest = decode_digest(&run.root_digest)?;
+        let marks = GcMarkStore::new(self.roots.clone());
+        if let Err(error) = marks.verify_all(run.id, digest, &run.mark_shards).await {
+            self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
+                .await;
+            return Err(error.into());
+        }
+        let inventory = GcInventoryStore::new(&self.roots);
+        if run.phase == GcRunPhase::Quarantined {
+            if let Err(error) = inventory
+                .verify_all(&run, digest, &run.quarantine_shards)
+                .await
+            {
+                self.record_blocker(run.id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+            return Ok(run);
+        }
+        if run.phase != GcRunPhase::Marking || run.revision != 2 {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let build = match inventory.build(&run).await {
+            Ok(build) => build,
+            Err(error) => {
+                self.record_blocker(run.id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let quarantine_at = catalog_timestamp(Utc::now());
+        let published = self
+            .catalog
+            .publish_gc_quarantine(GcQuarantinePublication {
+                id: run.id,
+                expected_revision: run.revision,
+                expected_generation: run.catalog_generation,
+                root_digest: run.root_digest.clone(),
+                quarantine_shards: build.shards.clone(),
+                inventory_stats: build.stats.clone(),
+                quarantine_at,
+            })
+            .await;
+        match published {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                if let Some(existing) = self.catalog.gc_run(run_id).await?
+                    && existing.phase == GcRunPhase::Quarantined
+                    && existing.root_digest == run.root_digest
+                    && existing.quarantine_shards == build.shards
+                    && existing.inventory_stats.as_ref() == Some(&build.stats)
+                    && existing.quarantine_at == Some(quarantine_at)
+                {
+                    inventory
+                        .verify_all(&existing, digest, &existing.quarantine_shards)
+                        .await?;
+                    return Ok(existing);
+                }
+                if self
+                    .catalog
+                    .snapshot()
+                    .await
+                    .is_ok_and(|snapshot| snapshot.generation != run.catalog_generation)
+                {
+                    self.record_blocker(
+                        run.id,
+                        GcBlockerKind::GenerationChanged,
+                        format!(
+                            "catalog generation changed after capture at {}",
+                            run.catalog_generation
+                        ),
+                    )
+                    .await;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
+        if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
+            let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        let _ = self
+            .catalog
+            .record_gc_blocker(run_id, kind, detail, catalog_timestamp(Utc::now()))
+            .await;
+    }
+}
+
+fn classify_mark_error(error: &GcMarkError) -> GcBlockerKind {
+    match error {
+        GcMarkError::RootStore(_) => GcBlockerKind::MissingRoot,
+        GcMarkError::Corrupt(_) => GcBlockerKind::CorruptMetadata,
+        GcMarkError::SlateDb(_) | GcMarkError::ObjectStore(_) | GcMarkError::Io(_) => {
+            GcBlockerKind::StorageUnavailable
+        }
+    }
+}
+
+fn classify_inventory_error(error: &GcInventoryError) -> GcBlockerKind {
+    match error {
+        GcInventoryError::Corrupt(_) => GcBlockerKind::CorruptMetadata,
+        GcInventoryError::Mark(error) => classify_mark_error(error),
+        GcInventoryError::ObjectStore(_) | GcInventoryError::Io(_) => {
+            GcBlockerKind::StorageUnavailable
+        }
+    }
 }
 
 fn decode_digest(value: &str) -> Result<[u8; 32], RootCaptureLifecycleError> {
@@ -164,11 +303,19 @@ pub enum RootCaptureLifecycleError {
     RootStore(#[from] RootStoreError),
     #[error("GC marking failed: {0}")]
     Mark(String),
+    #[error("GC inventory failed: {0}")]
+    Inventory(String),
 }
 
 impl From<GcMarkError> for RootCaptureLifecycleError {
     fn from(error: GcMarkError) -> Self {
         Self::Mark(error.to_string())
+    }
+}
+
+impl From<GcInventoryError> for RootCaptureLifecycleError {
+    fn from(error: GcInventoryError) -> Self {
+        Self::Inventory(error.to_string())
     }
 }
 
@@ -275,9 +422,12 @@ mod tests {
             catalog_generation: 0,
             inventory_cutoff: now,
             root_digest: gc_root_digest(&pins).unwrap(),
+            segment_pool: String::new(),
             roots: pins,
             mark_shards: Vec::new(),
             mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
             phase: GcRunPhase::Completed,
             quarantine_at: None,
             created_at: now,
@@ -394,9 +544,12 @@ mod tests {
             catalog_generation: captured.generation,
             inventory_cutoff: now,
             root_digest: gc_root_digest(&pins).unwrap(),
+            segment_pool: String::new(),
             roots: pins,
             mark_shards: Vec::new(),
             mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             created_at: now,
@@ -468,6 +621,27 @@ mod tests {
             kind: GcRootKind::Checkpoint,
             root,
         }];
+        let segment_pool = Path::from(".zerofs/segment-pool");
+        for counter in 0..1_000u64 {
+            let segment = Segid::new(7, counter);
+            store
+                .put(
+                    &Path::from(format!("{segment_pool}/{}", segment.object_key())),
+                    bytes::Bytes::from_static(b"r").into(),
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0..9_000u64 {
+            let segment = Segid::new(8, index * 256);
+            store
+                .put(
+                    &Path::from(format!("{segment_pool}/{}", segment.object_key())),
+                    bytes::Bytes::from_static(b"q").into(),
+                )
+                .await
+                .unwrap();
+        }
         let now = catalog_timestamp(Utc::now());
         let run = GcRunRecord {
             id: Uuid::new_v4(),
@@ -475,9 +649,12 @@ mod tests {
             catalog_generation: 0,
             inventory_cutoff: now,
             root_digest: gc_root_digest(&pins).unwrap(),
+            segment_pool: segment_pool.to_string(),
             roots: pins,
             mark_shards: Vec::new(),
             mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
             phase: GcRunPhase::Captured,
             quarantine_at: None,
             created_at: now,
@@ -492,7 +669,8 @@ mod tests {
         let artifact_store = Arc::clone(&store);
         let lifecycle = RootCaptureLifecycle::new(
             catalog.clone(),
-            SlateDbRootStore::new(store, Path::from("gc-mark-branches")),
+            SlateDbRootStore::new(store, Path::from("gc-mark-branches"))
+                .with_segment_pool_root(segment_pool.clone()),
         );
         let marked = lifecycle.mark(run.id).await.unwrap();
         assert_eq!(marked.phase, GcRunPhase::Marking);
@@ -513,6 +691,47 @@ mod tests {
         assert_eq!(stats.unique_segments, 1_000);
         assert_eq!(lifecycle.mark(run.id).await.unwrap(), marked);
         assert_eq!(catalog.snapshot().await.unwrap().generation, 0);
+        let newer = Segid::new(9, 1);
+        artifact_store
+            .put(
+                &Path::from(format!("{segment_pool}/{}", newer.object_key())),
+                bytes::Bytes::from_static(b"n").into(),
+            )
+            .await
+            .unwrap();
+        let quarantined = lifecycle.quarantine(run.id).await.unwrap();
+        assert_eq!(quarantined.phase, GcRunPhase::Quarantined);
+        assert_eq!(quarantined.revision, 3);
+        assert_eq!(quarantined.quarantine_shards.len(), 256);
+        let inventory = quarantined.inventory_stats.as_ref().unwrap();
+        assert_eq!(inventory.objects_seen, 10_001);
+        assert_eq!(inventory.objects_newer_than_cutoff, 1);
+        assert_eq!(inventory.reachable_objects, 1_000);
+        assert_eq!(inventory.candidate_objects, 9_000);
+        assert_eq!(inventory.candidate_bytes, 9_000);
+        assert_eq!(inventory.intermediate_runs, 257);
+        assert_eq!(lifecycle.quarantine(run.id).await.unwrap(), quarantined);
+        assert!(
+            artifact_store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    Segid::new(8, 0).object_key()
+                )))
+                .await
+                .is_ok(),
+            "first observation must not delete candidates"
+        );
+        artifact_store
+            .put(
+                &Path::from(quarantined.quarantine_shards[0].location.clone()),
+                bytes::Bytes::from_static(b"corrupt").into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle.quarantine(run.id).await,
+            Err(RootCaptureLifecycleError::Inventory(_))
+        ));
         artifact_store
             .put(
                 &Path::from(marked.mark_shards[0].location.clone()),
@@ -524,6 +743,10 @@ mod tests {
             lifecycle.mark(run.id).await,
             Err(RootCaptureLifecycleError::Mark(_))
         ));
+        let blockers = catalog.gc_blockers(run.id).await.unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].kind, GcBlockerKind::CorruptMetadata);
+        assert_eq!(blockers[0].occurrences, 2);
         catalog.close().await.unwrap();
     }
 }

@@ -1132,6 +1132,7 @@ mod tests {
             segment_codec,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
