@@ -1,7 +1,9 @@
+use super::lease::LEASE_CLOCK_SKEW;
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, CATALOG_SCHEMA_VERSION,
-    Catalog, CatalogError, CatalogMutation, CatalogSnapshot, CheckpointRecord, TombstoneKind,
-    TombstoneRecord, validate_name, validate_root, validate_timestamp,
+    Catalog, CatalogError, CatalogMutation, CatalogSnapshot, CheckpointRecord, LeaseAccessMode,
+    LeaseRecord, LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name,
+    validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,8 +25,11 @@ const CHECKPOINT_NAME_PREFIX: &[u8] = b"catalog/checkpoint-name/";
 const TOMBSTONE_PREFIX: &[u8] = b"catalog/tombstone/";
 const BRANCH_CREATE_OPERATION_PREFIX: &[u8] = b"catalog/branch-create-operation/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
+const LEASE_PREFIX: &[u8] = b"catalog/lease/";
+const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
+const OPERATION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -115,7 +120,13 @@ impl SlateDbCatalog {
         if state.schema_version == CATALOG_SCHEMA_VERSION {
             return Ok(());
         }
-        if ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION].contains(&state.schema_version) {
+        if ![
+            LEGACY_SCHEMA_VERSION,
+            PREVIOUS_SCHEMA_VERSION,
+            OPERATION_SCHEMA_VERSION,
+        ]
+        .contains(&state.schema_version)
+        {
             return Err(CatalogError::Corrupt(format!(
                 "unsupported SlateDB catalog schema version {}",
                 state.schema_version
@@ -221,6 +232,10 @@ impl SlateDbCatalog {
         let tombstones = self
             .scan_records::<TombstoneRecord>(TOMBSTONE_PREFIX)
             .await?;
+        let leases = self.scan_records::<LeaseRecord>(LEASE_PREFIX).await?;
+        let lease_tombstones = self
+            .scan_records::<LeaseTombstone>(LEASE_TOMBSTONE_PREFIX)
+            .await?;
         let snapshot = CatalogSnapshot {
             schema_version: state.schema_version,
             generation: state.generation,
@@ -233,6 +248,14 @@ impl SlateDbCatalog {
                 .map(|record| (record.id, record))
                 .collect(),
             branch_create_operations: branch_create_operations
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            leases: leases
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            lease_tombstones: lease_tombstones
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -290,6 +313,192 @@ impl SlateDbCatalog {
         let mut batch = WriteBatch::new();
 
         match mutation {
+            CatalogMutation::AcquireLease {
+                expected_subject_revision,
+                lease,
+            } => {
+                lease.validate()?;
+                ensure_initial_revision(lease.revision)?;
+                if let Some(existing) = self.get_record::<LeaseRecord>(lease_key(lease.id)).await? {
+                    if existing.subject_kind == lease.subject_kind
+                        && existing.subject_id == lease.subject_id
+                        && existing.root == lease.root
+                        && existing.access_mode == lease.access_mode
+                        && existing.token_hash == lease.token_hash
+                        && existing.revision == 1
+                        && existing.expires_at - existing.updated_at
+                            == lease.expires_at - lease.updated_at
+                    {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(lease.id.to_string()));
+                }
+                ensure_resource_id_available(self.db.as_ref(), lease.id).await?;
+                ensure_absent(
+                    self.db.as_ref(),
+                    lease_tombstone_key(lease.id),
+                    &lease.id.to_string(),
+                )
+                .await?;
+                match lease.subject_kind {
+                    LeaseSubjectKind::Branch => {
+                        let branch = self
+                            .get_record::<BranchRecord>(branch_key(lease.subject_id))
+                            .await?
+                            .ok_or_else(|| CatalogError::NotFound(lease.subject_id.to_string()))?;
+                        ensure_expected_revision(expected_subject_revision, branch.revision)?;
+                        if branch.state != BranchState::Ready
+                            || branch.root.as_ref() != Some(&lease.root)
+                        {
+                            return Err(CatalogError::OperationConflict(lease.id.to_string()));
+                        }
+                    }
+                    LeaseSubjectKind::Checkpoint => {
+                        let checkpoint = self
+                            .get_record::<CheckpointRecord>(checkpoint_key(lease.subject_id))
+                            .await?
+                            .ok_or_else(|| CatalogError::NotFound(lease.subject_id.to_string()))?;
+                        ensure_expected_revision(expected_subject_revision, checkpoint.revision)?;
+                        if checkpoint.root != lease.root
+                            || lease.access_mode != LeaseAccessMode::Read
+                        {
+                            return Err(CatalogError::OperationConflict(lease.id.to_string()));
+                        }
+                    }
+                }
+                put_json(&mut batch, lease_key(lease.id), &lease)?;
+            }
+            CatalogMutation::RenewLease {
+                id,
+                expected_revision,
+                token_hash,
+                renewed_at,
+                expires_at,
+            } => {
+                validate_timestamp(renewed_at, "lease renewed_at")?;
+                validate_timestamp(expires_at, "lease expires_at")?;
+                let mut lease = self
+                    .get_record::<LeaseRecord>(lease_key(id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+                let retry_revision = expected_revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Invalid("lease expected revision overflow".to_string())
+                })?;
+                let subject_is_mountable = match lease.subject_kind {
+                    LeaseSubjectKind::Branch => self
+                        .get_record::<BranchRecord>(branch_key(lease.subject_id))
+                        .await?
+                        .is_some_and(|branch| {
+                            branch.state == BranchState::Ready
+                                && branch.root.as_ref() == Some(&lease.root)
+                        }),
+                    LeaseSubjectKind::Checkpoint => self
+                        .get_record::<CheckpointRecord>(checkpoint_key(lease.subject_id))
+                        .await?
+                        .is_some_and(|checkpoint| checkpoint.root == lease.root),
+                };
+                if !subject_is_mountable {
+                    return Err(CatalogError::OperationConflict(id.to_string()));
+                }
+                if lease.revision == retry_revision
+                    && lease.token_hash == token_hash
+                    && lease.expires_at - lease.updated_at == expires_at - renewed_at
+                    && renewed_at < lease.expires_at
+                {
+                    return Ok(state.generation);
+                }
+                ensure_expected_revision(expected_revision, lease.revision)?;
+                if lease.token_hash != token_hash
+                    || renewed_at >= lease.expires_at
+                    || expires_at <= renewed_at
+                    || renewed_at < lease.updated_at
+                    || expires_at < lease.expires_at
+                    || expires_at - renewed_at > super::lease::MAX_LEASE_DURATION
+                {
+                    return Err(CatalogError::OperationConflict(id.to_string()));
+                }
+                lease.revision = lease
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogError::Corrupt("lease revision overflow".to_string()))?;
+                lease.updated_at = renewed_at;
+                lease.expires_at = expires_at;
+                put_json(&mut batch, lease_key(id), &lease)?;
+            }
+            CatalogMutation::EndLease {
+                id,
+                expected_revision,
+                token_hash,
+                ended_at,
+            } => {
+                validate_timestamp(ended_at, "lease ended_at")?;
+                if let Some(tombstone) = self
+                    .get_record::<LeaseTombstone>(lease_tombstone_key(id))
+                    .await?
+                {
+                    if tombstone.token_hash == token_hash {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(id.to_string()));
+                }
+                let lease = self
+                    .get_record::<LeaseRecord>(lease_key(id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+                ensure_expected_revision(expected_revision, lease.revision)?;
+                if lease.token_hash != token_hash {
+                    return Err(CatalogError::OperationConflict(id.to_string()));
+                }
+                if ended_at < lease.issued_at {
+                    return Err(CatalogError::Invalid(
+                        "lease release cannot precede issuance".to_string(),
+                    ));
+                }
+                batch.delete(lease_key(id));
+                put_json(
+                    &mut batch,
+                    lease_tombstone_key(id),
+                    &LeaseTombstone {
+                        id,
+                        token_hash,
+                        ended_at,
+                    },
+                )?;
+            }
+            CatalogMutation::ExpireLease {
+                id,
+                expected_revision,
+                observed_at,
+            } => {
+                validate_timestamp(observed_at, "lease expiry observation")?;
+                if self.db.get(lease_tombstone_key(id)).await?.is_some() {
+                    return Ok(state.generation);
+                }
+                let lease = self
+                    .get_record::<LeaseRecord>(lease_key(id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+                ensure_expected_revision(expected_revision, lease.revision)?;
+                let retention_deadline = lease
+                    .expires_at
+                    .checked_add_signed(LEASE_CLOCK_SKEW)
+                    .ok_or_else(|| {
+                        CatalogError::Invalid("lease retention deadline overflow".to_string())
+                    })?;
+                if observed_at < retention_deadline {
+                    return Err(CatalogError::OperationConflict(id.to_string()));
+                }
+                batch.delete(lease_key(id));
+                put_json(
+                    &mut batch,
+                    lease_tombstone_key(id),
+                    &LeaseTombstone {
+                        id,
+                        token_hash: lease.token_hash,
+                        ended_at: observed_at,
+                    },
+                )?;
+            }
             CatalogMutation::ReserveBranchCreate { branch, operation } => {
                 branch.validate()?;
                 operation.validate()?;
@@ -759,6 +968,11 @@ impl Catalog for SlateDbCatalog {
         self.get_record(branch_create_operation_key(id)).await
     }
 
+    async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(lease_key(id)).await
+    }
+
     async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
         let _guard = self.lock.lock().await;
         self.apply_unlocked(mutation).await
@@ -797,6 +1011,14 @@ fn tombstone_key(id: Uuid) -> Bytes {
 
 fn branch_create_operation_key(id: Uuid) -> Bytes {
     joined_key(BRANCH_CREATE_OPERATION_PREFIX, id.to_string().as_bytes())
+}
+
+fn lease_key(id: Uuid) -> Bytes {
+    joined_key(LEASE_PREFIX, id.to_string().as_bytes())
+}
+
+fn lease_tombstone_key(id: Uuid) -> Bytes {
+    joined_key(LEASE_TOMBSTONE_PREFIX, id.to_string().as_bytes())
 }
 
 fn branch_create_source_checkpoint_prefix(checkpoint_id: Uuid) -> Bytes {
@@ -840,6 +1062,8 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         checkpoint_key(id),
         tombstone_key(id),
         branch_create_operation_key(id),
+        lease_key(id),
+        lease_tombstone_key(id),
     ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
@@ -907,7 +1131,7 @@ fn validate_revision_change(expected: u64, actual: u64, next: u64) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{BranchState, DurableRoot, catalog_timestamp};
+    use crate::catalog::{BranchState, DurableRoot, catalog_timestamp, lease::LEASE_CLOCK_SKEW};
     use chrono::Utc;
     use slatedb::object_store::memory::InMemory;
 
@@ -942,6 +1166,21 @@ mod tests {
             },
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn branch_lease(branch: &BranchRecord, issued_at: chrono::DateTime<Utc>) -> LeaseRecord {
+        LeaseRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            subject_kind: LeaseSubjectKind::Branch,
+            subject_id: branch.id,
+            root: branch.root.clone().unwrap(),
+            access_mode: LeaseAccessMode::Read,
+            token_hash: "a".repeat(64),
+            issued_at,
+            updated_at: issued_at,
+            expires_at: issued_at + chrono::Duration::seconds(10),
         }
     }
 
@@ -1150,6 +1389,175 @@ mod tests {
             6
         );
         catalog.snapshot().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leases_survive_subject_deletion_expire_once_and_cannot_resurrect() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("lease-lifecycle"), store)
+            .await
+            .unwrap();
+        let branch = branch("leased");
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+        let issued_at = catalog_timestamp(Utc::now());
+        let lease = branch_lease(&branch, issued_at);
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::AcquireLease {
+                    expected_subject_revision: branch.revision,
+                    lease: lease.clone(),
+                })
+                .await
+                .unwrap(),
+            2
+        );
+        for (renewed_at, expires_at) in [
+            (
+                issued_at - chrono::Duration::microseconds(1),
+                lease.expires_at + chrono::Duration::seconds(1),
+            ),
+            (issued_at, lease.expires_at - chrono::Duration::seconds(1)),
+        ] {
+            assert!(matches!(
+                catalog
+                    .apply(CatalogMutation::RenewLease {
+                        id: lease.id,
+                        expected_revision: lease.revision,
+                        token_hash: lease.token_hash.clone(),
+                        renewed_at,
+                        expires_at,
+                    })
+                    .await,
+                Err(CatalogError::OperationConflict(_))
+            ));
+        }
+        catalog
+            .apply(CatalogMutation::DeleteBranch {
+                id: branch.id,
+                expected_revision: branch.revision,
+                name: branch.name,
+                deleted_at: issued_at,
+            })
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert!(!snapshot.branches.contains_key(&branch.id));
+        assert!(snapshot.gc_roots().contains(&&lease.root));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::RenewLease {
+                    id: lease.id,
+                    expected_revision: lease.revision,
+                    token_hash: lease.token_hash.clone(),
+                    renewed_at: issued_at,
+                    expires_at: lease.expires_at + chrono::Duration::seconds(10),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ExpireLease {
+                    id: lease.id,
+                    expected_revision: lease.revision,
+                    observed_at: lease.expires_at + LEASE_CLOCK_SKEW
+                        - chrono::Duration::microseconds(1),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        let expire = CatalogMutation::ExpireLease {
+            id: lease.id,
+            expected_revision: lease.revision,
+            observed_at: lease.expires_at + LEASE_CLOCK_SKEW,
+        };
+        assert_eq!(catalog.apply(expire.clone()).await.unwrap(), 4);
+        assert_eq!(catalog.apply(expire).await.unwrap(), 4);
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert!(!snapshot.leases.contains_key(&lease.id));
+        assert!(snapshot.lease_tombstones.contains_key(&lease.id));
+        assert!(!snapshot.gc_roots().contains(&&lease.root));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLease {
+                    expected_subject_revision: branch.revision,
+                    lease,
+                })
+                .await,
+            Err(CatalogError::AlreadyExists(_) | CatalogError::NotFound(_))
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_lease_acquisition_serializes_with_logical_deletion() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("checkpoint-lease-delete-race"), store)
+                .await
+                .unwrap(),
+        );
+        let owner = branch("owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let checkpoint = checkpoint(Uuid::new_v4(), owner.id, "point");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(checkpoint.clone()))
+            .await
+            .unwrap();
+        let now = catalog_timestamp(Utc::now());
+        let lease = LeaseRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            subject_kind: LeaseSubjectKind::Checkpoint,
+            subject_id: checkpoint.id,
+            root: checkpoint.root.clone(),
+            access_mode: LeaseAccessMode::Read,
+            token_hash: "b".repeat(64),
+            issued_at: now,
+            updated_at: now,
+            expires_at: now + chrono::Duration::minutes(1),
+        };
+        let acquire_catalog = Arc::clone(&catalog);
+        let delete_catalog = Arc::clone(&catalog);
+        let acquire_lease = lease.clone();
+        let delete_checkpoint = checkpoint.clone();
+        let (acquired, deleted) = tokio::join!(
+            async move {
+                acquire_catalog
+                    .apply(CatalogMutation::AcquireLease {
+                        expected_subject_revision: delete_checkpoint.revision,
+                        lease: acquire_lease,
+                    })
+                    .await
+            },
+            async move {
+                delete_catalog
+                    .apply(CatalogMutation::DeleteCheckpoint {
+                        id: checkpoint.id,
+                        expected_revision: checkpoint.revision,
+                        name: checkpoint.name,
+                        deleted_at: now,
+                    })
+                    .await
+            }
+        );
+        deleted.unwrap();
+        let acquired_ok = acquired.is_ok();
+        assert!(acquired_ok || matches!(&acquired, Err(CatalogError::NotFound(_))));
+        let snapshot = catalog.snapshot().await.unwrap();
+        if acquired_ok {
+            assert!(snapshot.leases.contains_key(&lease.id));
+            assert!(snapshot.gc_roots().contains(&&lease.root));
+        } else {
+            assert!(!snapshot.leases.contains_key(&lease.id));
+        }
         catalog.close().await.unwrap();
     }
 
@@ -1443,36 +1851,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_catalog_to_operation_schema_without_rewriting_records() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("migration-v2-v3");
-        let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
-            .build()
-            .await
+    async fn migrates_v2_and_v3_catalogs_to_lease_schema_without_rewriting_records() {
+        for prior_version in [PREVIOUS_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let path = Path::from(format!("migration-v{prior_version}-v4"));
+            let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
+                .build()
+                .await
+                .unwrap();
+            let existing = branch("existing");
+            let mut batch = WriteBatch::new();
+            put_json(
+                &mut batch,
+                Bytes::from_static(STATE_KEY),
+                &CatalogState {
+                    schema_version: prior_version,
+                    generation: 1,
+                },
+            )
             .unwrap();
-        let existing = branch("existing");
-        let mut batch = WriteBatch::new();
-        put_json(
-            &mut batch,
-            Bytes::from_static(STATE_KEY),
-            &CatalogState {
-                schema_version: PREVIOUS_SCHEMA_VERSION,
-                generation: 1,
-            },
-        )
-        .unwrap();
-        put_json(&mut batch, branch_key(existing.id), &existing).unwrap();
-        db.write_with_options(batch, &durable_write_options())
-            .await
-            .unwrap();
-        db.close().await.unwrap();
+            put_json(&mut batch, branch_key(existing.id), &existing).unwrap();
+            db.write_with_options(batch, &durable_write_options())
+                .await
+                .unwrap();
+            db.close().await.unwrap();
 
-        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
-        let snapshot = catalog.snapshot().await.unwrap();
-        assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
-        assert_eq!(snapshot.branches[&existing.id], existing);
-        assert!(snapshot.branch_create_operations.is_empty());
-        catalog.close().await.unwrap();
+            let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+            let snapshot = catalog.snapshot().await.unwrap();
+            assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
+            assert_eq!(snapshot.branches[&existing.id], existing);
+            assert!(snapshot.branch_create_operations.is_empty());
+            assert!(snapshot.leases.is_empty());
+            assert!(snapshot.lease_tombstones.is_empty());
+            catalog.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 //! the same projection contract.
 
 mod json;
+mod lease;
 mod lifecycle;
 mod postgres;
 mod root_store;
@@ -24,6 +25,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub use json::JsonCatalogProjection;
+pub use lease::{
+    LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
+};
 pub use lifecycle::{
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchLifecycle,
     BranchLifecycleError,
@@ -32,7 +36,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -206,6 +210,97 @@ pub struct CheckpointRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum LeaseSubjectKind {
+    Branch,
+    Checkpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseAccessMode {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaseRecord {
+    pub id: Uuid,
+    pub revision: u64,
+    pub subject_kind: LeaseSubjectKind,
+    pub subject_id: Uuid,
+    pub root: DurableRoot,
+    pub access_mode: LeaseAccessMode,
+    pub token_hash: String,
+    pub issued_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl LeaseRecord {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "lease")?;
+        validate_revision(self.revision, "lease")?;
+        validate_id(self.subject_id, "lease subject")?;
+        validate_root(&self.root)?;
+        if self.subject_kind == LeaseSubjectKind::Checkpoint
+            && self.access_mode != LeaseAccessMode::Read
+        {
+            return Err(CatalogError::Invalid(
+                "checkpoint leases must be read-only".to_string(),
+            ));
+        }
+        if self.token_hash.len() != 64
+            || !self.token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "lease token hash must be 64 hexadecimal bytes".to_string(),
+            ));
+        }
+        validate_timestamp(self.issued_at, "lease issued_at")?;
+        validate_timestamp(self.updated_at, "lease updated_at")?;
+        validate_timestamp(self.expires_at, "lease expires_at")?;
+        if self.updated_at < self.issued_at || self.expires_at <= self.updated_at {
+            return Err(CatalogError::Invalid(
+                "lease times must satisfy issued_at <= updated_at < expires_at".to_string(),
+            ));
+        }
+        if self.expires_at - self.updated_at > lease::MAX_LEASE_DURATION {
+            return Err(CatalogError::Invalid(
+                "lease duration exceeds the production maximum".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_unexpired(&self, now: DateTime<Utc>) -> bool {
+        now < self.expires_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaseTombstone {
+    pub id: Uuid,
+    pub token_hash: String,
+    pub ended_at: DateTime<Utc>,
+}
+
+impl LeaseTombstone {
+    fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "lease tombstone")?;
+        validate_timestamp(self.ended_at, "lease tombstone ended_at")?;
+        if self.token_hash.len() != 64
+            || !self.token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "lease tombstone token hash must be 64 hexadecimal bytes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BranchCreatePhase {
     Reserved,
     RootCreated,
@@ -356,6 +451,10 @@ pub struct CatalogSnapshot {
     #[serde(default)]
     pub branch_create_operations: BTreeMap<Uuid, BranchCreateOperation>,
     #[serde(default)]
+    pub leases: BTreeMap<Uuid, LeaseRecord>,
+    #[serde(default)]
+    pub lease_tombstones: BTreeMap<Uuid, LeaseTombstone>,
+    #[serde(default)]
     pub tombstones: BTreeMap<Uuid, TombstoneRecord>,
 }
 
@@ -367,6 +466,8 @@ impl Default for CatalogSnapshot {
             branches: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             branch_create_operations: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         }
     }
@@ -390,6 +491,12 @@ impl CatalogSnapshot {
             &self.branch_create_operations,
             |record| record.id,
             BranchCreateOperation::validate,
+        )?;
+        validate_records(&self.leases, |record| record.id, LeaseRecord::validate)?;
+        validate_records(
+            &self.lease_tombstones,
+            |record| record.id,
+            LeaseTombstone::validate,
         )?;
         validate_records(
             &self.tombstones,
@@ -425,12 +532,31 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let lease_ids = self
+            .leases
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let lease_tombstone_ids = self
+            .lease_tombstones
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         if !branch_ids.is_disjoint(&checkpoint_ids)
             || !branch_ids.is_disjoint(&tombstone_ids)
             || !checkpoint_ids.is_disjoint(&tombstone_ids)
             || !operation_ids.is_disjoint(&branch_ids)
             || !operation_ids.is_disjoint(&checkpoint_ids)
             || !operation_ids.is_disjoint(&tombstone_ids)
+            || !lease_ids.is_disjoint(&branch_ids)
+            || !lease_ids.is_disjoint(&checkpoint_ids)
+            || !lease_ids.is_disjoint(&operation_ids)
+            || !lease_ids.is_disjoint(&tombstone_ids)
+            || !lease_tombstone_ids.is_disjoint(&branch_ids)
+            || !lease_tombstone_ids.is_disjoint(&checkpoint_ids)
+            || !lease_tombstone_ids.is_disjoint(&operation_ids)
+            || !lease_tombstone_ids.is_disjoint(&tombstone_ids)
+            || !lease_tombstone_ids.is_disjoint(&lease_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -447,13 +573,73 @@ impl CatalogSnapshot {
             "checkpoint",
         )?;
         validate_branch_create_relationships(self)?;
+        for lease in self.leases.values() {
+            let expected_kind = match lease.subject_kind {
+                LeaseSubjectKind::Branch => TombstoneKind::Branch,
+                LeaseSubjectKind::Checkpoint => TombstoneKind::Checkpoint,
+            };
+            let live = match lease.subject_kind {
+                LeaseSubjectKind::Branch => self.branches.contains_key(&lease.subject_id),
+                LeaseSubjectKind::Checkpoint => self.checkpoints.contains_key(&lease.subject_id),
+            };
+            let deleted = self
+                .tombstones
+                .get(&lease.subject_id)
+                .is_some_and(|tombstone| tombstone.kind == expected_kind);
+            if !live && !deleted {
+                return Err(CatalogError::Corrupt(format!(
+                    "lease {} refers to an unknown subject {}",
+                    lease.id, lease.subject_id
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Complete authoritative durable-root set at one captured generation.
+    pub fn gc_roots(&self) -> Vec<&DurableRoot> {
+        let mut roots = Vec::new();
+        roots.extend(
+            self.branches
+                .values()
+                .filter_map(|branch| branch.root.as_ref()),
+        );
+        roots.extend(self.checkpoints.values().map(|checkpoint| &checkpoint.root));
+        roots.extend(
+            self.branch_create_operations
+                .values()
+                .flat_map(BranchCreateOperation::gc_roots),
+        );
+        roots.extend(self.leases.values().map(|lease| &lease.root));
+        roots
     }
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
 pub(crate) enum CatalogMutation {
+    AcquireLease {
+        expected_subject_revision: u64,
+        lease: LeaseRecord,
+    },
+    RenewLease {
+        id: Uuid,
+        expected_revision: u64,
+        token_hash: String,
+        renewed_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    },
+    EndLease {
+        id: Uuid,
+        expected_revision: u64,
+        token_hash: String,
+        ended_at: DateTime<Utc>,
+    },
+    ExpireLease {
+        id: Uuid,
+        expected_revision: u64,
+        observed_at: DateTime<Utc>,
+    },
     ReserveBranchCreate {
         branch: BranchRecord,
         operation: Box<BranchCreateOperation>,
@@ -569,6 +755,7 @@ pub(crate) trait Catalog: Send + Sync {
         &self,
         id: Uuid,
     ) -> Result<Option<BranchCreateOperation>, CatalogError>;
+    async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
 
     /// Apply one atomic mutation and advance the root-snapshot generation.
     /// Updates/deletes carry per-record revisions, so unrelated mutations do
@@ -765,6 +952,11 @@ fn validate_name(name: &str) -> Result<(), CatalogError> {
             "catalog names cannot contain control characters".to_string(),
         ));
     }
+    if name.as_bytes().starts_with(b"__zerofs_") {
+        return Err(CatalogError::Invalid(
+            "catalog names beginning with __zerofs_ are reserved".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -839,6 +1031,15 @@ mod tests {
             nil_lineage.validate(),
             Err(CatalogError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn rejects_reserved_internal_names() {
+        assert!(matches!(
+            validate_name("__zerofs_branch_create_private"),
+            Err(CatalogError::Invalid(message)) if message.contains("reserved")
+        ));
+        validate_name("__ZeroFS_customer_name").unwrap();
     }
 
     #[test]

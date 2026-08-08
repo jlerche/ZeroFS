@@ -263,6 +263,13 @@ times, monotonically increasing revision, and a random renewal token or
 equivalent unforgeable binding. It is an authoritative GC root. Checkpoint
 leases are always read-only; write leases are valid only for branches.
 
+The production catalog caps every acquisition or renewal interval at five
+minutes and retains an expired root for an additional 30-second clock-skew
+window before an expiry mutation may tombstone it. Only a SHA-256 binding of
+the caller-held UUID renewal token is stored. A compact permanent lease
+tombstone retains that binding and UUID so exact release/expiry retries are
+idempotent and the lease incarnation can never be recreated.
+
 - Acquisition first authenticates that the candidate root is readable. It then
   atomically revalidates the exact subject kind/UUID, revision, mountable state,
   and unchanged root identity while inserting the authoritative lease in the
@@ -270,9 +277,12 @@ leases are always read-only; write leases are valid only for branches.
   that batch is durable. Exact resource deletion serializes with this batch, so
   exactly one of lease acquisition or the deletion fence wins.
 - Renewal must match lease UUID, subject kind/UUID, root, access mode, token, and
-  revision, and must occur before expiry. It produces a higher revision and
-  bounded new expiry. Once deletion has fenced either a branch or checkpoint,
-  renewal is rejected so every deleted subject has a bounded drain time.
+  revision, and must occur before expiry. The expected revision and requested
+  duration form a lease-scoped idempotency key, so an applied batch with a lost
+  response is reconciled without extending the interval again. It produces a
+  higher revision and bounded, nondecreasing expiry; renewal time cannot move
+  backward. Once deletion has fenced either a branch or checkpoint, renewal is
+  rejected so every deleted subject has a bounded drain time.
 - Release is idempotent for the exact lease UUID/token.
 - Shutdown attempts release but correctness relies on expiry after a crash.
 - Once expired or released, a lease UUID/token pair can never be resurrected.

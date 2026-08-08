@@ -99,6 +99,15 @@ impl SlateDbRootStore {
         self
     }
 
+    /// Authenticate an ordinary named checkpoint before exposing a read lease.
+    pub async fn verify_checkpoint(
+        &self,
+        checkpoint: &ImmutableCheckpoint,
+    ) -> Result<(), RootStoreError> {
+        validate_database_path("checkpoint", &checkpoint.database_path)?;
+        self.verify_source(checkpoint).await
+    }
+
     /// Idempotently create a destination clone from one exact checkpoint.
     ///
     /// The caller must keep the source checkpoint held until the resulting root

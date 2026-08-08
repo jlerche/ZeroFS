@@ -145,23 +145,23 @@
 
 ### Epic 2.3: Implement leases
 
-- [ ] Define bounded leases for active mounts and writers.
-  - [ ] Bind each lease to an exact branch UUID and root identity rather than only a reusable name.
-  - [ ] Define renewal, expiry, shutdown, and crash behavior.
-  - [ ] Ensure an expired lease cannot be resurrected accidentally.
-- [ ] Make active leases explicit GC roots.
-- [ ] Allow logical deletion while preserving data required by unexpired leases according to documented semantics.
+- [x] Define bounded leases for active mounts and writers.
+  - [x] Bind each lease to an exact branch UUID and root identity rather than only a reusable name.
+  - [x] Define renewal, expiry, shutdown, and crash behavior.
+  - [x] Ensure an expired lease cannot be resurrected accidentally.
+- [x] Make active leases explicit GC roots.
+- [x] Allow logical deletion while preserving data required by unexpired leases according to documented semantics.
 - [ ] Test deletion, remount, process crash, lease expiry, and name reuse races.
 
 ## Phase 3: Implement the branch lifecycle
 
 ### Epic 3.1: Create and inspect branches
 
-- [ ] Implement branch creation from a named checkpoint.
-  - [ ] Validate branch names and reject reserved names.
-  - [ ] Use stable UUIDs for branches and operations.
-  - [ ] Make exact retries idempotent.
-  - [ ] Reject conflicting retries with clear diagnostics.
+- [x] Implement branch creation from a named checkpoint.
+  - [x] Validate branch names and reject reserved names.
+  - [x] Use stable UUIDs for branches and operations.
+  - [x] Make exact retries idempotent.
+  - [x] Reject conflicting retries with clear diagnostics.
 - [ ] Implement branch listing and inspection.
   - [ ] Report UUID, state, current root, origin, and historical parent.
   - [ ] Distinguish live parents/checkpoints from tombstoned historical origins.
@@ -378,7 +378,7 @@
 - Consistency contract: every successful mutation advances the root-snapshot generation, but unrelated writers do not compare-and-swap on that global value. Updates and deletes use per-record revisions and exact UUIDs, returning actionable revision conflicts without hidden retry loops.
 - Projection boundary: PostgreSQL/JSON contain only volume/resource UUIDs, kind, name, customer-visible state, lineage UUIDs, timestamps, observed generation, and customer metadata. They never contain durable roots or manifests and are never consulted for mounting or garbage collection.
 - Reconciliation: a projection consumes an authoritative generation-tagged SlateDB snapshot idempotently. Projection outages do not invalidate storage operations; a later reconciliation catches up while preserving customer-managed metadata.
-- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds bounded crash-resumable SlateDB migrations through the current v3 operation schema, and adds adversarial tests.
+- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds bounded crash-resumable SlateDB migrations through the current v4 lease schema, and adds adversarial tests.
 
 ### 2026-08-08: semantics and research inventory
 
@@ -400,3 +400,9 @@
 - Atomic boundaries: reservation creates the `Creating` branch, name index, operation, and exact source-hold index in one durable batch. Root recording adds the authenticated destination as an incomplete root. Publication re-authenticates storage, atomically changes the branch to `Ready`, retains the exact destination head, marks the operation published, and removes the source hold. Raw catalog mutations are crate-private so external callers cannot bypass the storage-verifying lifecycle coordinator; its factory rejects catalog/branch namespace overlap before storage I/O.
 - Retry and race proof: the safe name-based entry point resolves once to the catalog checkpoint UUID and encoded SlateDB checkpoint/manifest identity. Exact retries return the existing generation/result, changed immutable inputs or roots conflict, checkpoint deletion and reservation serialize under the exact source hold, snapshots fail closed if that derived hold index diverges from incomplete operations, completed retries do not require a deleted historical source, and generic mutations cannot create or rewrite `Creating` lifecycle state.
 - Projection boundary: create-operation phases, source holds, and both durable roots exist only in authoritative SlateDB. JSON and PostgreSQL continue to receive the same root-free branch/checkpoint/tombstone projection.
+
+### 2026-08-08: bounded authoritative leases
+
+- Lease authority: catalog schema v4 stores leases and permanent lease-UUID tombstones only in SlateDB. Each lease binds an exact subject kind/UUID/root, read/write mode, revision, issuance/renewal/expiry times, and SHA-256 renewal-token binding; PostgreSQL and JSON remain unchanged and root-free.
+- Acquisition and renewal: the public coordinator authenticates storage before an atomic exact-resource revision/root/state check and lease insertion. Name lookup is only the first locator and the request carries the stable subject UUID. Renewal requires the exact UUID, token, expected revision, unexpired lease, unchanged root, and still-mountable subject. The expected revision plus requested duration is the scoped idempotency key: exact retries reconcile an applied batch with a lost response, while timestamps and expiry can only move forward.
+- Expiry and GC: leases are bounded to five minutes. Release is exact and idempotent; crash cleanup expires only after the lease deadline plus 30 seconds of conservative clock skew. Live lease roots participate directly in generation-tagged root snapshots, survive logical subject deletion, and cannot be renewed after deletion or resurrected after expiry/tombstoning.
