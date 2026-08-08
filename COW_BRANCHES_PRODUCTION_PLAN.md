@@ -119,7 +119,7 @@
   - [x] Bound record sizes and validate all externally supplied names and identifiers.
 - [x] Add a monotonically changing catalog generation or equivalent consistent-snapshot token.
   - [x] Change the generation whenever the set or identity of GC roots changes.
-  - [ ] Make a root visible only after its durable storage state exists.
+  - [x] Make a root visible only after its durable storage state exists.
   - [x] Make root removal and tombstone publication atomic from the catalog reader's perspective.
 - [x] Define catalog consistency and contention behavior.
   - [x] Avoid one CAS domain for unrelated mounts, checkpoint fences, and branch updates.
@@ -128,20 +128,20 @@
 
 ### Epic 2.2: Implement durable branch roots
 
-- [ ] Create a branch from an exact immutable checkpoint identity.
-  - [ ] Resolve checkpoint name to stable UUID and manifest identity once.
-  - [ ] Prevent deletion or replacement of that exact source while clone publication is incomplete.
+- [x] Create a branch from an exact immutable checkpoint identity.
+  - [x] Resolve checkpoint name to stable UUID and manifest identity once.
+  - [x] Prevent deletion or replacement of that exact source while clone publication is incomplete.
   - [x] Create the destination's independent durable root.
-  - [ ] Publish the branch as `Ready` only after the root is durable.
+  - [x] Publish the branch as `Ready` only after the root is durable.
 - [ ] Support creation from live head only if it can be reduced to the same checkpoint-based primitive.
   - [ ] Flush the parent to a durable point.
   - [ ] Create a temporary internal checkpoint with a stable identity.
   - [ ] Clone from that checkpoint.
   - [ ] Remove the temporary public dependency after the destination root is independently pinned.
 - [ ] Keep the recovery record minimal.
-  - [ ] Persist an operation ID and immutable source/destination identities.
+  - [x] Persist an operation ID and immutable source/destination identities.
   - [ ] Resume or safely roll back an incomplete create.
-  - [ ] Avoid per-step receipts when the operation can be reconciled from authoritative state.
+  - [x] Avoid per-step receipts when the operation can be reconciled from authoritative state.
 
 ### Epic 2.3: Implement leases
 
@@ -378,7 +378,7 @@
 - Consistency contract: every successful mutation advances the root-snapshot generation, but unrelated writers do not compare-and-swap on that global value. Updates and deletes use per-record revisions and exact UUIDs, returning actionable revision conflicts without hidden retry loops.
 - Projection boundary: PostgreSQL/JSON contain only volume/resource UUIDs, kind, name, customer-visible state, lineage UUIDs, timestamps, observed generation, and customer metadata. They never contain durable roots or manifests and are never consulted for mounting or garbage collection.
 - Reconciliation: a projection consumes an authoritative generation-tagged SlateDB snapshot idempotently. Projection outages do not invalidate storage operations; a later reconciliation catches up while preserving customer-managed metadata.
-- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds a bounded crash-resumable SlateDB v1-to-v2 migration, and adds adversarial tests.
+- Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds bounded crash-resumable SlateDB migrations through the current v3 operation schema, and adds adversarial tests.
 
 ### 2026-08-08: semantics and research inventory
 
@@ -393,3 +393,10 @@
 - Retry boundary: immutable owner and result descriptors in the private destination namespace are the one storage proof rooted by the matching catalog operation/live root. They bind exact operation/source/destination inputs, reconcile applied writes with lost responses, and elect one canonical root. A crash leaving duplicate operation checkpoints is recovered by deterministic election and best-effort loser cleanup. Descriptors never publish lifecycle state; the authoritative catalog remains the only `Ready` authority.
 - Cleanup boundary: the proof descriptors, canonical checkpoint, and destination namespace remain root metadata while referenced by an incomplete operation, live branch, or lease. Noncanonical checkpoints are cleaned on retries; final cleanup waits for exact tombstone/abort state, lease drain, and generation-fenced GC. Uncertainty retains.
 - Executable proof: focused in-memory tests clone from an exact checkpoint identity, reject mismatched manifests and WAL-dependent roots before clone I/O, reject unowned, overlapping, oversized, or malformed destinations, converge concurrent retries, recover duplicate checkpoints after every creator crashes before result publication, reject noncanonical losing roots, detect missing reachable SSTs in ordinary and segmented manifests, reconcile injected lost responses, delete the named source checkpoint, read and write the child independently, verify the parent remains unchanged, and fail closed after removal of an external final pin.
+
+### 2026-08-08: authoritative branch-create publication
+
+- Catalog lifecycle: schema v3 adds independently keyed permanent create-operation records with only `reserved`, `root_created`, and `published` phases. Reserved operations root the exact source; root-created operations root source plus destination; published records enumerate no GC roots and remain only as operation-UUID/idempotency reservations.
+- Atomic boundaries: reservation creates the `Creating` branch, name index, operation, and exact source-hold index in one durable batch. Root recording adds the authenticated destination as an incomplete root. Publication re-authenticates storage, atomically changes the branch to `Ready`, retains the exact destination head, marks the operation published, and removes the source hold. Raw catalog mutations are crate-private so external callers cannot bypass the storage-verifying lifecycle coordinator; its factory rejects catalog/branch namespace overlap before storage I/O.
+- Retry and race proof: the safe name-based entry point resolves once to the catalog checkpoint UUID and encoded SlateDB checkpoint/manifest identity. Exact retries return the existing generation/result, changed immutable inputs or roots conflict, checkpoint deletion and reservation serialize under the exact source hold, snapshots fail closed if that derived hold index diverges from incomplete operations, completed retries do not require a deleted historical source, and generic mutations cannot create or rewrite `Creating` lifecycle state.
+- Projection boundary: create-operation phases, source holds, and both durable roots exist only in authoritative SlateDB. JSON and PostgreSQL continue to receive the same root-free branch/checkpoint/tombstone projection.

@@ -41,6 +41,28 @@ pub struct ImmutableCheckpoint {
     pub manifest_id: u64,
 }
 
+impl ImmutableCheckpoint {
+    pub fn durable_root(&self) -> DurableRoot {
+        DurableRoot {
+            identity: self.database_path.to_string(),
+            manifest_id: encode_root_checkpoint(self.checkpoint_id, self.manifest_id),
+        }
+    }
+
+    /// Decode an exact SlateDB checkpoint identity from an authoritative root.
+    pub fn from_durable_root(root: &DurableRoot) -> Result<Self, RootStoreError> {
+        validate_root(root).map_err(|error| RootStoreError::Invalid(error.to_string()))?;
+        let (checkpoint_id, manifest_id) = decode_root_checkpoint(&root.manifest_id)?;
+        let database_path = Path::from(root.identity.clone());
+        validate_database_path("source", &database_path)?;
+        Ok(Self {
+            database_path,
+            checkpoint_id,
+            manifest_id,
+        })
+    }
+}
+
 /// Creates and authenticates SlateDB roots used by ready branches.
 ///
 /// A SlateDB clone is shallow. Its manifest names external SSTs and installs an
@@ -631,6 +653,22 @@ fn database_paths_overlap(left: &Path, right: &Path) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+pub(crate) fn ensure_database_namespaces_disjoint(
+    left_label: &str,
+    left: &Path,
+    right_label: &str,
+    right: &Path,
+) -> Result<(), RootStoreError> {
+    validate_database_path(left_label, left)?;
+    validate_database_path(right_label, right)?;
+    if database_paths_overlap(left, right) {
+        return Err(RootStoreError::Invalid(format!(
+            "{left_label} and {right_label} database namespaces must not overlap"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_no_wal_dependency(manifest: &slatedb::VersionedManifest) -> Result<(), RootStoreError> {
     if manifest.next_wal_sst_id() > manifest.replay_after_wal_id().saturating_add(1) {
         return Err(RootStoreError::WalDependency {
@@ -756,6 +794,32 @@ mod tests {
     use slatedb::Db;
     use slatedb::config::{CheckpointOptions, CheckpointScope};
     use slatedb::object_store::memory::InMemory;
+
+    #[test]
+    fn rejects_overlapping_catalog_and_branch_namespaces_without_io() {
+        for (catalog, branches) in [
+            ("zerofs/catalog", "zerofs/catalog"),
+            ("zerofs/catalog", "zerofs/catalog/branches"),
+            ("zerofs/catalog/metadata", "zerofs/catalog"),
+        ] {
+            assert!(matches!(
+                ensure_database_namespaces_disjoint(
+                    "catalog",
+                    &Path::from(catalog),
+                    "branch root",
+                    &Path::from(branches),
+                ),
+                Err(RootStoreError::Invalid(_))
+            ));
+        }
+        ensure_database_namespaces_disjoint(
+            "catalog",
+            &Path::from("zerofs/catalog"),
+            "branch root",
+            &Path::from("zerofs/branches"),
+        )
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn clone_root_survives_named_source_deletion_and_retries_exactly() {

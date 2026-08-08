@@ -6,6 +6,7 @@
 //! the same projection contract.
 
 mod json;
+mod lifecycle;
 mod postgres;
 mod root_store;
 #[path = "slatedb.rs"]
@@ -23,11 +24,15 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub use json::JsonCatalogProjection;
+pub use lifecycle::{
+    BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchLifecycle,
+    BranchLifecycleError,
+};
 pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
-pub use slate::SlateDbCatalog;
+pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -58,16 +63,25 @@ impl Default for CatalogConfig {
 }
 
 impl CatalogConfig {
-    pub async fn open(
+    /// Open the authoritative SlateDB catalog behind the safe branch lifecycle
+    /// boundary. Raw catalog mutations remain crate-private.
+    pub async fn open_branch_lifecycle(
         &self,
         object_store: Arc<dyn ObjectStore>,
-    ) -> Result<Arc<dyn Catalog>, CatalogError> {
-        Ok(Arc::new(
-            SlateDbCatalog::open(
-                slatedb::object_store::path::Path::from(self.slatedb_path.as_str()),
-                object_store,
-            )
-            .await?,
+        branch_database_root: slatedb::object_store::path::Path,
+    ) -> Result<BranchLifecycle, BranchLifecycleError> {
+        let catalog_path = slatedb::object_store::path::Path::from(self.slatedb_path.as_str());
+        root_store::ensure_database_namespaces_disjoint(
+            "catalog",
+            &catalog_path,
+            "branch root",
+            &branch_database_root,
+        )?;
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(SlateDbCatalog::open(catalog_path, Arc::clone(&object_store)).await?);
+        Ok(BranchLifecycle::new(
+            catalog,
+            SlateDbRootStore::new(object_store, branch_database_root),
         ))
     }
 }
@@ -190,6 +204,94 @@ pub struct CheckpointRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchCreatePhase {
+    Reserved,
+    RootCreated,
+    Published,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchCreateOperation {
+    pub id: Uuid,
+    pub revision: u64,
+    pub destination_id: Uuid,
+    pub destination_name: String,
+    pub source_checkpoint_id: Uuid,
+    pub source_root: DurableRoot,
+    pub parent_id: Option<Uuid>,
+    pub phase: BranchCreatePhase,
+    pub destination_root: Option<DurableRoot>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl BranchCreateOperation {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "branch create operation")?;
+        validate_revision(self.revision, "branch create operation")?;
+        validate_id(self.destination_id, "branch create destination")?;
+        validate_name(&self.destination_name)?;
+        validate_id(self.source_checkpoint_id, "branch create source checkpoint")?;
+        validate_optional_id(self.parent_id, "branch create parent")?;
+        validate_root(&self.source_root)?;
+        if self.destination_id == self.source_checkpoint_id
+            || self.id == self.destination_id
+            || self.id == self.source_checkpoint_id
+        {
+            return Err(CatalogError::Invalid(
+                "branch operation, destination, and source checkpoint UUIDs must differ"
+                    .to_string(),
+            ));
+        }
+        match (&self.phase, &self.destination_root) {
+            (BranchCreatePhase::Reserved, None) => {}
+            (BranchCreatePhase::RootCreated | BranchCreatePhase::Published, Some(root)) => {
+                validate_root(root)?;
+            }
+            (BranchCreatePhase::Reserved, Some(_)) => {
+                return Err(CatalogError::Invalid(
+                    "a reserved branch operation cannot have a destination root".to_string(),
+                ));
+            }
+            (BranchCreatePhase::RootCreated | BranchCreatePhase::Published, None) => {
+                return Err(CatalogError::Invalid(
+                    "a root-created or published branch operation requires a destination root"
+                        .to_string(),
+                ));
+            }
+        }
+        validate_times(self.created_at, self.updated_at, "branch create operation")
+    }
+
+    pub(crate) fn immutable_inputs_equal(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.destination_id == other.destination_id
+            && self.destination_name == other.destination_name
+            && self.source_checkpoint_id == other.source_checkpoint_id
+            && self.source_root == other.source_root
+            && self.parent_id == other.parent_id
+            && self.created_at == other.created_at
+    }
+
+    /// Exact storage roots retained while this operation is incomplete.
+    /// Published records remain only as idempotency reservations.
+    pub fn gc_roots(&self) -> Vec<&DurableRoot> {
+        match self.phase {
+            BranchCreatePhase::Reserved => vec![&self.source_root],
+            BranchCreatePhase::RootCreated => {
+                let mut roots = vec![&self.source_root];
+                if let Some(destination) = &self.destination_root {
+                    roots.push(destination);
+                }
+                roots
+            }
+            BranchCreatePhase::Published => Vec::new(),
+        }
+    }
+}
+
 impl CheckpointRecord {
     pub fn validate(&self) -> Result<(), CatalogError> {
         validate_id(self.id, "checkpoint")?;
@@ -252,6 +354,8 @@ pub struct CatalogSnapshot {
     #[serde(default)]
     pub checkpoints: BTreeMap<Uuid, CheckpointRecord>,
     #[serde(default)]
+    pub branch_create_operations: BTreeMap<Uuid, BranchCreateOperation>,
+    #[serde(default)]
     pub tombstones: BTreeMap<Uuid, TombstoneRecord>,
 }
 
@@ -262,6 +366,7 @@ impl Default for CatalogSnapshot {
             generation: 0,
             branches: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            branch_create_operations: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         }
     }
@@ -280,6 +385,11 @@ impl CatalogSnapshot {
             &self.checkpoints,
             |record| record.id,
             CheckpointRecord::validate,
+        )?;
+        validate_records(
+            &self.branch_create_operations,
+            |record| record.id,
+            BranchCreateOperation::validate,
         )?;
         validate_records(
             &self.tombstones,
@@ -310,9 +420,17 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let operation_ids = self
+            .branch_create_operations
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         if !branch_ids.is_disjoint(&checkpoint_ids)
             || !branch_ids.is_disjoint(&tombstone_ids)
             || !checkpoint_ids.is_disjoint(&tombstone_ids)
+            || !operation_ids.is_disjoint(&branch_ids)
+            || !operation_ids.is_disjoint(&checkpoint_ids)
+            || !operation_ids.is_disjoint(&tombstone_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -328,12 +446,29 @@ impl CatalogSnapshot {
                 .map(|record| (record.branch_id, record.name.as_str())),
             "checkpoint",
         )?;
+        validate_branch_create_relationships(self)?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum CatalogMutation {
+#[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
+pub(crate) enum CatalogMutation {
+    ReserveBranchCreate {
+        branch: BranchRecord,
+        operation: Box<BranchCreateOperation>,
+    },
+    RecordBranchCreateRoot {
+        operation_id: Uuid,
+        expected_revision: u64,
+        destination_root: DurableRoot,
+        updated_at: DateTime<Utc>,
+    },
+    PublishBranchCreate {
+        operation_id: Uuid,
+        expected_revision: u64,
+        updated_at: DateTime<Utc>,
+    },
     CreateBranch(BranchRecord),
     ReplaceBranch {
         expected_revision: u64,
@@ -394,6 +529,8 @@ pub struct CustomerCatalogRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("branch operation conflicts with its immutable request or phase: {0}")]
+    OperationConflict(String),
     #[error("catalog record revision conflict: expected {expected}, found {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
     #[error("catalog record already exists: {0}")]
@@ -417,7 +554,8 @@ pub enum CatalogError {
 }
 
 #[async_trait]
-pub trait Catalog: Send + Sync {
+#[allow(dead_code)] // Read methods are consumed incrementally as lifecycle APIs land.
+pub(crate) trait Catalog: Send + Sync {
     async fn snapshot(&self) -> Result<CatalogSnapshot, CatalogError>;
     async fn branch(&self, id: Uuid) -> Result<Option<BranchRecord>, CatalogError>;
     async fn branch_by_name(&self, name: &str) -> Result<Option<BranchRecord>, CatalogError>;
@@ -427,6 +565,10 @@ pub trait Catalog: Send + Sync {
         branch_id: Uuid,
         name: &str,
     ) -> Result<Option<CheckpointRecord>, CatalogError>;
+    async fn branch_create_operation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<BranchCreateOperation>, CatalogError>;
 
     /// Apply one atomic mutation and advance the root-snapshot generation.
     /// Updates/deletes carry per-record revisions, so unrelated mutations do
@@ -469,6 +611,80 @@ fn validate_records<T>(
             )));
         }
         validate(record)?;
+    }
+    Ok(())
+}
+
+fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {
+    let mut destinations = std::collections::BTreeSet::new();
+    for operation in snapshot.branch_create_operations.values() {
+        if !destinations.insert(operation.destination_id) {
+            return Err(CatalogError::Corrupt(format!(
+                "multiple create operations target branch {}",
+                operation.destination_id
+            )));
+        }
+        match operation.phase {
+            BranchCreatePhase::Reserved | BranchCreatePhase::RootCreated => {
+                let branch = snapshot
+                    .branches
+                    .get(&operation.destination_id)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt(format!(
+                            "incomplete operation {} has no destination branch",
+                            operation.id
+                        ))
+                    })?;
+                if branch.state != BranchState::Creating
+                    || branch.name != operation.destination_name
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    || branch.root.is_some()
+                {
+                    return Err(CatalogError::Corrupt(format!(
+                        "incomplete operation {} disagrees with its destination branch",
+                        operation.id
+                    )));
+                }
+                let source = snapshot
+                    .checkpoints
+                    .get(&operation.source_checkpoint_id)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt(format!(
+                            "incomplete operation {} has no live source checkpoint",
+                            operation.id
+                        ))
+                    })?;
+                if source.root != operation.source_root {
+                    return Err(CatalogError::Corrupt(format!(
+                        "incomplete operation {} source root changed",
+                        operation.id
+                    )));
+                }
+            }
+            BranchCreatePhase::Published => {
+                if let Some(branch) = snapshot.branches.get(&operation.destination_id) {
+                    if branch.state != BranchState::Ready
+                        || branch.parent_id != operation.parent_id
+                        || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    {
+                        return Err(CatalogError::Corrupt(format!(
+                            "published operation {} disagrees with its destination branch",
+                            operation.id
+                        )));
+                    }
+                } else if !snapshot
+                    .tombstones
+                    .get(&operation.destination_id)
+                    .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Branch)
+                {
+                    return Err(CatalogError::Corrupt(format!(
+                        "published operation {} has no branch or tombstone",
+                        operation.id
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -194,6 +194,14 @@ catalog phases. Additional per-step receipts, takeover generations, activity
 fences, and recovery sweeps are prohibited until a demonstrated failure case
 cannot be reconciled from these fields.
 
+The implementation retains the operation UUID after publication as a compact
+`published` idempotency reservation containing the same immutable request and
+initial result. It is not an incomplete operation and enumerates no GC roots;
+the live branch head and leases are authoritative after publication. This
+permanent reservation prevents rebinding an old operation UUID after name reuse
+and lets a lost publication response return success even after the historical
+source checkpoint is deleted or the branch head later advances.
+
 ## Checkpoint state and deletion
 
 A named checkpoint is a stable UUID plus exact immutable root. Creation becomes

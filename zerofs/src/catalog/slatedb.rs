@@ -1,6 +1,7 @@
 use super::{
-    BranchRecord, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation, CatalogSnapshot,
-    CheckpointRecord, TombstoneKind, TombstoneRecord, validate_name, validate_timestamp,
+    BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, CATALOG_SCHEMA_VERSION,
+    Catalog, CatalogError, CatalogMutation, CatalogSnapshot, CheckpointRecord, TombstoneKind,
+    TombstoneRecord, validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -9,6 +10,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use slatedb::config::WriteOptions;
 use slatedb::object_store::path::Path;
 use slatedb::{Db, WriteBatch};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -19,7 +21,10 @@ const BRANCH_NAME_PREFIX: &[u8] = b"catalog/branch-name/";
 const CHECKPOINT_PREFIX: &[u8] = b"catalog/checkpoint/";
 const CHECKPOINT_NAME_PREFIX: &[u8] = b"catalog/checkpoint-name/";
 const TOMBSTONE_PREFIX: &[u8] = b"catalog/tombstone/";
-const PREVIOUS_SCHEMA_VERSION: u32 = 1;
+const BRANCH_CREATE_OPERATION_PREFIX: &[u8] = b"catalog/branch-create-operation/";
+const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -80,6 +85,7 @@ impl SlateDbCatalog {
         Ok(catalog)
     }
 
+    #[allow(dead_code)] // Explicit shutdown is used by owners once server wiring lands.
     pub async fn close(&self) -> Result<(), CatalogError> {
         self.db.close().await?;
         Ok(())
@@ -109,23 +115,48 @@ impl SlateDbCatalog {
         if state.schema_version == CATALOG_SCHEMA_VERSION {
             return Ok(());
         }
-        if state.schema_version != PREVIOUS_SCHEMA_VERSION {
+        if ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION].contains(&state.schema_version) {
             return Err(CatalogError::Corrupt(format!(
                 "unsupported SlateDB catalog schema version {}",
                 state.schema_version
             )));
         }
 
-        for prefix in [BRANCH_PREFIX, CHECKPOINT_PREFIX] {
-            let mut iterator = self.db.scan_prefix(prefix, ..).await?;
+        if state.schema_version == LEGACY_SCHEMA_VERSION {
+            for prefix in [BRANCH_PREFIX, CHECKPOINT_PREFIX] {
+                let mut iterator = self.db.scan_prefix(prefix, ..).await?;
+                while let Some(entry) = iterator.next().await? {
+                    let mut value = serde_json::from_slice::<serde_json::Value>(&entry.value)?;
+                    let object = value.as_object_mut().ok_or_else(|| {
+                        CatalogError::Corrupt("catalog record is not a JSON object".to_string())
+                    })?;
+                    object
+                        .entry("revision")
+                        .or_insert_with(|| serde_json::Value::from(1));
+                    self.db
+                        .put_with_options(
+                            entry.key,
+                            serde_json::to_vec(&value)?,
+                            &slatedb::config::PutOptions::default(),
+                            &durable_write_options(),
+                        )
+                        .await?;
+                }
+            }
+            let mut iterator = self.db.scan_prefix(TOMBSTONE_PREFIX, ..).await?;
             while let Some(entry) = iterator.next().await? {
                 let mut value = serde_json::from_slice::<serde_json::Value>(&entry.value)?;
                 let object = value.as_object_mut().ok_or_else(|| {
-                    CatalogError::Corrupt("catalog record is not a JSON object".to_string())
+                    CatalogError::Corrupt("catalog tombstone is not a JSON object".to_string())
                 })?;
+                object.entry("parent_id").or_insert(serde_json::Value::Null);
                 object
-                    .entry("revision")
-                    .or_insert_with(|| serde_json::Value::from(1));
+                    .entry("origin_checkpoint_id")
+                    .or_insert(serde_json::Value::Null);
+                let deleted_at = object.get("deleted_at").cloned().ok_or_else(|| {
+                    CatalogError::Corrupt("catalog tombstone is missing deleted_at".to_string())
+                })?;
+                object.entry("created_at").or_insert(deleted_at);
                 self.db
                     .put_with_options(
                         entry.key,
@@ -136,29 +167,6 @@ impl SlateDbCatalog {
                     .await?;
             }
         }
-        let mut iterator = self.db.scan_prefix(TOMBSTONE_PREFIX, ..).await?;
-        while let Some(entry) = iterator.next().await? {
-            let mut value = serde_json::from_slice::<serde_json::Value>(&entry.value)?;
-            let object = value.as_object_mut().ok_or_else(|| {
-                CatalogError::Corrupt("catalog tombstone is not a JSON object".to_string())
-            })?;
-            object.entry("parent_id").or_insert(serde_json::Value::Null);
-            object
-                .entry("origin_checkpoint_id")
-                .or_insert(serde_json::Value::Null);
-            let deleted_at = object.get("deleted_at").cloned().ok_or_else(|| {
-                CatalogError::Corrupt("catalog tombstone is missing deleted_at".to_string())
-            })?;
-            object.entry("created_at").or_insert(deleted_at);
-            self.db
-                .put_with_options(
-                    entry.key,
-                    serde_json::to_vec(&value)?,
-                    &slatedb::config::PutOptions::default(),
-                    &durable_write_options(),
-                )
-                .await?;
-        }
         self.snapshot_unlocked(CatalogState {
             schema_version: CATALOG_SCHEMA_VERSION,
             generation: state.generation,
@@ -166,7 +174,8 @@ impl SlateDbCatalog {
         .await
         .map_err(|error| {
             CatalogError::Invalid(format!(
-                "SlateDB catalog v{PREVIOUS_SCHEMA_VERSION} cannot migrate to v{CATALOG_SCHEMA_VERSION}: {error}"
+                "SlateDB catalog v{} cannot migrate to v{CATALOG_SCHEMA_VERSION}: {error}",
+                state.schema_version
             ))
         })?;
         self.db
@@ -191,6 +200,24 @@ impl SlateDbCatalog {
         let checkpoints = self
             .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
             .await?;
+        let branch_create_operations = self
+            .scan_records::<BranchCreateOperation>(BRANCH_CREATE_OPERATION_PREFIX)
+            .await?;
+        let expected_source_holds = branch_create_operations
+            .iter()
+            .filter(|operation| operation.phase != BranchCreatePhase::Published)
+            .map(|operation| branch_create_source_key(operation.source_checkpoint_id, operation.id))
+            .collect::<BTreeSet<_>>();
+        let mut source_hold_iterator = self.db.scan_prefix(BRANCH_CREATE_SOURCE_PREFIX, ..).await?;
+        let mut actual_source_holds = BTreeSet::new();
+        while let Some(entry) = source_hold_iterator.next().await? {
+            actual_source_holds.insert(entry.key);
+        }
+        if actual_source_holds != expected_source_holds {
+            return Err(CatalogError::Corrupt(
+                "branch-create source-hold index disagrees with incomplete operations".to_string(),
+            ));
+        }
         let tombstones = self
             .scan_records::<TombstoneRecord>(TOMBSTONE_PREFIX)
             .await?;
@@ -202,6 +229,10 @@ impl SlateDbCatalog {
                 .map(|record| (record.id, record))
                 .collect(),
             checkpoints: checkpoints
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            branch_create_operations: branch_create_operations
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -222,6 +253,7 @@ impl SlateDbCatalog {
             .transpose()
     }
 
+    #[allow(dead_code)] // Called by crate-private lookup methods used by later API slices.
     async fn id_by_name(&self, key: Bytes) -> Result<Option<Uuid>, CatalogError> {
         self.db
             .get(key)
@@ -258,8 +290,181 @@ impl SlateDbCatalog {
         let mut batch = WriteBatch::new();
 
         match mutation {
+            CatalogMutation::ReserveBranchCreate { branch, operation } => {
+                branch.validate()?;
+                operation.validate()?;
+                ensure_initial_revision(branch.revision)?;
+                ensure_initial_revision(operation.revision)?;
+                if branch.state != BranchState::Creating
+                    || branch.root.is_some()
+                    || operation.phase != BranchCreatePhase::Reserved
+                    || operation.destination_root.is_some()
+                    || branch.id != operation.destination_id
+                    || branch.name != operation.destination_name
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    || branch.created_at != operation.created_at
+                    || branch.updated_at != operation.updated_at
+                    || operation.updated_at != operation.created_at
+                {
+                    return Err(CatalogError::Invalid(
+                        "branch reservation and create operation disagree".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .get_record::<BranchCreateOperation>(branch_create_operation_key(operation.id))
+                    .await?
+                {
+                    if existing.immutable_inputs_equal(&operation) {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(operation.id.to_string()));
+                }
+                ensure_resource_id_available(self.db.as_ref(), operation.id).await?;
+                ensure_resource_id_available(self.db.as_ref(), branch.id).await?;
+                ensure_absent(
+                    self.db.as_ref(),
+                    branch_name_key(&branch.name),
+                    &branch.name,
+                )
+                .await?;
+                let source = self
+                    .get_record::<CheckpointRecord>(checkpoint_key(operation.source_checkpoint_id))
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogError::NotFound(operation.source_checkpoint_id.to_string())
+                    })?;
+                if source.root != operation.source_root {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "source checkpoint {} root changed",
+                        source.id
+                    )));
+                }
+                if let Some(parent_id) = operation.parent_id {
+                    ensure_known_resource(self.db.as_ref(), parent_id, TombstoneKind::Branch)
+                        .await?;
+                }
+                put_json(&mut batch, branch_key(branch.id), &branch)?;
+                batch.put(branch_name_key(&branch.name), branch.id.to_string());
+                put_json(
+                    &mut batch,
+                    branch_create_operation_key(operation.id),
+                    &operation,
+                )?;
+                batch.put(
+                    branch_create_source_key(operation.source_checkpoint_id, operation.id),
+                    operation.destination_id.to_string(),
+                );
+            }
+            CatalogMutation::RecordBranchCreateRoot {
+                operation_id,
+                expected_revision,
+                destination_root,
+                updated_at,
+            } => {
+                validate_root(&destination_root)?;
+                validate_timestamp(updated_at, "branch root-created updated_at")?;
+                let mut operation = self
+                    .get_record::<BranchCreateOperation>(branch_create_operation_key(operation_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
+                if operation.phase != BranchCreatePhase::Reserved {
+                    if operation.destination_root.as_ref() == Some(&destination_root) {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                ensure_expected_revision(expected_revision, operation.revision)?;
+                if updated_at < operation.created_at || updated_at < operation.updated_at {
+                    return Err(CatalogError::Invalid(
+                        "branch root-created time cannot move backwards".to_string(),
+                    ));
+                }
+                operation.revision = operation.revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("branch operation revision overflow".to_string())
+                })?;
+                operation.phase = BranchCreatePhase::RootCreated;
+                operation.destination_root = Some(destination_root);
+                operation.updated_at = updated_at;
+                put_json(
+                    &mut batch,
+                    branch_create_operation_key(operation.id),
+                    &operation,
+                )?;
+            }
+            CatalogMutation::PublishBranchCreate {
+                operation_id,
+                expected_revision,
+                updated_at,
+            } => {
+                validate_timestamp(updated_at, "branch publication updated_at")?;
+                let mut operation = self
+                    .get_record::<BranchCreateOperation>(branch_create_operation_key(operation_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
+                let root = operation.destination_root.clone().ok_or_else(|| {
+                    CatalogError::OperationConflict(format!(
+                        "operation {operation_id} has no destination root"
+                    ))
+                })?;
+                let mut branch = self
+                    .get_record::<BranchRecord>(branch_key(operation.destination_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation.destination_id.to_string()))?;
+                if operation.phase == BranchCreatePhase::Published {
+                    if branch.state == BranchState::Ready
+                        && branch.parent_id == operation.parent_id
+                        && branch.origin_checkpoint_id == Some(operation.source_checkpoint_id)
+                    {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                if operation.phase != BranchCreatePhase::RootCreated
+                    || branch.state != BranchState::Creating
+                    || branch.root.is_some()
+                    || branch.name != operation.destination_name
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                {
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                ensure_expected_revision(expected_revision, operation.revision)?;
+                if updated_at < operation.updated_at || updated_at < branch.updated_at {
+                    return Err(CatalogError::Invalid(
+                        "branch publication time cannot move backwards".to_string(),
+                    ));
+                }
+                operation.revision = operation.revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("branch operation revision overflow".to_string())
+                })?;
+                operation.phase = BranchCreatePhase::Published;
+                operation.updated_at = updated_at;
+                branch.revision = branch
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogError::Corrupt("branch revision overflow".to_string()))?;
+                branch.state = BranchState::Ready;
+                branch.root = Some(root);
+                branch.updated_at = updated_at;
+                put_json(
+                    &mut batch,
+                    branch_create_operation_key(operation.id),
+                    &operation,
+                )?;
+                put_json(&mut batch, branch_key(branch.id), &branch)?;
+                batch.delete(branch_create_source_key(
+                    operation.source_checkpoint_id,
+                    operation.id,
+                ));
+            }
             CatalogMutation::CreateBranch(record) => {
                 record.validate()?;
+                if record.state == BranchState::Creating {
+                    return Err(CatalogError::Invalid(
+                        "creating branches must be reserved with an operation".to_string(),
+                    ));
+                }
                 ensure_initial_revision(record.revision)?;
                 ensure_resource_id_available(self.db.as_ref(), record.id).await?;
                 if let Some(parent_id) = record.parent_id {
@@ -292,6 +497,16 @@ impl SlateDbCatalog {
                     .get_record::<BranchRecord>(branch_key(record.id))
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(record.id.to_string()))?;
+                if old.state == BranchState::Creating
+                    || record.state == BranchState::Creating
+                    || old.state != record.state
+                    || old.parent_id != record.parent_id
+                    || old.origin_checkpoint_id != record.origin_checkpoint_id
+                {
+                    return Err(CatalogError::Invalid(
+                        "branch lifecycle and lineage require dedicated mutations".to_string(),
+                    ));
+                }
                 validate_revision_change(expected_revision, old.revision, record.revision)?;
                 if let Some(parent_id) = record.parent_id {
                     ensure_known_resource(self.db.as_ref(), parent_id, TombstoneKind::Branch)
@@ -329,6 +544,11 @@ impl SlateDbCatalog {
                     .get_record::<BranchRecord>(branch_key(id))
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+                if old.state == BranchState::Creating {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "creating branch {id} must be aborted through its operation"
+                    )));
+                }
                 if old.name != name {
                     return Err(CatalogError::NotFound(format!("{name} ({id})")));
                 }
@@ -360,9 +580,13 @@ impl SlateDbCatalog {
                 record.validate()?;
                 ensure_initial_revision(record.revision)?;
                 ensure_resource_id_available(self.db.as_ref(), record.id).await?;
-                if self.db.get(branch_key(record.branch_id)).await?.is_none() {
+                if !self
+                    .get_record::<BranchRecord>(branch_key(record.branch_id))
+                    .await?
+                    .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
                     return Err(CatalogError::NotFound(format!(
-                        "live checkpoint branch {}",
+                        "ready checkpoint branch {}",
                         record.branch_id
                     )));
                 }
@@ -387,10 +611,19 @@ impl SlateDbCatalog {
                     .get_record::<CheckpointRecord>(checkpoint_key(record.id))
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(record.id.to_string()))?;
+                if old.branch_id != record.branch_id || old.root != record.root {
+                    return Err(CatalogError::Invalid(
+                        "checkpoint branch and immutable root cannot be replaced".to_string(),
+                    ));
+                }
                 validate_revision_change(expected_revision, old.revision, record.revision)?;
-                if self.db.get(branch_key(record.branch_id)).await?.is_none() {
+                if !self
+                    .get_record::<BranchRecord>(branch_key(record.branch_id))
+                    .await?
+                    .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
                     return Err(CatalogError::NotFound(format!(
-                        "live checkpoint branch {}",
+                        "ready checkpoint branch {}",
                         record.branch_id
                     )));
                 }
@@ -417,6 +650,16 @@ impl SlateDbCatalog {
             } => {
                 validate_name(&name)?;
                 validate_timestamp(deleted_at, "checkpoint deleted_at")?;
+                if has_any_key(
+                    self.db.as_ref(),
+                    &branch_create_source_checkpoint_prefix(id),
+                )
+                .await?
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "checkpoint {id} is held by an incomplete branch create"
+                    )));
+                }
                 let old = self
                     .get_record::<CheckpointRecord>(checkpoint_key(id))
                     .await?
@@ -508,6 +751,14 @@ impl Catalog for SlateDbCatalog {
         }
     }
 
+    async fn branch_create_operation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<BranchCreateOperation>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(branch_create_operation_key(id)).await
+    }
+
     async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
         let _guard = self.lock.lock().await;
         self.apply_unlocked(mutation).await
@@ -544,6 +795,22 @@ fn tombstone_key(id: Uuid) -> Bytes {
     joined_key(TOMBSTONE_PREFIX, id.to_string().as_bytes())
 }
 
+fn branch_create_operation_key(id: Uuid) -> Bytes {
+    joined_key(BRANCH_CREATE_OPERATION_PREFIX, id.to_string().as_bytes())
+}
+
+fn branch_create_source_checkpoint_prefix(checkpoint_id: Uuid) -> Bytes {
+    let mut suffix = checkpoint_id.to_string().into_bytes();
+    suffix.push(b'/');
+    joined_key(BRANCH_CREATE_SOURCE_PREFIX, &suffix)
+}
+
+fn branch_create_source_key(checkpoint_id: Uuid, operation_id: Uuid) -> Bytes {
+    let mut key = branch_create_source_checkpoint_prefix(checkpoint_id).to_vec();
+    key.extend_from_slice(operation_id.to_string().as_bytes());
+    Bytes::from(key)
+}
+
 fn joined_key(prefix: &[u8], suffix: &[u8]) -> Bytes {
     let mut key = Vec::with_capacity(prefix.len() + suffix.len());
     key.extend_from_slice(prefix);
@@ -568,10 +835,20 @@ async fn ensure_absent(db: &Db, key: Bytes, label: &str) -> Result<(), CatalogEr
 }
 
 async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogError> {
-    for key in [branch_key(id), checkpoint_key(id), tombstone_key(id)] {
+    for key in [
+        branch_key(id),
+        checkpoint_key(id),
+        tombstone_key(id),
+        branch_create_operation_key(id),
+    ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
     Ok(())
+}
+
+async fn has_any_key(db: &Db, prefix: &[u8]) -> Result<bool, CatalogError> {
+    let mut iterator = db.scan_prefix(prefix, ..).await?;
+    Ok(iterator.next().await?.is_some())
 }
 
 async fn ensure_known_resource(
@@ -668,6 +945,39 @@ mod tests {
         }
     }
 
+    fn reserved_create(
+        source: &CheckpointRecord,
+        name: &str,
+    ) -> (BranchRecord, BranchCreateOperation) {
+        let now = catalog_timestamp(Utc::now());
+        let destination_id = Uuid::new_v4();
+        let branch = BranchRecord {
+            id: destination_id,
+            revision: 1,
+            name: name.to_string(),
+            state: BranchState::Creating,
+            root: None,
+            parent_id: Some(source.branch_id),
+            origin_checkpoint_id: Some(source.id),
+            created_at: now,
+            updated_at: now,
+        };
+        let operation = BranchCreateOperation {
+            id: Uuid::new_v4(),
+            revision: 1,
+            destination_id,
+            destination_name: name.to_string(),
+            source_checkpoint_id: source.id,
+            source_root: source.root.clone(),
+            parent_id: Some(source.branch_id),
+            phase: BranchCreatePhase::Reserved,
+            destination_root: None,
+            created_at: now,
+            updated_at: now,
+        };
+        (branch, operation)
+    }
+
     #[tokio::test]
     async fn records_are_independent_and_deletion_is_atomic_with_tombstone() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -701,6 +1011,242 @@ mod tests {
             snapshot.tombstones.get(&record.id).unwrap().deleted_at,
             deleted_at
         );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_create_operation_is_exactly_idempotent_and_publishes_atomically() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("branch-create-lifecycle"), store)
+            .await
+            .unwrap();
+        let parent = branch("parent");
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent.clone()))
+            .await
+            .unwrap();
+        let source = checkpoint(Uuid::new_v4(), parent.id, "source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (creating, operation) = reserved_create(&source, "child");
+        let reservation = CatalogMutation::ReserveBranchCreate {
+            branch: creating.clone(),
+            operation: Box::new(operation.clone()),
+        };
+        assert_eq!(catalog.apply(reservation.clone()).await.unwrap(), 3);
+        assert_eq!(catalog.apply(reservation).await.unwrap(), 3);
+        let reserved = catalog
+            .branch_create_operation(operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.gc_roots(), vec![&source.root]);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::DeleteCheckpoint {
+                    id: source.id,
+                    expected_revision: source.revision,
+                    name: source.name.clone(),
+                    deleted_at: catalog_timestamp(Utc::now()),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let mut conflicting = operation.clone();
+        conflicting.destination_name = "different".to_string();
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch: BranchRecord {
+                        name: "different".to_string(),
+                        ..creating.clone()
+                    },
+                    operation: Box::new(conflicting),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let destination_root = DurableRoot {
+            identity: "branches/child".to_string(),
+            manifest_id: "checkpoint@7".to_string(),
+        };
+        let root_created_at = catalog_timestamp(Utc::now());
+        let record_root = CatalogMutation::RecordBranchCreateRoot {
+            operation_id: operation.id,
+            expected_revision: 1,
+            destination_root: destination_root.clone(),
+            updated_at: root_created_at,
+        };
+        assert_eq!(catalog.apply(record_root.clone()).await.unwrap(), 4);
+        assert_eq!(catalog.apply(record_root).await.unwrap(), 4);
+        assert_eq!(
+            catalog
+                .branch_create_operation(operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .gc_roots()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::RecordBranchCreateRoot {
+                    operation_id: operation.id,
+                    expected_revision: 1,
+                    destination_root: DurableRoot {
+                        identity: "branches/other".to_string(),
+                        manifest_id: "checkpoint@8".to_string(),
+                    },
+                    updated_at: root_created_at,
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let published_at = catalog_timestamp(Utc::now());
+        let publish = CatalogMutation::PublishBranchCreate {
+            operation_id: operation.id,
+            expected_revision: 2,
+            updated_at: published_at,
+        };
+        assert_eq!(catalog.apply(publish.clone()).await.unwrap(), 5);
+        assert_eq!(catalog.apply(publish).await.unwrap(), 5);
+        let snapshot = catalog.snapshot().await.unwrap();
+        let ready = &snapshot.branches[&creating.id];
+        assert_eq!(ready.state, BranchState::Ready);
+        assert_eq!(ready.root.as_ref(), Some(&destination_root));
+        let completed = &snapshot.branch_create_operations[&operation.id];
+        assert_eq!(completed.phase, BranchCreatePhase::Published);
+        assert_eq!(completed.revision, 3);
+        assert_eq!(completed.destination_root.as_ref(), Some(&destination_root));
+        assert!(completed.gc_roots().is_empty());
+
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::DeleteCheckpoint {
+                    id: source.id,
+                    expected_revision: source.revision,
+                    name: source.name,
+                    deleted_at: catalog_timestamp(Utc::now()),
+                })
+                .await
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::PublishBranchCreate {
+                    operation_id: operation.id,
+                    expected_revision: 2,
+                    updated_at: published_at,
+                })
+                .await
+                .unwrap(),
+            6
+        );
+        catalog.snapshot().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_fails_closed_when_source_hold_index_is_missing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("source-hold-audit"), store)
+            .await
+            .unwrap();
+        let parent = branch("parent");
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent.clone()))
+            .await
+            .unwrap();
+        let source = checkpoint(Uuid::new_v4(), parent.id, "source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (creating, operation) = reserved_create(&source, "child");
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: creating,
+                operation: Box::new(operation.clone()),
+            })
+            .await
+            .unwrap();
+        catalog.snapshot().await.unwrap();
+
+        let mut corrupt = WriteBatch::new();
+        corrupt.delete(branch_create_source_key(source.id, operation.id));
+        catalog
+            .db
+            .write_with_options(corrupt, &durable_write_options())
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Corrupt(message)) if message.contains("source-hold index")
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_checkpoint_deletion_and_create_reservation_serialize_exactly() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("source-delete-race"), store)
+                .await
+                .unwrap(),
+        );
+        let parent = branch("parent");
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent.clone()))
+            .await
+            .unwrap();
+        let source = checkpoint(Uuid::new_v4(), parent.id, "source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (creating, operation) = reserved_create(&source, "child");
+
+        let (reserve, delete) = tokio::join!(
+            catalog.apply(CatalogMutation::ReserveBranchCreate {
+                branch: creating.clone(),
+                operation: Box::new(operation.clone()),
+            }),
+            catalog.apply(CatalogMutation::DeleteCheckpoint {
+                id: source.id,
+                expected_revision: source.revision,
+                name: source.name,
+                deleted_at: catalog_timestamp(Utc::now()),
+            })
+        );
+        let snapshot = catalog.snapshot().await.unwrap();
+        match (reserve, delete) {
+            (Ok(_), Err(CatalogError::OperationConflict(_))) => {
+                assert!(snapshot.checkpoints.contains_key(&source.id));
+                assert!(snapshot.branches.contains_key(&creating.id));
+                assert!(
+                    snapshot
+                        .branch_create_operations
+                        .contains_key(&operation.id)
+                );
+            }
+            (Err(CatalogError::NotFound(_)), Ok(_)) => {
+                assert!(snapshot.tombstones.contains_key(&source.id));
+                assert!(!snapshot.branches.contains_key(&creating.id));
+                assert!(
+                    !snapshot
+                        .branch_create_operations
+                        .contains_key(&operation.id)
+                );
+            }
+            outcomes => panic!("unexpected reservation/deletion outcomes: {outcomes:?}"),
+        }
         catalog.close().await.unwrap();
     }
 
@@ -811,7 +1357,7 @@ mod tests {
                     record: bad_branch,
                 })
                 .await,
-            Err(CatalogError::NotFound(_))
+            Err(CatalogError::Invalid(_))
         ));
 
         let original_checkpoint = checkpoint(Uuid::new_v4(), owner.id, "stable");
@@ -831,7 +1377,7 @@ mod tests {
                     record: bad_checkpoint,
                 })
                 .await,
-            Err(CatalogError::NotFound(_))
+            Err(CatalogError::Invalid(_))
         ));
         catalog.close().await.unwrap();
     }
@@ -852,7 +1398,7 @@ mod tests {
             &mut batch,
             Bytes::from_static(STATE_KEY),
             &CatalogState {
-                schema_version: PREVIOUS_SCHEMA_VERSION,
+                schema_version: LEGACY_SCHEMA_VERSION,
                 generation: 2,
             },
         )
@@ -897,6 +1443,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_v2_catalog_to_operation_schema_without_rewriting_records() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("migration-v2-v3");
+        let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
+            .build()
+            .await
+            .unwrap();
+        let existing = branch("existing");
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: PREVIOUS_SCHEMA_VERSION,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        put_json(&mut batch, branch_key(existing.id), &existing).unwrap();
+        db.write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
+        assert_eq!(snapshot.branches[&existing.id], existing);
+        assert!(snapshot.branch_create_operations.is_empty());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_v1_migration_never_flips_the_schema_marker() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("migration-v1-invalid-v2");
@@ -908,7 +1487,7 @@ mod tests {
             &mut batch,
             Bytes::from_static(STATE_KEY),
             &CatalogState {
-                schema_version: PREVIOUS_SCHEMA_VERSION,
+                schema_version: LEGACY_SCHEMA_VERSION,
                 generation: 1,
             },
         )
@@ -947,7 +1526,7 @@ mod tests {
                 &catalog.db.get(STATE_KEY).await.unwrap().unwrap(),
             )
             .unwrap();
-            assert_eq!(state.schema_version, PREVIOUS_SCHEMA_VERSION);
+            assert_eq!(state.schema_version, LEGACY_SCHEMA_VERSION);
         }
         catalog.close().await.unwrap();
     }
