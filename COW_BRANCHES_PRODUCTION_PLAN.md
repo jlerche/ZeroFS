@@ -9,14 +9,14 @@
 
 ## Architectural decisions
 
-- [ ] Model every ready branch as an independent durable root over immutable storage objects.
-- [ ] Treat branch ancestry as historical metadata, not as a storage-liveness dependency.
-- [ ] Treat named checkpoints, branch heads, and active leases as garbage-collection roots.
-- [ ] Make namespace deletion immediate and physical reclamation asynchronous.
-- [ ] Use generation-fenced, streaming mark-and-sweep for shared and inherited data.
-- [ ] Use fast local garbage collection only when a segment is provably private to one branch.
-- [ ] Prefer safe retention over deletion whenever metadata is corrupt, unavailable, ambiguous, or concurrently changing.
-- [ ] Keep the branch feature independent of unrelated 9P, FUSE, TLS, authentication, CSI, frontend, dependency, NBD, and replication redesigns.
+- [x] Model every ready branch as an independent durable root over immutable storage objects.
+- [x] Treat branch ancestry as historical metadata, not as a storage-liveness dependency.
+- [x] Treat named checkpoints, branch heads, and active leases as garbage-collection roots.
+- [x] Make namespace deletion immediate and physical reclamation asynchronous.
+- [x] Use generation-fenced, streaming mark-and-sweep for shared and inherited data.
+- [x] Use fast local garbage collection only when a segment is provably private to one branch.
+- [x] Prefer safe retention over deletion whenever metadata is corrupt, unavailable, ambiguous, or concurrently changing.
+- [x] Keep the branch feature independent of unrelated 9P, FUSE, TLS, authentication, CSI, frontend, dependency, NBD, and replication redesigns.
 
 ## Phase 0: Preserve research and reset scope
 
@@ -26,87 +26,87 @@
   - [x] Record the current commit IDs and dirty working-tree state.
   - [x] Decide whether uncommitted research changes need a separate archival commit or patch bundle.
   - [x] Document that the research branch is not a merge candidate.
-- [ ] Inventory reusable artifacts from the research branch.
-  - [ ] Catalogue branch lifecycle tests and the invariant each test exercises.
-  - [ ] Catalogue crash, retry, stale-record, deletion-race, and garbage-collection scenarios.
-  - [ ] Preserve useful CLI and RPC naming as an API specification draft.
-  - [ ] Preserve useful branch and checkpoint documentation as product-behavior input.
-  - [ ] Preserve stable branch UUID, origin-checkpoint, and catalog-generation concepts.
-  - [ ] Preserve segment ownership and conservative reclamation ideas that remain compatible with the new design.
+- [x] Inventory reusable artifacts from the research branch.
+  - [x] Catalogue branch lifecycle tests and the invariant each test exercises.
+  - [x] Catalogue crash, retry, stale-record, deletion-race, and garbage-collection scenarios.
+  - [x] Preserve useful CLI and RPC naming as an API specification draft.
+  - [x] Preserve useful branch and checkpoint documentation as product-behavior input.
+  - [x] Preserve stable branch UUID, origin-checkpoint, and catalog-generation concepts.
+  - [x] Preserve segment ownership and conservative reclamation ideas that remain compatible with the new design.
 
 ### Epic 0.2: Reject accidental scope
 
 - [x] Start a fresh implementation branch from `main`.
 - [x] Exclude the current approximately 8,500-line `BranchManager` implementation.
-- [ ] Exclude activity fences, takeover generations, publication receipts, expiry buckets, deletion plans, and recovery sweeps unless a written invariant proves one is necessary.
+- [x] Exclude activity fences, takeover generations, publication receipts, expiry buckets, deletion plans, and recovery sweeps unless a written invariant proves one is necessary.
 - [x] Exclude the candidate-by-candidate global GC implementation that can open tens of thousands of external views per pass.
 - [x] Exclude the monolithic registry design in which every mutation rewrites a global JSON object of up to 16 MiB.
 - [x] Exclude unrelated changes to the 9P replay model, FUSE lifecycle, transport security, web authentication, CSI productionization, dependencies, replication, and NBD.
-- [ ] Require every future cross-subsystem change to identify the branch or GC invariant that makes it necessary.
+- [x] Require every future cross-subsystem change to identify the branch or GC invariant that makes it necessary.
 
 ### Epic 0.3: Restore a reviewable baseline
 
 - [x] Confirm the fresh branch passes `cargo check --workspace --all-targets`.
 - [ ] Confirm the fresh branch passes the repository's standard formatting, lint, and test gates.
 - [x] Avoid carrying over the current `FuseTasks` compilation failure in `zerofs/src/mount.rs`.
-- [ ] Define a pull-request size and scope policy for the implementation.
-  - [ ] Keep storage-model, catalog, lifecycle, GC, API, and integration changes in separate reviewable commits or pull requests.
-  - [ ] Require production code and its focused tests to land together.
+- [x] Define a pull-request size and scope policy for the implementation.
+  - [x] Keep storage-model, catalog, lifecycle, GC, API, and integration changes in separate reviewable commits or pull requests.
+  - [x] Require production code and its focused tests to land together.
 
 ## Phase 1: Specify semantics and invariants
 
 ### Epic 1.1: Define branch semantics
 
-- [ ] Write a concise branch state-machine specification.
-  - [ ] Define `Creating`, `Ready`, `Deleting`, and `Deleted` or tombstoned states.
-  - [ ] Define which transitions are externally visible.
-  - [ ] Define retry and idempotency behavior for every transition.
-  - [ ] Define recovery behavior after ambiguous process or object-store failures.
-- [ ] Define a ready branch as independently mountable without its parent branch or source checkpoint.
-  - [ ] Require the branch's durable root to exist before publishing `Ready`.
-  - [ ] Require the durable root to pin every immutable object the branch may read.
+- [x] Write a concise branch state-machine specification.
+  - [x] Define `Creating`, `Ready`, `Deleting`, and `Deleted` or tombstoned states.
+  - [x] Define which transitions are externally visible.
+  - [x] Define retry and idempotency behavior for every transition.
+  - [x] Define recovery behavior after ambiguous process or object-store failures.
+- [x] Define a ready branch as independently mountable without its parent branch or source checkpoint.
+  - [x] Require the branch's durable root to exist before publishing `Ready`.
+  - [x] Require the durable root to pin every immutable object the branch may read.
   - [ ] Verify that the SlateDB clone/final-checkpoint mechanism provides this property or add the smallest required pinning layer.
-- [ ] Define ancestry behavior after deletion.
-  - [ ] Decide whether `parent_id` continues to reference a tombstoned UUID, becomes optional, or is reparented for display purposes.
-  - [ ] Ensure ancestry representation does not control physical liveness.
-  - [ ] Preserve origin metadata needed for audit and user-facing history.
+- [x] Define ancestry behavior after deletion.
+  - [x] Decide whether `parent_id` continues to reference a tombstoned UUID, becomes optional, or is reparented for display purposes.
+  - [x] Ensure ancestry representation does not control physical liveness.
+  - [x] Preserve origin metadata needed for audit and user-facing history.
 
 ### Epic 1.2: Define deletion semantics
 
-- [ ] Allow deletion of a checkpoint referenced as the historical origin of a ready branch.
-  - [ ] Remove the checkpoint's named GC root.
-  - [ ] Keep descendant branches valid through their independent durable roots.
-  - [ ] Serialize checkpoint deletion safely against branch creation that is still in progress.
-- [ ] Allow deletion of a branch that has descendants.
-  - [ ] Remove or tombstone the deleted branch's GC root.
-  - [ ] Keep every descendant independently mountable and writable.
-  - [ ] Define behavior for active mounts and writers on the deleted branch.
-  - [ ] Ensure deletion by name cannot affect a subsequently recreated branch with the same name.
-- [ ] Make logical deletion fast and physical deletion asynchronous.
-  - [ ] Reject new opens by name after the deletion linearization point.
-  - [ ] Retain a compact tombstone until old leases and GC generations can no longer observe the former root.
-  - [ ] Make repeated deletion requests idempotent.
+- [x] Allow deletion of a checkpoint referenced as the historical origin of a ready branch.
+  - [x] Remove the checkpoint's named GC root.
+  - [x] Keep descendant branches valid through their independent durable roots.
+  - [x] Serialize checkpoint deletion safely against branch creation that is still in progress.
+- [x] Allow deletion of a branch that has descendants.
+  - [x] Remove or tombstone the deleted branch's GC root.
+  - [x] Keep every descendant independently mountable and writable.
+  - [x] Define behavior for active mounts and writers on the deleted branch.
+  - [x] Ensure deletion by name cannot affect a subsequently recreated branch with the same name.
+- [x] Make logical deletion fast and physical deletion asynchronous.
+  - [x] Reject new opens by name after the deletion linearization point.
+  - [x] Retain a compact tombstone until old leases and GC generations can no longer observe the former root.
+  - [x] Make repeated deletion requests idempotent.
 
 ### Epic 1.3: Define GC safety invariants
 
-- [ ] Enumerate every authoritative GC root.
-  - [ ] Live branch heads.
-  - [ ] Live named checkpoints.
-  - [ ] Internal durable roots required by ready branches.
-  - [ ] Active mount or writer leases.
-  - [ ] Replication or recovery roots that can still expose old data.
-  - [ ] Roots pinned by an in-progress GC run.
-- [ ] Define object eligibility for physical deletion.
-  - [ ] The object is absent from a complete reachable set.
-  - [ ] The object predates the GC inventory cutoff.
-  - [ ] The catalog generation and captured roots remain valid.
-  - [ ] The object remains unreachable after a grace period and second observation.
-  - [ ] No unreadable, corrupt, or ambiguous metadata was treated as evidence of unreachability.
-- [ ] Define fail-safe behavior.
-  - [ ] Interrupted collection leaks storage rather than deleting live data.
-  - [ ] Catalog changes abort or restart a collection rather than being reconciled speculatively.
-  - [ ] Delete operations are idempotent.
-  - [ ] Missing mark data prevents deletion.
+- [x] Enumerate every authoritative GC root.
+  - [x] Live branch heads.
+  - [x] Live named checkpoints.
+  - [x] Internal durable roots required by ready branches.
+  - [x] Active mount or writer leases.
+  - [x] Replication or recovery roots that can still expose old data.
+  - [x] Roots pinned by an in-progress GC run.
+- [x] Define object eligibility for physical deletion.
+  - [x] The object is absent from a complete reachable set.
+  - [x] The object predates the GC inventory cutoff.
+  - [x] The catalog generation and captured roots remain valid.
+  - [x] The object remains unreachable after a grace period and second observation.
+  - [x] No unreadable, corrupt, or ambiguous metadata was treated as evidence of unreachability.
+- [x] Define fail-safe behavior.
+  - [x] Interrupted collection leaks storage rather than deleting live data.
+  - [x] Catalog changes abort or restart a collection rather than being reconciled speculatively.
+  - [x] Delete operations are idempotent.
+  - [x] Missing mark data prevents deletion.
 
 ## Phase 2: Build the durable catalog and root model
 
@@ -379,3 +379,9 @@
 - Projection boundary: PostgreSQL/JSON contain only volume/resource UUIDs, kind, name, customer-visible state, lineage UUIDs, timestamps, observed generation, and customer metadata. They never contain durable roots or manifests and are never consulted for mounting or garbage collection.
 - Reconciliation: a projection consumes an authoritative generation-tagged SlateDB snapshot idempotently. Projection outages do not invalidate storage operations; a later reconciliation catches up while preserving customer-managed metadata.
 - Independent review gate: review of `31efd05` found cross-kind/tombstone UUID reuse, global-generation contention, projection parity, deleted-lineage reconstruction, identifier-bound, and schema-upgrade issues. The follow-up correction globally reserves UUIDs, uses per-record revisions, retains root-free historical lineage in tombstones, aligns JSON/PostgreSQL behavior, adds a bounded crash-resumable SlateDB v1-to-v2 migration, and adds adversarial tests.
+
+### 2026-08-08: semantics and research inventory
+
+- Normative contract: `docs/cow-branches-semantics.md` defines stable identity/name reuse, the branch state machine, publication and deletion linearization points, exact retry behavior, minimal create recovery, bounded leases, authoritative GC roots, two-observation deletion eligibility, and fail-closed behavior.
+- Research reuse: the contract maps research registry, manager, mount, GC, CLI/RPC, and documentation artifacts to specific reusable scenarios while explicitly rejecting the monolithic registry, broad fencing, receipt, takeover, and candidate-by-view designs.
+- Review policy: storage, catalog, lifecycle, lease, GC, API, and rollout work remain separate coherent changes. Production code and focused tests land together, and each subtask requires an independent pre-commit review.
