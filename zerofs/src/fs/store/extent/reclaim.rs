@@ -14,12 +14,14 @@ use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::metrics::SegmentGcPass;
 use crate::segment::{FrameLoc, Segid};
-use crate::segment_store::SegmentStoreError;
+use crate::segment_store::{SegmentObjectIdentity, SegmentStoreError};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
+use sha2::{Digest, Sha256};
 use slatedb::config::WriteOptions;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
@@ -85,6 +87,49 @@ enum SegmentDeadVerdict {
     Keep,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
+pub(crate) struct PrivateGcCandidate {
+    pub(crate) segid: Segid,
+    pub(crate) appended_bytes: u64,
+    pub(crate) object_identity: Option<SegmentObjectIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
+pub(crate) struct PreparedPrivateGcBatch {
+    pub(crate) publisher_id: uuid::Uuid,
+    pub(crate) epoch: u64,
+    pub(crate) candidates: Vec<PrivateGcCandidate>,
+    pub(crate) candidate_digest: String,
+}
+
+fn private_candidate_digest(candidates: &[PrivateGcCandidate]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"zerofs-private-gc-candidates-v1");
+    digest.update((candidates.len() as u64).to_be_bytes());
+    for candidate in candidates {
+        digest.update(candidate.segid.epoch.to_be_bytes());
+        digest.update(candidate.segid.counter.to_be_bytes());
+        digest.update(candidate.appended_bytes.to_be_bytes());
+        match &candidate.object_identity {
+            Some(identity) => {
+                digest.update([1]);
+                digest.update(identity.size.to_be_bytes());
+                digest.update(identity.modified_seconds.to_be_bytes());
+                digest.update(identity.modified_nanos.to_be_bytes());
+                digest.update(identity.content_digest);
+            }
+            None => digest.update([0]),
+        }
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// What one reclaim pass did and whether it left actionable work behind —
 /// the input to the GC loop's cadence decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +170,99 @@ pub enum PassStatus {
 }
 
 impl ExtentStore {
+    /// Build one deterministic bounded candidate set from an epoch the live
+    /// writer has already left. The exclusive publication and flush barriers
+    /// make both the durable zero-live counters and forward-map verification
+    /// one stable local observation. Ambiguous/corrupt/live objects are simply
+    /// retained for global GC; storage errors abort the whole preparation.
+    #[allow(dead_code)] // The private catalog coordinator remains disabled.
+    pub(crate) async fn prepare_private_gc_batch(
+        &self,
+        epoch: u64,
+        max_candidates: usize,
+    ) -> Result<PreparedPrivateGcBatch, FsError> {
+        if epoch == 0 || max_candidates == 0 || max_candidates > crate::fs::MAX_LOCAL_GC_CANDIDATES
+        {
+            return Err(FsError::InvalidArgument);
+        }
+        let _refs = self.extent_ref_barrier.clone().write_owned().await;
+        let _flush = self.db.flush_barrier().write_owned().await;
+        if epoch >= self.segment_store().epoch() {
+            return Err(FsError::InvalidArgument);
+        }
+        // The flush is database-wide, not scoped to `epoch`: first make every
+        // current-writer FrameLoc's segment durable, exactly like fsync and the
+        // established reclaim barrier. This also drains background re-PUTs.
+        self.seal_open().await?;
+        self.db.flush().await.map_err(|_| FsError::IoError)?;
+
+        let (start, end) = self.key_codec.segcount_prefix_range();
+        let mut stream = self
+            .db
+            .scan_durable(start..end)
+            .await
+            .map_err(|_| FsError::IoError)?;
+        let mut dead = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let (key, value) = entry.map_err(|_| FsError::IoError)?;
+            let Some((candidate_epoch, counter)) = self.key_codec.parse_segcount_key(&key) else {
+                continue;
+            };
+            if candidate_epoch != epoch {
+                continue;
+            }
+            let Some((live, total)) = KeyCodec::decode_segcount(&value) else {
+                continue;
+            };
+            if live == 0 {
+                dead.push((Segid::new(epoch, counter), total));
+            }
+        }
+        drop(stream);
+        dead.sort_unstable_by_key(|(segid, _)| *segid);
+
+        let mut candidates = Vec::with_capacity(max_candidates.min(dead.len()));
+        for (segid, appended_bytes) in dead {
+            if candidates.len() == max_candidates {
+                break;
+            }
+            let identity = match self.segment_store().object_identity(segid).await {
+                Ok(identity) => Some(identity),
+                Err(SegmentStoreError::NotFound) => None,
+                Err(_) => return Err(FsError::IoError),
+            };
+            match self.verify_segment_reclaimable(segid).await {
+                SegmentDeadVerdict::Keep => continue,
+                SegmentDeadVerdict::Reclaim => {
+                    let Some(identity) = identity else {
+                        // The object appeared between two exact reads. Retain
+                        // the ambiguity rather than minting a deletion proof.
+                        continue;
+                    };
+                    candidates.push(PrivateGcCandidate {
+                        segid,
+                        appended_bytes,
+                        object_identity: Some(identity),
+                    });
+                }
+                SegmentDeadVerdict::ObjectAbsent => {
+                    candidates.push(PrivateGcCandidate {
+                        segid,
+                        appended_bytes,
+                        object_identity: identity,
+                    });
+                }
+            }
+        }
+        let candidate_digest = private_candidate_digest(&candidates);
+        Ok(PreparedPrivateGcBatch {
+            publisher_id: self.publisher_id(),
+            epoch,
+            candidates,
+            candidate_digest,
+        })
+    }
+
     /// Reclaim object-store space: delete fully-dead segments and compact the
     /// most-fragmented ones, driven entirely off the local `segcount` scan.
     /// Returns (segments deleted, frames relocated); production goes through
@@ -1269,6 +1407,89 @@ mod tests {
             "the leaked counter (object already gone) must be dropped"
         );
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[2u8; 1000]);
+    }
+
+    #[tokio::test]
+    async fn private_batch_is_bounded_deterministic_and_directory_verified() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let dead = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        write_and_check(&store, &db, &mut model, 0, &[2u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let live = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        assert_ne!(dead, live);
+
+        // Simulate a corrupt under-count. The zero-live scan sees both rows,
+        // but the directory/forward-map proof must retain the live segment.
+        let (_, live_total) = segcount_pair_of(&store, &db, live).await;
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(live.epoch, live.counter),
+            KeyCodec::encode_segcount(0, live_total),
+        );
+        commit(&store, txn).await;
+        let _receipt = store.rotate_writer_epoch(8).await.unwrap();
+        let successor_payload = Bytes::from_static(b"successor writer payload");
+        let mut successor_txn = db.new_transaction().unwrap();
+        let successor_tail = store
+            .write(&mut successor_txn, 2, 0, &successor_payload, 0)
+            .await
+            .unwrap();
+        commit(&store, successor_txn).await;
+        store.apply_tail_update(2, successor_tail);
+        assert!(
+            store.unflushed_bytes() > 0,
+            "successor frame starts RAM-only"
+        );
+
+        let first = store.prepare_private_gc_batch(7, 1).await.unwrap();
+        assert_eq!(
+            store.unflushed_bytes(),
+            0,
+            "preparation seals before flushing"
+        );
+        let successor_key = store.key_codec.extent_key(2, 0);
+        let successor_loc = db
+            .get_bytes_durable(&successor_key)
+            .await
+            .unwrap()
+            .and_then(|encoded| FrameLoc::decode(&encoded))
+            .expect("successor FrameLoc is durable");
+        assert_eq!(successor_loc.segid.epoch, 8);
+        let durable_successor = store
+            .segment_store()
+            .read_extent(successor_loc, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            &durable_successor[..successor_payload.len()],
+            successor_payload.as_ref(),
+            "a crash-equivalent durable pointer resolves to its sealed object"
+        );
+        let retry = store.prepare_private_gc_batch(7, 1).await.unwrap();
+        assert_eq!(first, retry, "the same durable view has one stable digest");
+        assert_eq!(first.publisher_id, store.publisher_id());
+        assert_eq!(first.epoch, 7);
+        assert_eq!(first.candidates.len(), 1);
+        assert_eq!(first.candidates[0].segid, dead);
+        assert!(first.candidates[0].object_identity.is_some());
+        assert_eq!(first.candidate_digest.len(), 64);
+        assert!(
+            first
+                .candidate_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert!(matches!(
+            store.prepare_private_gc_batch(8, 1).await,
+            Err(FsError::InvalidArgument)
+        ));
+        assert!(matches!(
+            store.prepare_private_gc_batch(7, 0).await,
+            Err(FsError::InvalidArgument)
+        ));
     }
 
     // A normally-counted segment (counter present) is not an orphan: the sweep

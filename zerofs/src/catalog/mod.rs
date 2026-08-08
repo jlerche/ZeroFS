@@ -584,7 +584,9 @@ impl LocalGcGuardRecord {
                 "local GC guard epoch identity must be nonzero".to_string(),
             ));
         }
-        if self.candidate_count == 0 || self.candidate_count > gc::MAX_DELETE_BATCH_SIZE {
+        if self.candidate_count == 0
+            || self.candidate_count as usize > crate::fs::MAX_LOCAL_GC_CANDIDATES
+        {
             return Err(CatalogError::Invalid(
                 "local GC guard candidate count is outside the safety bound".to_string(),
             ));
@@ -634,7 +636,9 @@ impl LocalGcProgressRecord {
                 "local GC progress epoch identity must be nonzero".to_string(),
             ));
         }
-        if self.candidate_count == 0 || self.candidate_count > gc::MAX_DELETE_BATCH_SIZE {
+        if self.candidate_count == 0
+            || self.candidate_count as usize > crate::fs::MAX_LOCAL_GC_CANDIDATES
+        {
             return Err(CatalogError::Invalid(
                 "local GC progress candidate count is outside the safety bound".to_string(),
             ));

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use slatedb::object_store::{
     CopyMode, CopyOptions, GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt,
     PutMode, PutOptions, path::Path,
@@ -60,6 +60,19 @@ pub struct AuthenticatedBranchEpoch {
     pub reservation_id: uuid::Uuid,
     pub database_identity: String,
     pub branch_id: uuid::Uuid,
+}
+
+/// Exact immutable object identity captured before a local deletion attempt.
+/// A later worker must stream and match every field again immediately before
+/// deleting the object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by the disabled private-epoch collector path.
+pub(crate) struct SegmentObjectIdentity {
+    pub(crate) segid: Segid,
+    pub(crate) size: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanos: u32,
+    pub(crate) content_digest: [u8; 32],
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -956,6 +969,43 @@ impl SegmentStore {
             .delete(&Path::from(segid.object_key()))
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
+    }
+
+    /// Stream the canonical immutable object and bind both its metadata and
+    /// bytes. Metadata-only checks are insufficient for irreversible deletion.
+    #[allow(dead_code)] // Consumed by the disabled private-epoch collector path.
+    pub(crate) async fn object_identity(&self, segid: Segid) -> Result<SegmentObjectIdentity> {
+        let result = self
+            .object_store
+            .get(&Path::from(segid.object_key()))
+            .await
+            .map_err(|error| match error {
+                slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
+                other => SegmentStoreError::ObjectStore(other.to_string()),
+            })?;
+        let meta = result.meta.clone();
+        let mut stream = result.into_stream();
+        let mut hasher = Sha256::new();
+        let mut bytes = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            bytes = bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                SegmentStoreError::ObjectStore("segment object length overflow".to_string())
+            })?;
+            hasher.update(&chunk);
+        }
+        if bytes != meta.size {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "segment {segid:?} body length disagrees with object metadata"
+            )));
+        }
+        Ok(SegmentObjectIdentity {
+            segid,
+            size: meta.size,
+            modified_seconds: meta.last_modified.timestamp(),
+            modified_nanos: meta.last_modified.timestamp_subsec_nanos(),
+            content_digest: hasher.finalize().into(),
+        })
     }
 
     /// Read and decrypt a segment's reverse-map directory (which frame backs

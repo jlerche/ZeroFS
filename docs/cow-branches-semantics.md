@@ -464,6 +464,20 @@ timestamps are monotonic and keep the immutable branch, epoch, count, and
 candidate digest. The final fully classified update atomically writes the
 completed audit and retires the guard; an incomplete update cannot retire it,
 and an exact retry after an ambiguous completion response is generation-neutral.
+
+Private candidate preparation accepts only a nonzero epoch older than the live
+writer and runs under the exclusive FrameLoc-publication and database-flush
+barriers. It seals the active successor before the database-wide metadata flush,
+so unrelated current-epoch pointers cannot become durable before their object.
+It then streams the durable exact-epoch segment counters, sorts zero-live
+candidates by segment identity, and applies the fixed catalog batch bound.
+Every selected object must also pass reverse-directory checks
+against both the current and durable forward maps. The object is streamed in
+full to bind its size, modification time, and SHA-256 content identity into the
+candidate-set digest; unreadable or still-referenced objects are retained.
+Preparation is not deletion authority by itself, and local deletion remains
+disabled until the artifact, guard, progress, and barrier-through-delete worker
+are wired as one crash-recoverable lifecycle.
 While a create operation is incomplete, its immutable `parent_id` is required
 to equal the authoritative source checkpoint's branch UUID. Snapshot validation
 rechecks that binding whenever the source checkpoint is live; after checkpoint

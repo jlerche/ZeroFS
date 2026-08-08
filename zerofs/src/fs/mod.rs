@@ -36,6 +36,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 pub use self::gc::GarbageCollector;
 pub use handle::OpenHandle;
 
+/// One private-GC guard/progress record covers at most this many candidates.
+/// Shared by the filesystem preparation path and the authoritative catalog.
+pub(crate) const MAX_LOCAL_GC_CANDIDATES: usize = 256;
+
 use self::errors::FsError;
 use self::inode::InodeId;
 use ::tracing::warn;
