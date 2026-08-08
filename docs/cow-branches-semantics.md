@@ -430,6 +430,24 @@ registration time, even if deletion has already advanced the record to
    deletion, and lease/recovery-root acquisition that could expose an older
    view must conflict or wait until every attempted delete has confirmed its
    outcome and progress is durable.
+
+Catalog schema v13 stores each acquired local-GC guard under an independent
+SlateDB key. Acquisition atomically requires the exact `sealed_private` epoch
+revision and ready branch, a bounded nonempty candidate count and digest, and
+the absence of checkpoints, leases, incomplete clone-source operations, other
+root-retaining GC runs, or another guard for the epoch. A live guard blocks
+epoch exposure, branch deletion, checkpoint publication, clone-source capture,
+and new branch/checkpoint leases. It has no expiry or generic release operation;
+a later deletion-progress transition must account durably for every candidate
+before retirement can exist. PostgreSQL and JSON do not project guards.
+While a create operation is incomplete, its immutable `parent_id` is required
+to equal the authoritative source checkpoint's branch UUID. Snapshot validation
+rechecks that binding whenever the source checkpoint is live; after checkpoint
+deletion, it requires the checkpoint tombstone's preserved former branch UUID
+to match the operation. Missing or mismatched migrated history fails closed.
+The previously validated immutable value therefore continues to identify the
+RootCreated operation as a guard blocker. A ready branch's parent remains only
+historical lineage and is not a general liveness dependency.
 4. No existing named/internal checkpoint or active lease/recovery root can
    expose a segment the local database now considers dead. The conservative
    implementation may pause local deletion for any such root. Unreadable or

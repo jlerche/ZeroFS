@@ -49,7 +49,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 12;
+pub const CATALOG_SCHEMA_VERSION: u32 = 13;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -400,7 +400,12 @@ impl BranchCreateOperation {
         validate_id(self.destination_id, "branch create destination")?;
         validate_name(&self.destination_name)?;
         validate_id(self.source_checkpoint_id, "branch create source checkpoint")?;
-        validate_optional_id(self.parent_id, "branch create parent")?;
+        let source_branch_id = self.parent_id.ok_or_else(|| {
+            CatalogError::Invalid(
+                "branch create operation requires its exact source branch UUID".to_string(),
+            )
+        })?;
+        validate_id(source_branch_id, "branch create source branch")?;
         validate_root(&self.source_root)?;
         if self.destination_id == self.source_checkpoint_id
             || self.id == self.destination_id
@@ -550,6 +555,50 @@ impl PrivateEpochRecord {
             }
         }
         Ok(())
+    }
+}
+
+/// Durable, non-expiring exclusion for one bounded local-GC batch. There is no
+/// generic release mutation: a later deletion slice must durably publish every
+/// candidate outcome before it can retire this guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalGcGuardRecord {
+    pub id: Uuid,
+    pub revision: u64,
+    pub branch_id: Uuid,
+    pub epoch: u64,
+    pub epoch_revision: u64,
+    pub candidate_count: u32,
+    pub candidate_digest: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl LocalGcGuardRecord {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "local GC guard")?;
+        validate_revision(self.revision, "local GC guard")?;
+        validate_id(self.branch_id, "local GC guard branch")?;
+        if self.epoch == 0 || self.epoch_revision == 0 {
+            return Err(CatalogError::Invalid(
+                "local GC guard epoch identity must be nonzero".to_string(),
+            ));
+        }
+        if self.candidate_count == 0 || self.candidate_count > gc::MAX_DELETE_BATCH_SIZE {
+            return Err(CatalogError::Invalid(
+                "local GC guard candidate count is outside the safety bound".to_string(),
+            ));
+        }
+        if self.candidate_digest.len() != 64
+            || !self
+                .candidate_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "local GC guard candidate digest must be 64 hexadecimal characters".to_string(),
+            ));
+        }
+        validate_timestamp(self.created_at, "local GC guard created_at")
     }
 }
 
@@ -1277,6 +1326,8 @@ pub struct CatalogSnapshot {
     pub tombstones: BTreeMap<Uuid, TombstoneRecord>,
     #[serde(default)]
     pub private_epochs: BTreeMap<u64, PrivateEpochRecord>,
+    #[serde(default)]
+    pub local_gc_guards: BTreeMap<Uuid, LocalGcGuardRecord>,
 }
 
 impl Default for CatalogSnapshot {
@@ -1293,6 +1344,7 @@ impl Default for CatalogSnapshot {
             lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             private_epochs: BTreeMap::new(),
+            local_gc_guards: BTreeMap::new(),
         }
     }
 }
@@ -1356,6 +1408,32 @@ impl CatalogSnapshot {
                 )));
             }
         }
+        validate_records(
+            &self.local_gc_guards,
+            |record| record.id,
+            LocalGcGuardRecord::validate,
+        )?;
+        for guard in self.local_gc_guards.values() {
+            let epoch = self.private_epochs.get(&guard.epoch).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "local GC guard {} refers to missing epoch {}",
+                    guard.id, guard.epoch
+                ))
+            })?;
+            if epoch.branch_id != guard.branch_id
+                || epoch.revision != guard.epoch_revision
+                || epoch.state != PrivateEpochState::SealedPrivate
+                || !self
+                    .branches
+                    .get(&guard.branch_id)
+                    .is_some_and(|branch| branch.state == BranchState::Ready)
+            {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC guard {} lost its sealed exact branch epoch",
+                    guard.id
+                )));
+            }
+        }
         if self
             .tombstones
             .values()
@@ -1405,6 +1483,11 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let local_gc_guard_ids = self
+            .local_gc_guards
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         if !branch_ids.is_disjoint(&checkpoint_ids)
             || !branch_ids.is_disjoint(&tombstone_ids)
             || !checkpoint_ids.is_disjoint(&tombstone_ids)
@@ -1433,6 +1516,14 @@ impl CatalogSnapshot {
             || !gc_run_ids.is_disjoint(&lease_ids)
             || !gc_run_ids.is_disjoint(&lease_tombstone_ids)
             || !gc_run_ids.is_disjoint(&tombstone_ids)
+            || !local_gc_guard_ids.is_disjoint(&branch_ids)
+            || !local_gc_guard_ids.is_disjoint(&checkpoint_ids)
+            || !local_gc_guard_ids.is_disjoint(&operation_ids)
+            || !local_gc_guard_ids.is_disjoint(&delete_operation_ids)
+            || !local_gc_guard_ids.is_disjoint(&gc_run_ids)
+            || !local_gc_guard_ids.is_disjoint(&lease_ids)
+            || !local_gc_guard_ids.is_disjoint(&lease_tombstone_ids)
+            || !local_gc_guard_ids.is_disjoint(&tombstone_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -1601,6 +1692,7 @@ fn canonicalize_gc_root_pins(pins: &mut Vec<GcRootPin>) {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
 pub(crate) enum CatalogMutation {
+    AcquireLocalGcGuard(LocalGcGuardRecord),
     RegisterPrivateEpoch(PrivateEpochRecord),
     SealPrivateEpoch {
         epoch: u64,
@@ -1935,9 +2027,11 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                                 operation.id
                             ))
                         })?;
-                    if source.root != operation.source_root {
+                    if source.root != operation.source_root
+                        || operation.parent_id != Some(source.branch_id)
+                    {
                         return Err(CatalogError::Corrupt(format!(
-                            "reserved operation {} source root changed",
+                            "reserved operation {} source identity changed",
                             operation.id
                         )));
                     }
@@ -1945,11 +2039,17 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                     let live_source_matches = snapshot
                         .checkpoints
                         .get(&operation.source_checkpoint_id)
-                        .is_some_and(|source| source.root == operation.source_root);
+                        .is_some_and(|source| {
+                            source.root == operation.source_root
+                                && operation.parent_id == Some(source.branch_id)
+                        });
                     let deleted_source_matches = snapshot
                         .tombstones
                         .get(&operation.source_checkpoint_id)
-                        .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Checkpoint);
+                        .is_some_and(|tombstone| {
+                            tombstone.kind == TombstoneKind::Checkpoint
+                                && tombstone.parent_id == operation.parent_id
+                        });
                     if !live_source_matches && !deleted_source_matches {
                         return Err(CatalogError::Corrupt(format!(
                             "root-created operation {} has no matching source history",

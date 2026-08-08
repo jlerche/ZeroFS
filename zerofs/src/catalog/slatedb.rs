@@ -5,8 +5,8 @@ use super::{
     CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcDeletionPublication,
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
-    LeaseSubjectKind, LeaseTombstone, PrivateEpochRecord, PrivateEpochState, TombstoneKind,
-    TombstoneRecord, validate_name, validate_root, validate_timestamp,
+    LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, PrivateEpochRecord, PrivateEpochState,
+    TombstoneKind, TombstoneRecord, validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,6 +35,7 @@ const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
+const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -46,6 +47,7 @@ const GC_MARK_SCHEMA_VERSION: u32 = 8;
 const GC_QUARANTINE_SCHEMA_VERSION: u32 = 9;
 const GC_REVALIDATION_SCHEMA_VERSION: u32 = 10;
 const GC_DELETION_SCHEMA_VERSION: u32 = 11;
+const PRIVATE_EPOCH_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -148,6 +150,7 @@ impl SlateDbCatalog {
             GC_QUARANTINE_SCHEMA_VERSION,
             GC_REVALIDATION_SCHEMA_VERSION,
             GC_DELETION_SCHEMA_VERSION,
+            PRIVATE_EPOCH_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -267,6 +270,9 @@ impl SlateDbCatalog {
         let private_epochs = self
             .scan_records::<PrivateEpochRecord>(PRIVATE_EPOCH_PREFIX)
             .await?;
+        let local_gc_guards = self
+            .scan_records::<LocalGcGuardRecord>(LOCAL_GC_GUARD_PREFIX)
+            .await?;
         let snapshot = CatalogSnapshot {
             schema_version: state.schema_version,
             generation: state.generation,
@@ -306,6 +312,10 @@ impl SlateDbCatalog {
                 .into_iter()
                 .map(|record| (record.epoch, record))
                 .collect(),
+            local_gc_guards: local_gc_guards
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -317,6 +327,22 @@ impl SlateDbCatalog {
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
             .transpose()
+    }
+
+    async fn has_local_gc_guard_for_branch(&self, branch_id: Uuid) -> Result<bool, CatalogError> {
+        Ok(self
+            .scan_records::<LocalGcGuardRecord>(LOCAL_GC_GUARD_PREFIX)
+            .await?
+            .iter()
+            .any(|guard| guard.branch_id == branch_id))
+    }
+
+    async fn has_local_gc_guard_for_epoch(&self, epoch: u64) -> Result<bool, CatalogError> {
+        Ok(self
+            .scan_records::<LocalGcGuardRecord>(LOCAL_GC_GUARD_PREFIX)
+            .await?
+            .iter()
+            .any(|guard| guard.epoch == epoch))
     }
 
     #[allow(dead_code)] // Called by crate-private lookup methods used by later API slices.
@@ -356,6 +382,78 @@ impl SlateDbCatalog {
         let mut batch = WriteBatch::new();
 
         match mutation {
+            CatalogMutation::AcquireLocalGcGuard(guard) => {
+                guard.validate()?;
+                ensure_initial_revision(guard.revision)?;
+                if let Some(existing) = self
+                    .get_record::<LocalGcGuardRecord>(local_gc_guard_key(guard.id))
+                    .await?
+                {
+                    if existing == guard {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(guard.id.to_string()));
+                }
+                ensure_resource_id_available(self.db.as_ref(), guard.id).await?;
+                if self
+                    .scan_records::<LocalGcGuardRecord>(LOCAL_GC_GUARD_PREFIX)
+                    .await?
+                    .iter()
+                    .any(|existing| existing.epoch == guard.epoch)
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {} already has a local GC guard",
+                        guard.epoch
+                    )));
+                }
+                let epoch = self
+                    .get_record::<PrivateEpochRecord>(private_epoch_key(guard.epoch))
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogError::NotFound(format!("private epoch {}", guard.epoch))
+                    })?;
+                epoch.validate()?;
+                if epoch.branch_id != guard.branch_id
+                    || epoch.revision != guard.epoch_revision
+                    || epoch.state != PrivateEpochState::SealedPrivate
+                    || guard.created_at < epoch.updated_at
+                    || !self
+                        .get_record::<BranchRecord>(branch_key(guard.branch_id))
+                        .await?
+                        .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
+                    return Err(CatalogError::OperationConflict(guard.id.to_string()));
+                }
+                if self
+                    .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
+                    .await?
+                    .iter()
+                    .any(|checkpoint| checkpoint.branch_id == guard.branch_id)
+                    || !self
+                        .scan_records::<LeaseRecord>(LEASE_PREFIX)
+                        .await?
+                        .is_empty()
+                    || self
+                        .scan_records::<BranchCreateOperation>(BRANCH_CREATE_OPERATION_PREFIX)
+                        .await?
+                        .iter()
+                        .any(|operation| {
+                            operation.parent_id == Some(guard.branch_id)
+                                && operation.phase != BranchCreatePhase::Published
+                        })
+                    || self
+                        .scan_records::<GcRunRecord>(GC_RUN_PREFIX)
+                        .await?
+                        .iter()
+                        .any(GcRunRecord::retains_roots)
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "local GC guard {} has an authoritative root blocker",
+                        guard.id
+                    )));
+                }
+                put_json(&mut batch, local_gc_guard_key(guard.id), &guard)?;
+            }
             CatalogMutation::RegisterPrivateEpoch(record) => {
                 record.validate()?;
                 ensure_initial_revision(record.revision)?;
@@ -423,6 +521,11 @@ impl SlateDbCatalog {
                         "private epoch {epoch}"
                     )));
                 }
+                if self.has_local_gc_guard_for_epoch(epoch).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {epoch} has an active local GC guard"
+                    )));
+                }
                 record.revision = record.revision.checked_add(1).ok_or_else(|| {
                     CatalogError::Corrupt("private epoch revision overflow".to_string())
                 })?;
@@ -464,6 +567,11 @@ impl SlateDbCatalog {
                 {
                     return Err(CatalogError::OperationConflict(format!(
                         "private epoch {epoch}"
+                    )));
+                }
+                if self.has_local_gc_guard_for_epoch(epoch).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {epoch} has an active local GC guard"
                     )));
                 }
                 record.revision = record.revision.checked_add(1).ok_or_else(|| {
@@ -508,6 +616,15 @@ impl SlateDbCatalog {
                     return Err(CatalogError::OperationConflict(operation.id.to_string()));
                 }
                 ensure_expected_revision(operation.expected_branch_revision, branch.revision)?;
+                if self
+                    .has_local_gc_guard_for_branch(operation.branch_id)
+                    .await?
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "branch {} has an active local GC guard",
+                        operation.branch_id
+                    )));
+                }
                 if operation.created_at < branch.created_at
                     || operation.created_at < branch.updated_at
                 {
@@ -665,7 +782,7 @@ impl SlateDbCatalog {
                     &lease.id.to_string(),
                 )
                 .await?;
-                match lease.subject_kind {
+                let lease_branch_id = match lease.subject_kind {
                     LeaseSubjectKind::Branch => {
                         let branch = self
                             .get_record::<BranchRecord>(branch_key(lease.subject_id))
@@ -677,6 +794,7 @@ impl SlateDbCatalog {
                         {
                             return Err(CatalogError::OperationConflict(lease.id.to_string()));
                         }
+                        branch.id
                     }
                     LeaseSubjectKind::Checkpoint => {
                         let checkpoint = self
@@ -689,7 +807,13 @@ impl SlateDbCatalog {
                         {
                             return Err(CatalogError::OperationConflict(lease.id.to_string()));
                         }
+                        checkpoint.branch_id
                     }
+                };
+                if self.has_local_gc_guard_for_branch(lease_branch_id).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "branch {lease_branch_id} has an active local GC guard"
+                    )));
                 }
                 put_json(&mut batch, lease_key(lease.id), &lease)?;
             }
@@ -868,10 +992,18 @@ impl SlateDbCatalog {
                     .ok_or_else(|| {
                         CatalogError::NotFound(operation.source_checkpoint_id.to_string())
                     })?;
-                if source.root != operation.source_root {
+                if source.root != operation.source_root
+                    || operation.parent_id != Some(source.branch_id)
+                {
                     return Err(CatalogError::OperationConflict(format!(
-                        "source checkpoint {} root changed",
+                        "source checkpoint {} identity changed",
                         source.id
+                    )));
+                }
+                if self.has_local_gc_guard_for_branch(source.branch_id).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "branch {} has an active local GC guard",
+                        source.branch_id
                     )));
                 }
                 if let Some(parent_id) = operation.parent_id {
@@ -1073,6 +1205,12 @@ impl SlateDbCatalog {
             CatalogMutation::CreateCheckpoint(record) => {
                 record.validate()?;
                 ensure_initial_revision(record.revision)?;
+                if self.has_local_gc_guard_for_branch(record.branch_id).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "branch {} has an active local GC guard",
+                        record.branch_id
+                    )));
+                }
                 ensure_resource_id_available(self.db.as_ref(), record.id).await?;
                 if !self
                     .get_record::<BranchRecord>(branch_key(record.branch_id))
@@ -1789,6 +1927,10 @@ fn private_epoch_key(epoch: u64) -> Bytes {
     joined_key(PRIVATE_EPOCH_PREFIX, format!("{epoch:016x}").as_bytes())
 }
 
+fn local_gc_guard_key(id: Uuid) -> Bytes {
+    joined_key(LOCAL_GC_GUARD_PREFIX, id.to_string().as_bytes())
+}
+
 fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
     let mut suffix = run_id.to_string().into_bytes();
     suffix.push(b'/');
@@ -1861,6 +2003,7 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         gc_run_key(id),
         lease_key(id),
         lease_tombstone_key(id),
+        local_gc_guard_key(id),
     ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
@@ -2780,6 +2923,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_gc_guard_is_durable_non_expiring_and_fences_root_exposure() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("local-gc-guard");
+        let catalog = SlateDbCatalog::open(path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let owner = branch("guard-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let opened_at = owner.updated_at + chrono::Duration::microseconds(1);
+        let epoch = private_epoch(owner.id, 91, opened_at);
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
+            .await
+            .unwrap();
+        let sealed_at = opened_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::SealPrivateEpoch {
+                epoch: epoch.epoch,
+                branch_id: owner.id,
+                expected_revision: epoch.revision,
+                sealed_at,
+            })
+            .await
+            .unwrap();
+
+        let lease = branch_lease(&owner, sealed_at);
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: owner.revision,
+                lease: lease.clone(),
+            })
+            .await
+            .unwrap();
+        let guard = LocalGcGuardRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            branch_id: owner.id,
+            epoch: epoch.epoch,
+            epoch_revision: 2,
+            candidate_count: 2,
+            candidate_digest: "a".repeat(64),
+            created_at: sealed_at + chrono::Duration::microseconds(1),
+        };
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLocalGcGuard(guard.clone()))
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        catalog
+            .apply(CatalogMutation::EndLease {
+                id: lease.id,
+                expected_revision: lease.revision,
+                token_hash: lease.token_hash.clone(),
+                ended_at: guard.created_at,
+            })
+            .await
+            .unwrap();
+
+        let guarded_generation = catalog
+            .apply(CatalogMutation::AcquireLocalGcGuard(guard.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::AcquireLocalGcGuard(guard.clone()))
+                .await
+                .unwrap(),
+            guarded_generation,
+            "exact guard retry is generation-neutral"
+        );
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ExposePrivateEpoch {
+                    epoch: epoch.epoch,
+                    branch_id: owner.id,
+                    expected_revision: 2,
+                    exposed_at: guard.created_at + chrono::Duration::microseconds(1),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLease {
+                    expected_subject_revision: owner.revision,
+                    lease: branch_lease(
+                        &owner,
+                        guard.created_at + chrono::Duration::microseconds(1)
+                    ),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::CreateCheckpoint(checkpoint(
+                    Uuid::new_v4(),
+                    owner.id,
+                    "guarded-checkpoint",
+                )))
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        let delete_at = guard.created_at + chrono::Duration::microseconds(2);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::StartBranchDelete {
+                    operation: BranchDeleteOperation {
+                        id: Uuid::new_v4(),
+                        revision: 1,
+                        branch_id: owner.id,
+                        branch_name: owner.name.clone(),
+                        expected_branch_revision: owner.revision,
+                        root: owner.root.clone().unwrap(),
+                        parent_id: owner.parent_id,
+                        origin_checkpoint_id: owner.origin_checkpoint_id,
+                        phase: BranchDeletePhase::Draining,
+                        created_at: delete_at,
+                        updated_at: delete_at,
+                    },
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        catalog.close().await.unwrap();
+
+        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.local_gc_guards[&guard.id], guard);
+        assert_eq!(
+            snapshot.private_epochs[&epoch.epoch].state,
+            PrivateEpochState::SealedPrivate
+        );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_gc_guard_blocks_root_created_clone_after_source_checkpoint_deletion() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("guard-source-clone");
+        let catalog = SlateDbCatalog::open(path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let source_branch = branch("clone-source-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(source_branch.clone()))
+            .await
+            .unwrap();
+        let source = checkpoint(Uuid::new_v4(), source_branch.id, "clone-source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (destination, operation) = reserved_create(&source, "incomplete-destination");
+        let wrong_parent = Uuid::new_v4();
+        let mut misbound_destination = destination.clone();
+        misbound_destination.parent_id = Some(wrong_parent);
+        let mut misbound_operation = operation.clone();
+        misbound_operation.parent_id = Some(wrong_parent);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch: misbound_destination,
+                    operation: Box::new(misbound_operation),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: destination,
+                operation: Box::new(operation.clone()),
+            })
+            .await
+            .unwrap();
+        let root_created_at = operation.updated_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::RecordBranchCreateRoot {
+                operation_id: operation.id,
+                expected_revision: operation.revision,
+                destination_root: DurableRoot {
+                    identity: "branches/incomplete-destination".to_string(),
+                    manifest_id: "manifest/incomplete-destination".to_string(),
+                },
+                updated_at: root_created_at,
+            })
+            .await
+            .unwrap();
+        let deleted_at = root_created_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::DeleteCheckpoint {
+                id: source.id,
+                expected_revision: source.revision,
+                name: source.name.clone(),
+                deleted_at,
+            })
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+
+        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+        let reopened = catalog.snapshot().await.unwrap();
+        assert_eq!(
+            reopened.tombstones[&source.id].parent_id,
+            operation.parent_id
+        );
+        assert_eq!(
+            reopened.branch_create_operations[&operation.id].phase,
+            BranchCreatePhase::RootCreated
+        );
+
+        let epoch = private_epoch(source_branch.id, 92, deleted_at);
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
+            .await
+            .unwrap();
+        let sealed_at = deleted_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::SealPrivateEpoch {
+                epoch: epoch.epoch,
+                branch_id: source_branch.id,
+                expected_revision: epoch.revision,
+                sealed_at,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLocalGcGuard(LocalGcGuardRecord {
+                    id: Uuid::new_v4(),
+                    revision: 1,
+                    branch_id: source_branch.id,
+                    epoch: epoch.epoch,
+                    epoch_revision: 2,
+                    candidate_count: 1,
+                    candidate_digest: "b".repeat(64),
+                    created_at: sealed_at + chrono::Duration::microseconds(1),
+                }))
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        catalog.snapshot().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn migrates_v1_records_before_reading_them() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("migration-v1-v2");
@@ -2840,7 +3233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v11_catalogs_to_private_epoch_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v12_catalogs_to_local_guard_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -2852,9 +3245,10 @@ mod tests {
             GC_QUARANTINE_SCHEMA_VERSION,
             GC_REVALIDATION_SCHEMA_VERSION,
             GC_DELETION_SCHEMA_VERSION,
+            PRIVATE_EPOCH_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v12"));
+            let path = Path::from(format!("migration-v{prior_version}-v13"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -2884,6 +3278,7 @@ mod tests {
             assert!(snapshot.leases.is_empty());
             assert!(snapshot.lease_tombstones.is_empty());
             assert!(snapshot.private_epochs.is_empty());
+            assert!(snapshot.local_gc_guards.is_empty());
             catalog.close().await.unwrap();
         }
     }
