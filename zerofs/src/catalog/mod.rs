@@ -13,6 +13,7 @@ mod json;
 mod lease;
 mod lifecycle;
 mod postgres;
+mod private_epoch;
 mod root_store;
 #[path = "slatedb.rs"]
 mod slate;
@@ -42,6 +43,9 @@ pub use lifecycle::{
     BranchLifecycleError,
 };
 pub use postgres::PostgresCatalogProjection;
+pub use private_epoch::{
+    PrivateEpochLifecycle, PrivateEpochLifecycleError, PrivateEpochRegisterRequest,
+};
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 

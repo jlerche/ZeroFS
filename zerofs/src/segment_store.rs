@@ -49,6 +49,19 @@ pub struct SegmentPoolAuthority {
     auth_key: [u8; 32],
 }
 
+/// Exact storage-authenticated identity of one branch-owned writer epoch.
+/// Callers must still consult authoritative lifecycle state before treating
+/// any segment in the epoch as private or reclaimable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+pub struct AuthenticatedBranchEpoch {
+    pub pool_id: uuid::Uuid,
+    pub epoch: u64,
+    pub reservation_id: uuid::Uuid,
+    pub database_identity: String,
+    pub branch_id: uuid::Uuid,
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SegmentEpochReservation {
     schema_version: u32,
@@ -441,6 +454,64 @@ impl SegmentStore {
         }
         Self::reserve_epoch_for_branch(object_store, authority, database_identity, Some(branch_id))
             .await
+    }
+
+    /// Authenticate one exact v2 branch-bound reservation directly from its
+    /// immutable pool marker. Legacy and ownerless markers remain valid for
+    /// global uniqueness, but can never produce private-ownership evidence.
+    #[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+    pub async fn authenticate_branch_epoch(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        epoch: u64,
+    ) -> Result<AuthenticatedBranchEpoch> {
+        if epoch == 0 {
+            return Err(SegmentStoreError::ObjectStore(
+                "branch-owned segment epoch must be nonzero".to_string(),
+            ));
+        }
+        let marker_path = Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json"));
+        let bytes = object_store
+            .get(&marker_path)
+            .await
+            .map_err(|error| {
+                SegmentStoreError::ObjectStore(format!(
+                    "branch-owned segment epoch {epoch} has no readable reservation: {error}"
+                ))
+            })?
+            .bytes()
+            .await
+            .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+        let marker: SegmentEpochReservation = serde_json::from_slice(&bytes).map_err(|error| {
+            SegmentStoreError::ObjectStore(format!(
+                "branch-owned segment epoch {epoch} has an invalid reservation marker: {error}"
+            ))
+        })?;
+        let branch_id = marker.branch_id.ok_or_else(|| {
+            SegmentStoreError::ObjectStore(format!(
+                "segment epoch {epoch} is global-only and has no authenticated branch owner"
+            ))
+        })?;
+        if marker.schema_version != SEGMENT_EPOCH_RESERVATION_VERSION
+            || marker.pool_id != authority.pool_id
+            || marker.epoch != epoch
+            || marker.reservation_id.is_nil()
+            || branch_id.is_nil()
+            || marker.database_identity.is_empty()
+            || marker.database_identity.len() > 4 * 1024
+            || !reservation_tag_is_valid(authority, &marker)
+        {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "branch-owned segment epoch {epoch} has a mismatched reservation marker"
+            )));
+        }
+        Ok(AuthenticatedBranchEpoch {
+            pool_id: marker.pool_id,
+            epoch: marker.epoch,
+            reservation_id: marker.reservation_id,
+            database_identity: marker.database_identity,
+            branch_id,
+        })
     }
 
     async fn reserve_epoch_for_branch(
@@ -1191,6 +1262,16 @@ mod tests {
         .await
         .unwrap();
         let segid = Segid::new(epoch, 0);
+        let authenticated =
+            SegmentStore::authenticate_branch_epoch(pool.clone(), &authority, epoch)
+                .await
+                .unwrap();
+        assert_eq!(authenticated.epoch, epoch);
+        assert_eq!(authenticated.branch_id, branch_id);
+        assert_eq!(
+            authenticated.database_identity,
+            "branches/exact-incarnation"
+        );
         pool.put(
             &Path::from(segid.object_key()),
             Bytes::from_static(b"branch-owned epoch segment").into(),
@@ -1211,7 +1292,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            SegmentStore::validate_epoch_reservations(pool, &authority)
+            SegmentStore::validate_epoch_reservations(pool.clone(), &authority)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched reservation marker")
+        );
+        assert!(
+            SegmentStore::authenticate_branch_epoch(pool, &authority, epoch)
                 .await
                 .unwrap_err()
                 .to_string()

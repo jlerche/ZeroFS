@@ -57,6 +57,17 @@ impl BranchLifecycle {
         super::RootCaptureLifecycle::new(Arc::clone(&self.catalog), self.roots.clone())
     }
 
+    /// Bind authenticated segment-pool reservations to this catalog's exact
+    /// branch incarnations. The resulting records are local SlateDB authority,
+    /// not part of the PostgreSQL/JSON customer projection.
+    pub fn private_epochs(
+        &self,
+        segment_pool: Arc<dyn object_store::ObjectStore>,
+        authority: crate::segment_store::SegmentPoolAuthority,
+    ) -> super::PrivateEpochLifecycle {
+        super::PrivateEpochLifecycle::new(Arc::clone(&self.catalog), segment_pool, authority)
+    }
+
     /// Resolve a checkpoint name once to its stable catalog UUID and exact
     /// SlateDB checkpoint/manifest identity, then use the same creation
     /// primitive as an already-resolved request.

@@ -411,6 +411,17 @@ Registration begins only in `open`; revision-fenced transitions are monotonic
 to `sealed_private` or permanently `exposed`. Branch deletion atomically exposes
 all remaining private epochs before fencing the branch. These records alone do
 not authorize deletion and are absent from PostgreSQL/JSON customer projections.
+
+Private registration is admitted only after rereading the permanent epoch
+marker and verifying its v2 HMAC with the segment-pool authority. Pool UUID,
+reservation UUID, branch UUID, epoch, and database identity are copied from that
+authenticated marker; caller-supplied branch and database identities must match
+exactly, and that database identity must equal the ready branch's authoritative
+root identity. Legacy v1 and ownerless v2 reservations remain global-only. Collection
+must authenticate the marker again, so registration is not deletion authority.
+An exact registration retry reconciles by immutable marker identity and original
+registration time, even if deletion has already advanced the record to
+`exposed`; it never requires or recreates the earlier `open` state.
 3. The collector holds an authoritative exclusion guard for that exact branch
    UUID, sealed epoch, and bounded batch. Guard acquisition and epoch-state
    validation are one atomic catalog transition. The guard is durable and does
