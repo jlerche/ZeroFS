@@ -50,7 +50,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 13;
+pub const CATALOG_SCHEMA_VERSION: u32 = 14;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -600,6 +600,87 @@ impl LocalGcGuardRecord {
             ));
         }
         validate_timestamp(self.created_at, "local GC guard created_at")
+    }
+}
+
+/// Durable bounded cursor and aggregate audit for one local-GC guard. Active
+/// progress keeps the matching guard present; the completed record is written
+/// in the same catalog mutation that retires that guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalGcProgressRecord {
+    pub id: Uuid,
+    pub revision: u64,
+    pub branch_id: Uuid,
+    pub epoch: u64,
+    pub epoch_revision: u64,
+    pub candidate_count: u32,
+    pub candidate_digest: String,
+    pub next_candidate: u32,
+    pub deleted_objects: u32,
+    pub deleted_bytes: u64,
+    pub already_absent: u32,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl LocalGcProgressRecord {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "local GC progress")?;
+        validate_revision(self.revision, "local GC progress")?;
+        validate_id(self.branch_id, "local GC progress branch")?;
+        if self.epoch == 0 || self.epoch_revision == 0 {
+            return Err(CatalogError::Invalid(
+                "local GC progress epoch identity must be nonzero".to_string(),
+            ));
+        }
+        if self.candidate_count == 0 || self.candidate_count > gc::MAX_DELETE_BATCH_SIZE {
+            return Err(CatalogError::Invalid(
+                "local GC progress candidate count is outside the safety bound".to_string(),
+            ));
+        }
+        if self.candidate_digest.len() != 64
+            || !self
+                .candidate_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::Invalid(
+                "local GC progress candidate digest must be 64 hexadecimal characters".to_string(),
+            ));
+        }
+        let classified = self
+            .deleted_objects
+            .checked_add(self.already_absent)
+            .ok_or_else(|| CatalogError::Invalid("local GC progress count overflow".to_string()))?;
+        if self.next_candidate > self.candidate_count || classified != self.next_candidate {
+            return Err(CatalogError::Invalid(
+                "local GC progress cursor disagrees with aggregate outcomes".to_string(),
+            ));
+        }
+        validate_times(self.started_at, self.updated_at, "local GC progress")?;
+        match self.completed_at {
+            Some(completed_at)
+                if completed_at == self.updated_at
+                    && self.next_candidate == self.candidate_count => {}
+            None if self.next_candidate < self.candidate_count => {}
+            _ => {
+                return Err(CatalogError::Invalid(
+                    "local GC completion disagrees with its bounded cursor".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_guard(&self, guard: &LocalGcGuardRecord) -> bool {
+        self.id == guard.id
+            && self.branch_id == guard.branch_id
+            && self.epoch == guard.epoch
+            && self.epoch_revision == guard.epoch_revision
+            && self.candidate_count == guard.candidate_count
+            && self.candidate_digest == guard.candidate_digest
+            && self.started_at >= guard.created_at
     }
 }
 
@@ -1329,6 +1410,8 @@ pub struct CatalogSnapshot {
     pub private_epochs: BTreeMap<u64, PrivateEpochRecord>,
     #[serde(default)]
     pub local_gc_guards: BTreeMap<Uuid, LocalGcGuardRecord>,
+    #[serde(default)]
+    pub local_gc_progress: BTreeMap<Uuid, LocalGcProgressRecord>,
 }
 
 impl Default for CatalogSnapshot {
@@ -1346,6 +1429,7 @@ impl Default for CatalogSnapshot {
             tombstones: BTreeMap::new(),
             private_epochs: BTreeMap::new(),
             local_gc_guards: BTreeMap::new(),
+            local_gc_progress: BTreeMap::new(),
         }
     }
 }
@@ -1414,6 +1498,11 @@ impl CatalogSnapshot {
             |record| record.id,
             LocalGcGuardRecord::validate,
         )?;
+        validate_records(
+            &self.local_gc_progress,
+            |record| record.id,
+            LocalGcProgressRecord::validate,
+        )?;
         for guard in self.local_gc_guards.values() {
             let epoch = self.private_epochs.get(&guard.epoch).ok_or_else(|| {
                 CatalogError::Corrupt(format!(
@@ -1433,6 +1522,21 @@ impl CatalogSnapshot {
                     "local GC guard {} lost its sealed exact branch epoch",
                     guard.id
                 )));
+            }
+        }
+        for progress in self.local_gc_progress.values() {
+            match (
+                progress.completed_at,
+                self.local_gc_guards.get(&progress.id),
+            ) {
+                (None, Some(guard)) if progress.matches_guard(guard) => {}
+                (Some(_), None) => {}
+                _ => {
+                    return Err(CatalogError::Corrupt(format!(
+                        "local GC progress {} disagrees with guard retirement",
+                        progress.id
+                    )));
+                }
             }
         }
         if self
@@ -1484,9 +1588,10 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let local_gc_guard_ids = self
+        let local_gc_ids = self
             .local_gc_guards
             .keys()
+            .chain(self.local_gc_progress.keys())
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         if !branch_ids.is_disjoint(&checkpoint_ids)
@@ -1517,14 +1622,14 @@ impl CatalogSnapshot {
             || !gc_run_ids.is_disjoint(&lease_ids)
             || !gc_run_ids.is_disjoint(&lease_tombstone_ids)
             || !gc_run_ids.is_disjoint(&tombstone_ids)
-            || !local_gc_guard_ids.is_disjoint(&branch_ids)
-            || !local_gc_guard_ids.is_disjoint(&checkpoint_ids)
-            || !local_gc_guard_ids.is_disjoint(&operation_ids)
-            || !local_gc_guard_ids.is_disjoint(&delete_operation_ids)
-            || !local_gc_guard_ids.is_disjoint(&gc_run_ids)
-            || !local_gc_guard_ids.is_disjoint(&lease_ids)
-            || !local_gc_guard_ids.is_disjoint(&lease_tombstone_ids)
-            || !local_gc_guard_ids.is_disjoint(&tombstone_ids)
+            || !local_gc_ids.is_disjoint(&branch_ids)
+            || !local_gc_ids.is_disjoint(&checkpoint_ids)
+            || !local_gc_ids.is_disjoint(&operation_ids)
+            || !local_gc_ids.is_disjoint(&delete_operation_ids)
+            || !local_gc_ids.is_disjoint(&gc_run_ids)
+            || !local_gc_ids.is_disjoint(&lease_ids)
+            || !local_gc_ids.is_disjoint(&lease_tombstone_ids)
+            || !local_gc_ids.is_disjoint(&tombstone_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -1694,6 +1799,7 @@ fn canonicalize_gc_root_pins(pins: &mut Vec<GcRootPin>) {
 #[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
 pub(crate) enum CatalogMutation {
     AcquireLocalGcGuard(LocalGcGuardRecord),
+    PublishLocalGcProgress(LocalGcProgressRecord),
     RegisterPrivateEpoch(PrivateEpochRecord),
     SealPrivateEpoch {
         epoch: u64,
@@ -2370,6 +2476,50 @@ mod tests {
                 },
                 created_at: now,
                 updated_at: now,
+            },
+        );
+        assert!(matches!(snapshot.validate(), Err(CatalogError::Corrupt(_))));
+    }
+
+    #[test]
+    fn snapshot_rejects_completed_local_gc_audit_id_collision() {
+        let id = Uuid::new_v4();
+        let now = catalog_timestamp(Utc::now());
+        let mut snapshot = CatalogSnapshot::default();
+        snapshot.branches.insert(
+            id,
+            BranchRecord {
+                id,
+                revision: 1,
+                name: "branch".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "branch-root".to_string(),
+                    manifest_id: "branch-manifest".to_string(),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        snapshot.local_gc_progress.insert(
+            id,
+            LocalGcProgressRecord {
+                id,
+                revision: 2,
+                branch_id: Uuid::new_v4(),
+                epoch: 1,
+                epoch_revision: 2,
+                candidate_count: 1,
+                candidate_digest: "a".repeat(64),
+                next_candidate: 1,
+                deleted_objects: 1,
+                deleted_bytes: 4096,
+                already_absent: 0,
+                started_at: now,
+                updated_at: now,
+                completed_at: Some(now),
             },
         );
         assert!(matches!(snapshot.validate(), Err(CatalogError::Corrupt(_))));

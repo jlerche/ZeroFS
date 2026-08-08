@@ -5,8 +5,9 @@ use super::{
     CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcDeletionPublication,
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
-    LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, PrivateEpochRecord, PrivateEpochState,
-    TombstoneKind, TombstoneRecord, validate_name, validate_root, validate_timestamp,
+    LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
+    PrivateEpochRecord, PrivateEpochState, TombstoneKind, TombstoneRecord, validate_name,
+    validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -36,6 +37,7 @@ const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
 const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
+const LOCAL_GC_PROGRESS_PREFIX: &[u8] = b"catalog/local-gc-progress/";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -48,6 +50,7 @@ const GC_QUARANTINE_SCHEMA_VERSION: u32 = 9;
 const GC_REVALIDATION_SCHEMA_VERSION: u32 = 10;
 const GC_DELETION_SCHEMA_VERSION: u32 = 11;
 const PRIVATE_EPOCH_SCHEMA_VERSION: u32 = 12;
+const LOCAL_GC_GUARD_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -151,6 +154,7 @@ impl SlateDbCatalog {
             GC_REVALIDATION_SCHEMA_VERSION,
             GC_DELETION_SCHEMA_VERSION,
             PRIVATE_EPOCH_SCHEMA_VERSION,
+            LOCAL_GC_GUARD_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -273,6 +277,9 @@ impl SlateDbCatalog {
         let local_gc_guards = self
             .scan_records::<LocalGcGuardRecord>(LOCAL_GC_GUARD_PREFIX)
             .await?;
+        let local_gc_progress = self
+            .scan_records::<LocalGcProgressRecord>(LOCAL_GC_PROGRESS_PREFIX)
+            .await?;
         let snapshot = CatalogSnapshot {
             schema_version: state.schema_version,
             generation: state.generation,
@@ -313,6 +320,10 @@ impl SlateDbCatalog {
                 .map(|record| (record.epoch, record))
                 .collect(),
             local_gc_guards: local_gc_guards
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            local_gc_progress: local_gc_progress
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -453,6 +464,66 @@ impl SlateDbCatalog {
                     )));
                 }
                 put_json(&mut batch, local_gc_guard_key(guard.id), &guard)?;
+            }
+            CatalogMutation::PublishLocalGcProgress(record) => {
+                record.validate()?;
+                let existing = self
+                    .get_record::<LocalGcProgressRecord>(local_gc_progress_key(record.id))
+                    .await?;
+                if existing.as_ref() == Some(&record) {
+                    return Ok(state.generation);
+                }
+                let guard = self
+                    .get_record::<LocalGcGuardRecord>(local_gc_guard_key(record.id))
+                    .await?
+                    .ok_or_else(|| {
+                        CatalogError::OperationConflict(format!(
+                            "local GC guard {} is not active",
+                            record.id
+                        ))
+                    })?;
+                if !record.matches_guard(&guard) {
+                    return Err(CatalogError::OperationConflict(record.id.to_string()));
+                }
+                match existing {
+                    None => {
+                        ensure_initial_revision(record.revision)?;
+                        if record.next_candidate != 0
+                            || record.deleted_objects != 0
+                            || record.deleted_bytes != 0
+                            || record.already_absent != 0
+                            || record.completed_at.is_some()
+                            || record.started_at != record.updated_at
+                        {
+                            return Err(CatalogError::OperationConflict(record.id.to_string()));
+                        }
+                    }
+                    Some(previous) => {
+                        let next_revision = previous.revision.checked_add(1).ok_or_else(|| {
+                            CatalogError::Corrupt("local GC progress revision overflow".to_string())
+                        })?;
+                        ensure_expected_revision(next_revision, record.revision)?;
+                        if previous.completed_at.is_some()
+                            || record.branch_id != previous.branch_id
+                            || record.epoch != previous.epoch
+                            || record.epoch_revision != previous.epoch_revision
+                            || record.candidate_count != previous.candidate_count
+                            || record.candidate_digest != previous.candidate_digest
+                            || record.started_at != previous.started_at
+                            || record.updated_at < previous.updated_at
+                            || record.next_candidate <= previous.next_candidate
+                            || record.deleted_objects < previous.deleted_objects
+                            || record.deleted_bytes < previous.deleted_bytes
+                            || record.already_absent < previous.already_absent
+                        {
+                            return Err(CatalogError::OperationConflict(record.id.to_string()));
+                        }
+                    }
+                }
+                put_json(&mut batch, local_gc_progress_key(record.id), &record)?;
+                if record.completed_at.is_some() {
+                    batch.delete(local_gc_guard_key(record.id));
+                }
             }
             CatalogMutation::RegisterPrivateEpoch(record) => {
                 record.validate()?;
@@ -1945,6 +2016,10 @@ fn local_gc_guard_key(id: Uuid) -> Bytes {
     joined_key(LOCAL_GC_GUARD_PREFIX, id.to_string().as_bytes())
 }
 
+fn local_gc_progress_key(id: Uuid) -> Bytes {
+    joined_key(LOCAL_GC_PROGRESS_PREFIX, id.to_string().as_bytes())
+}
+
 fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
     let mut suffix = run_id.to_string().into_bytes();
     suffix.push(b'/');
@@ -2018,6 +2093,7 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         lease_key(id),
         lease_tombstone_key(id),
         local_gc_guard_key(id),
+        local_gc_progress_key(id),
     ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
@@ -3115,6 +3191,84 @@ mod tests {
             snapshot.private_epochs[&epoch.epoch].state,
             PrivateEpochState::SealedPrivate
         );
+        let started_at = guard.created_at + chrono::Duration::microseconds(1);
+        let initial = LocalGcProgressRecord {
+            id: guard.id,
+            revision: 1,
+            branch_id: guard.branch_id,
+            epoch: guard.epoch,
+            epoch_revision: guard.epoch_revision,
+            candidate_count: guard.candidate_count,
+            candidate_digest: guard.candidate_digest.clone(),
+            next_candidate: 0,
+            deleted_objects: 0,
+            deleted_bytes: 0,
+            already_absent: 0,
+            started_at,
+            updated_at: started_at,
+            completed_at: None,
+        };
+        let initial_generation = catalog
+            .apply(CatalogMutation::PublishLocalGcProgress(initial.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::PublishLocalGcProgress(initial.clone()))
+                .await
+                .unwrap(),
+            initial_generation,
+            "exact local progress retry is generation-neutral"
+        );
+        let mut invalid = initial.clone();
+        invalid.revision = 2;
+        invalid.next_candidate = 1;
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::PublishLocalGcProgress(invalid))
+                .await,
+            Err(CatalogError::Invalid(_))
+        ));
+        let mut advanced = initial;
+        advanced.revision = 2;
+        advanced.next_candidate = 1;
+        advanced.deleted_objects = 1;
+        advanced.deleted_bytes = 4096;
+        advanced.updated_at += chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::PublishLocalGcProgress(advanced.clone()))
+            .await
+            .unwrap();
+        let mut completed = advanced;
+        completed.revision = 3;
+        completed.next_candidate = 2;
+        completed.already_absent = 1;
+        completed.updated_at += chrono::Duration::microseconds(1);
+        completed.completed_at = Some(completed.updated_at);
+        let completed_generation = catalog
+            .apply(CatalogMutation::PublishLocalGcProgress(completed.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::PublishLocalGcProgress(completed.clone()))
+                .await
+                .unwrap(),
+            completed_generation,
+            "lost completion response reconciles after guard retirement"
+        );
+        let completed_snapshot = catalog.snapshot().await.unwrap();
+        assert!(!completed_snapshot.local_gc_guards.contains_key(&guard.id));
+        assert_eq!(completed_snapshot.local_gc_progress[&guard.id], completed);
+        catalog
+            .apply(CatalogMutation::ExposePrivateEpoch {
+                epoch: epoch.epoch,
+                branch_id: owner.id,
+                expected_revision: 2,
+                exposed_at: completed.updated_at + chrono::Duration::microseconds(1),
+            })
+            .await
+            .unwrap();
         catalog.close().await.unwrap();
     }
 
@@ -3296,7 +3450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v12_catalogs_to_local_guard_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v13_catalogs_to_local_progress_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -3309,9 +3463,10 @@ mod tests {
             GC_REVALIDATION_SCHEMA_VERSION,
             GC_DELETION_SCHEMA_VERSION,
             PRIVATE_EPOCH_SCHEMA_VERSION,
+            LOCAL_GC_GUARD_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v13"));
+            let path = Path::from(format!("migration-v{prior_version}-v14"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -3342,6 +3497,7 @@ mod tests {
             assert!(snapshot.lease_tombstones.is_empty());
             assert!(snapshot.private_epochs.is_empty());
             assert!(snapshot.local_gc_guards.is_empty());
+            assert!(snapshot.local_gc_progress.is_empty());
             catalog.close().await.unwrap();
         }
     }

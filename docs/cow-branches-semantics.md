@@ -454,8 +454,16 @@ the absence of checkpoints, leases, incomplete clone-source operations, other
 root-retaining GC runs, or another guard for the epoch. A live guard blocks
 epoch exposure, branch deletion, checkpoint publication, clone-source capture,
 and new branch/checkpoint leases. It has no expiry or generic release operation;
-a later deletion-progress transition must account durably for every candidate
-before retirement can exist. PostgreSQL and JSON do not project guards.
+only a fully classified deletion-progress transition may account durably for
+every candidate and retire it. PostgreSQL and JSON do not project guards.
+
+Catalog schema v14 stores a separate bounded progress/audit record for each
+guard. Its cursor equals the aggregate deleted-plus-already-absent count and
+cannot exceed the guard's fixed candidate count. Progress revisions and
+timestamps are monotonic and keep the immutable branch, epoch, count, and
+candidate digest. The final fully classified update atomically writes the
+completed audit and retires the guard; an incomplete update cannot retire it,
+and an exact retry after an ambiguous completion response is generation-neutral.
 While a create operation is incomplete, its immutable `parent_id` is required
 to equal the authoritative source checkpoint's branch UUID. Snapshot validation
 rechecks that binding whenever the source checkpoint is live; after checkpoint
