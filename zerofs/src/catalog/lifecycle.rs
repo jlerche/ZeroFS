@@ -75,10 +75,14 @@ impl BranchLifecycle {
         &self,
         segment_pool: Arc<dyn object_store::ObjectStore>,
         authority: crate::segment_store::SegmentPoolAuthority,
+        branch_id: Uuid,
+        database_identity: String,
         extent_store: &crate::fs::store::ExtentStore,
-    ) -> super::PrivateEpochLifecycle {
-        self.private_epochs(segment_pool, authority)
-            .with_publisher(extent_store)
+    ) -> Result<super::PrivateEpochLifecycle, crate::fs::errors::FsError> {
+        extent_store.bind_private_owner(branch_id, database_identity)?;
+        Ok(self
+            .private_epochs(segment_pool, authority)
+            .with_publisher(extent_store))
     }
 
     /// Resolve a checkpoint name once to its stable catalog UUID and exact

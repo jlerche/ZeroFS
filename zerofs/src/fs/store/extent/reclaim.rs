@@ -99,9 +99,55 @@ pub(crate) struct PrivateGcCandidate {
 #[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
 pub(crate) struct PreparedPrivateGcBatch {
     pub(crate) publisher_id: uuid::Uuid,
+    pub(crate) branch_id: uuid::Uuid,
+    pub(crate) database_identity: String,
     pub(crate) epoch: u64,
     pub(crate) candidates: Vec<PrivateGcCandidate>,
     pub(crate) candidate_digest: String,
+}
+
+#[must_use = "persisted candidate authority must be attached to its catalog guard"]
+#[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
+pub(crate) struct PersistedPrivateGcArtifact {
+    guard_id: uuid::Uuid,
+    publisher_id: uuid::Uuid,
+    branch_id: uuid::Uuid,
+    database_identity: String,
+    epoch: u64,
+    candidate_count: u32,
+    candidate_digest: String,
+    _private: (),
+}
+
+#[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
+impl PersistedPrivateGcArtifact {
+    pub(crate) fn guard_id(&self) -> uuid::Uuid {
+        self.guard_id
+    }
+
+    pub(crate) fn publisher_id(&self) -> uuid::Uuid {
+        self.publisher_id
+    }
+
+    pub(crate) fn branch_id(&self) -> uuid::Uuid {
+        self.branch_id
+    }
+
+    pub(crate) fn database_identity(&self) -> &str {
+        &self.database_identity
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn candidate_count(&self) -> u32 {
+        self.candidate_count
+    }
+
+    pub(crate) fn candidate_digest(&self) -> &str {
+        &self.candidate_digest
+    }
 }
 
 fn private_candidate_digest(candidates: &[PrivateGcCandidate]) -> String {
@@ -128,6 +174,35 @@ fn private_candidate_digest(candidates: &[PrivateGcCandidate]) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
     encoded
+}
+
+fn encode_private_gc_artifact(guard_id: uuid::Uuid, batch: &PreparedPrivateGcBatch) -> Bytes {
+    let mut encoded = Vec::with_capacity(128 + batch.candidates.len() * 96);
+    encoded.extend_from_slice(b"ZFPGCA01");
+    encoded.extend_from_slice(guard_id.as_bytes());
+    encoded.extend_from_slice(batch.publisher_id.as_bytes());
+    encoded.extend_from_slice(batch.branch_id.as_bytes());
+    encoded.extend_from_slice(&(batch.database_identity.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(batch.database_identity.as_bytes());
+    encoded.extend_from_slice(&batch.epoch.to_be_bytes());
+    encoded.extend_from_slice(&(batch.candidates.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(batch.candidate_digest.as_bytes());
+    for candidate in &batch.candidates {
+        encoded.extend_from_slice(&candidate.segid.epoch.to_be_bytes());
+        encoded.extend_from_slice(&candidate.segid.counter.to_be_bytes());
+        encoded.extend_from_slice(&candidate.appended_bytes.to_be_bytes());
+        match &candidate.object_identity {
+            Some(identity) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&identity.size.to_be_bytes());
+                encoded.extend_from_slice(&identity.modified_seconds.to_be_bytes());
+                encoded.extend_from_slice(&identity.modified_nanos.to_be_bytes());
+                encoded.extend_from_slice(&identity.content_digest);
+            }
+            None => encoded.push(0),
+        }
+    }
+    Bytes::from(encoded)
 }
 
 /// What one reclaim pass did and whether it left actionable work behind —
@@ -170,8 +245,62 @@ pub enum PassStatus {
 }
 
 impl ExtentStore {
-    /// Build one deterministic bounded candidate set from an epoch the live
-    /// writer has already left. The exclusive publication and flush barriers
+    /// Publish the exact bounded candidate descriptor set under an immutable
+    /// operation key. Exact retries reconcile byte-for-byte; a conflicting use
+    /// of the UUID fails and cannot be attached to catalog authority.
+    #[allow(dead_code)] // The private catalog coordinator remains disabled.
+    pub(crate) async fn persist_private_gc_batch(
+        &self,
+        guard_id: uuid::Uuid,
+        batch: &PreparedPrivateGcBatch,
+    ) -> Result<PersistedPrivateGcArtifact, FsError> {
+        if guard_id.is_nil()
+            || self.private_publisher_identity().is_none_or(|identity| {
+                batch.publisher_id != identity.publisher_id
+                    || batch.branch_id != identity.branch_id
+                    || batch.database_identity != identity.database_identity
+            })
+            || batch.epoch == 0
+            || batch.candidates.is_empty()
+            || batch.candidates.len() > crate::fs::MAX_LOCAL_GC_CANDIDATES
+            || private_candidate_digest(&batch.candidates) != batch.candidate_digest
+        {
+            return Err(FsError::InvalidArgument);
+        }
+        self.segment_store()
+            .put_private_gc_artifact(guard_id, &encode_private_gc_artifact(guard_id, batch))
+            .await
+            .map_err(|_| FsError::IoError)?;
+        Ok(PersistedPrivateGcArtifact {
+            guard_id,
+            publisher_id: batch.publisher_id,
+            branch_id: batch.branch_id,
+            database_identity: batch.database_identity.clone(),
+            epoch: batch.epoch,
+            candidate_count: batch.candidates.len() as u32,
+            candidate_digest: batch.candidate_digest.clone(),
+            _private: (),
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // The standalone binary omits the catalog integration test.
+    pub(crate) async fn delete_prepared_private_candidates_for_test(
+        &self,
+        batch: &PreparedPrivateGcBatch,
+    ) {
+        for candidate in &batch.candidates {
+            self.segment_store()
+                .delete_segment(candidate.segid)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Build one deterministic bounded candidate set from a non-active epoch.
+    /// The catalog attachment later proves the writer actually left and sealed
+    /// it; globally unique reservations are intentionally not numerically
+    /// ordered. The exclusive publication and flush barriers
     /// make both the durable zero-live counters and forward-map verification
     /// one stable local observation. Ambiguous/corrupt/live objects are simply
     /// retained for global GC; storage errors abort the whole preparation.
@@ -185,9 +314,12 @@ impl ExtentStore {
         {
             return Err(FsError::InvalidArgument);
         }
+        let publisher = self
+            .private_publisher_identity()
+            .ok_or(FsError::InvalidArgument)?;
         let _refs = self.extent_ref_barrier.clone().write_owned().await;
         let _flush = self.db.flush_barrier().write_owned().await;
-        if epoch >= self.segment_store().epoch() {
+        if epoch == self.segment_store().epoch() {
             return Err(FsError::InvalidArgument);
         }
         // The flush is database-wide, not scoped to `epoch`: first make every
@@ -257,6 +389,8 @@ impl ExtentStore {
         let candidate_digest = private_candidate_digest(&candidates);
         Ok(PreparedPrivateGcBatch {
             publisher_id: self.publisher_id(),
+            branch_id: publisher.branch_id,
+            database_identity: publisher.database_identity,
             epoch,
             candidates,
             candidate_digest,
@@ -1431,6 +1565,9 @@ mod tests {
         );
         commit(&store, txn).await;
         let _receipt = store.rotate_writer_epoch(8).await.unwrap();
+        store
+            .bind_private_owner(uuid::Uuid::new_v4(), "test-database".to_string())
+            .unwrap();
         let successor_payload = Bytes::from_static(b"successor writer payload");
         let mut successor_txn = db.new_transaction().unwrap();
         let successor_tail = store
@@ -1482,6 +1619,30 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
         );
+        let guard_id = uuid::Uuid::new_v4();
+        let persisted = store
+            .persist_private_gc_batch(guard_id, &first)
+            .await
+            .unwrap();
+        assert_eq!(persisted.guard_id, guard_id);
+        assert_eq!(persisted.publisher_id, store.publisher_id());
+        assert_eq!(persisted.epoch, 7);
+        assert_eq!(persisted.candidate_count, 1);
+        assert_eq!(persisted.candidate_digest, first.candidate_digest);
+        let _retry = store
+            .persist_private_gc_batch(guard_id, &first)
+            .await
+            .expect("exact immutable artifact retry reconciles");
+
+        // The same operation UUID cannot be rebound after storage changes.
+        store.segments.delete_segment(dead).await.unwrap();
+        let changed = store.prepare_private_gc_batch(7, 1).await.unwrap();
+        assert_eq!(changed.candidates.len(), 1);
+        assert!(changed.candidates[0].object_identity.is_none());
+        assert!(matches!(
+            store.persist_private_gc_batch(guard_id, &changed).await,
+            Err(FsError::IoError)
+        ));
         assert!(matches!(
             store.prepare_private_gc_batch(8, 1).await,
             Err(FsError::InvalidArgument)

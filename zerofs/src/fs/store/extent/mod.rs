@@ -19,8 +19,9 @@ mod select;
 mod test_util;
 mod write;
 
-pub(crate) use reclaim::QUIESCENT_AFTER_DEFAULT;
 pub use reclaim::{ChainOutcome, PassOutcome, PassStatus};
+#[allow(unused_imports)] // The standalone binary does not compile the catalog consumer.
+pub(crate) use reclaim::{PersistedPrivateGcArtifact, QUIESCENT_AFTER_DEFAULT};
 
 use crate::db::{Db, ExtentRefGuard, Transaction};
 use crate::frame_codec::FrameCodec;
@@ -51,6 +52,8 @@ use write::{MAX_INFLIGHT_SEALS, OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
+const MAX_PRIVATE_DATABASE_IDENTITY_BYTES: usize = 4 * 1024;
+
 pub(super) const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 
 /// What a `write` leaves for the tail cache. Applied by the caller only after
@@ -71,6 +74,13 @@ pub(crate) struct PublisherDrainReceipt {
     pub(crate) old_epoch: u64,
     pub(crate) next_epoch: u64,
     _private: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrivatePublisherIdentity {
+    pub(crate) publisher_id: Uuid,
+    pub(crate) branch_id: Uuid,
+    pub(crate) database_identity: String,
 }
 
 struct RotatingSegmentStore {
@@ -137,6 +147,7 @@ pub struct ExtentStore {
     /// A separately constructed store over the same epoch pair gets a different
     /// identity and cannot satisfy the catalog's publisher binding.
     publisher_id: Arc<Uuid>,
+    private_owner: Arc<std::sync::OnceLock<(Uuid, String)>>,
     /// Same per-inode write lock the foreground path uses, so the coalescer's
     /// conditional swap can't be clobbered by a concurrent write.
     lock_manager: Arc<KeyedLockManager<InodeId>>,
@@ -223,6 +234,7 @@ impl ExtentStore {
             key_codec,
             segments: Arc::new(RotatingSegmentStore::new(segments)),
             publisher_id: Arc::new(Uuid::new_v4()),
+            private_owner: Arc::new(std::sync::OnceLock::new()),
             lock_manager,
             codec,
             open,
@@ -256,6 +268,38 @@ impl ExtentStore {
 
     pub(crate) fn publisher_id(&self) -> Uuid {
         *self.publisher_id
+    }
+
+    #[allow(dead_code)] // The standalone server remains ownerless/global-only.
+    pub(crate) fn bind_private_owner(
+        &self,
+        branch_id: Uuid,
+        database_identity: String,
+    ) -> Result<(), FsError> {
+        if branch_id.is_nil()
+            || database_identity.is_empty()
+            || database_identity.len() > MAX_PRIVATE_DATABASE_IDENTITY_BYTES
+            || database_identity.chars().any(char::is_control)
+        {
+            return Err(FsError::InvalidArgument);
+        }
+        match self
+            .private_owner
+            .set((branch_id, database_identity.clone()))
+        {
+            Ok(()) => Ok(()),
+            Err(_) if self.private_owner.get() == Some(&(branch_id, database_identity)) => Ok(()),
+            Err(_) => Err(FsError::InvalidArgument),
+        }
+    }
+
+    pub(crate) fn private_publisher_identity(&self) -> Option<PrivatePublisherIdentity> {
+        let (branch_id, database_identity) = self.private_owner.get()?.clone();
+        Some(PrivatePublisherIdentity {
+            publisher_id: self.publisher_id(),
+            branch_id,
+            database_identity,
+        })
     }
 
     /// Rotate allocation to a previously reserved epoch while holding the
@@ -411,6 +455,12 @@ impl ExtentStore {
         );
         drop(extent_ref_guard);
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // The standalone binary omits the catalog integration test.
+    pub(crate) async fn commit_test_transaction(&self, txn: Transaction) -> Result<(), FsError> {
+        self.commit_via_coordinator(txn).await
     }
 
     /// Test-only: lower the seal threshold so seal-path tests don't build a full

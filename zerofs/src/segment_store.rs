@@ -34,6 +34,7 @@ const SEGMENT_POOL_GENESIS_PATH: &str = "segment-pool-genesis.json";
 const SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
 const SEGMENT_POOL_AUTH_INFO: &[u8] = b"zerofs-v1-segment-pool-authority";
 const SEGMENT_UPLOAD_PREFIX: &str = "segment-uploads";
+const PRIVATE_GC_ARTIFACT_PREFIX: &str = "private-gc-artifacts";
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SegmentPoolGenesis {
@@ -666,6 +667,16 @@ impl SegmentStore {
             Ok(_) => Ok(()),
             Err(error) => self.reconcile_segment_create(path, bytes, error).await,
         }
+    }
+
+    #[allow(dead_code)] // Used by the disabled private-epoch collector coordinator.
+    pub(crate) async fn put_private_gc_artifact(
+        &self,
+        guard_id: uuid::Uuid,
+        bytes: &Bytes,
+    ) -> Result<()> {
+        let path = Path::from(format!("{PRIVATE_GC_ARTIFACT_PREFIX}/{guard_id}.bin"));
+        self.put_segment_create(&path, bytes).await
     }
 
     async fn reconcile_segment_create(

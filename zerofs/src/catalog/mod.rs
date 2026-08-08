@@ -45,7 +45,7 @@ pub use lifecycle::{
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
     PrivateEpochLifecycle, PrivateEpochLifecycleError, PrivateEpochRegisterRequest,
-    PrivateEpochSealRequest,
+    PrivateEpochSealRequest, PrivateGcGuardRequest,
 };
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;

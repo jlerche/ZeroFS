@@ -465,8 +465,8 @@ candidate digest. The final fully classified update atomically writes the
 completed audit and retires the guard; an incomplete update cannot retire it,
 and an exact retry after an ambiguous completion response is generation-neutral.
 
-Private candidate preparation accepts only a nonzero epoch older than the live
-writer and runs under the exclusive FrameLoc-publication and database-flush
+Private candidate preparation accepts only a nonzero epoch different from the
+live writer and runs under the exclusive FrameLoc-publication and database-flush
 barriers. It seals the active successor before the database-wide metadata flush,
 so unrelated current-epoch pointers cannot become durable before their object.
 It then streams the durable exact-epoch segment counters, sorts zero-live
@@ -478,6 +478,29 @@ candidate-set digest; unreadable or still-referenced objects are retained.
 Preparation is not deletion authority by itself, and local deletion remains
 disabled until the artifact, guard, progress, and barrier-through-delete worker
 are wired as one crash-recoverable lifecycle.
+
+The prepared descriptors can be published under an immutable
+`private-gc-artifacts/<guard UUID>.bin` key. Before preparation, the live extent
+store is permanently bound to one exact branch UUID and database identity. The
+canonical bounded encoding binds that owner capability together with the guard
+UUID, exact live publisher identity, epoch, candidate digest, and every object
+descriptor. Conditional create plus byte-for-byte reconciliation makes an exact
+lost-response retry safe and rejects UUID reuse with different bytes. Only an
+opaque receipt from that successful publication can enter guard acquisition.
+The lifecycle requires the receipt's publisher, branch UUID, and database
+identity to match its bound live writer and the requested branch, then
+reauthenticates the permanent branch-epoch marker and exact authoritative
+`sealed_private` revision before the atomic catalog mutation rechecks root
+blockers. Thus same-pool credentials cannot attach branch A's local candidates
+to a valid epoch owned by branch B. The artifact and guard remain
+SlateDB/object-store authority and are not projected to PostgreSQL or JSON.
+Physical deletion remains disabled pending durable artifact decode/recovery and
+the barrier-through-delete worker.
+
+Epoch reservations are globally unique but not numerically ordered. No local-GC
+decision interprets a smaller integer as older: preparation excludes the exact
+active writer, and authoritative guard attachment proves the requested term was
+actually rotated away and sealed.
 While a create operation is incomplete, its immutable `parent_id` is required
 to equal the authoritative source checkpoint's branch UUID. Snapshot validation
 rechecks that binding whenever the source checkpoint is live; after checkpoint
