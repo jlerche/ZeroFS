@@ -494,6 +494,8 @@ impl SlateDbCatalog {
                 epoch,
                 branch_id,
                 expected_revision,
+                next_epoch,
+                expected_next_revision,
                 sealed_at,
             } => {
                 validate_timestamp(sealed_at, "private epoch sealed_at")?;
@@ -509,9 +511,21 @@ impl SlateDbCatalog {
                     return Ok(state.generation);
                 }
                 ensure_expected_revision(expected_revision, record.revision)?;
+                let next = self
+                    .get_record::<PrivateEpochRecord>(private_epoch_key(next_epoch))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(format!("private epoch {next_epoch}")))?;
+                next.validate()?;
+                ensure_expected_revision(expected_next_revision, next.revision)?;
                 if record.branch_id != branch_id
                     || record.state != PrivateEpochState::Open
+                    || next_epoch == epoch
+                    || next.branch_id != branch_id
+                    || next.state != PrivateEpochState::Open
+                    || next.pool_id != record.pool_id
+                    || next.database_identity != record.database_identity
                     || sealed_at < record.updated_at
+                    || sealed_at < next.created_at
                     || !self
                         .get_record::<BranchRecord>(branch_key(branch_id))
                         .await?
@@ -2815,11 +2829,45 @@ mod tests {
         ));
 
         let sealed_at = opened_at + chrono::Duration::microseconds(1);
+        let mut second = private_epoch(owner.id, 42, sealed_at);
+        second.pool_id = record.pool_id;
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(second.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::SealPrivateEpoch {
+                    epoch: record.epoch,
+                    branch_id: owner.id,
+                    expected_revision: record.revision,
+                    next_epoch: second.epoch,
+                    expected_next_revision: second.revision + 1,
+                    sealed_at,
+                })
+                .await,
+            Err(CatalogError::RevisionConflict {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert_eq!(
+            catalog
+                .private_epoch(record.epoch)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PrivateEpochState::Open,
+            "a stale successor revision must atomically reject the old-epoch seal"
+        );
         catalog
             .apply(CatalogMutation::SealPrivateEpoch {
                 epoch: record.epoch,
                 branch_id: owner.id,
                 expected_revision: 1,
+                next_epoch: second.epoch,
+                expected_next_revision: second.revision,
                 sealed_at,
             })
             .await
@@ -2833,6 +2881,8 @@ mod tests {
                     epoch: record.epoch,
                     branch_id: Uuid::new_v4(),
                     expected_revision: 2,
+                    next_epoch: second.epoch,
+                    expected_next_revision: second.revision,
                     sealed_at,
                 })
                 .await,
@@ -2859,17 +2909,14 @@ mod tests {
                     epoch: record.epoch,
                     branch_id: owner.id,
                     expected_revision: 3,
+                    next_epoch: second.epoch,
+                    expected_next_revision: second.revision,
                     sealed_at: exposed_at + chrono::Duration::microseconds(1),
                 })
                 .await,
             Err(CatalogError::OperationConflict(_))
         ));
 
-        let second = private_epoch(owner.id, 42, exposed_at);
-        catalog
-            .apply(CatalogMutation::RegisterPrivateEpoch(second.clone()))
-            .await
-            .unwrap();
         let delete_at = catalog_timestamp(Utc::now());
         let operation = BranchDeleteOperation {
             id: Uuid::new_v4(),
@@ -2936,8 +2983,14 @@ mod tests {
             .unwrap();
         let opened_at = owner.updated_at + chrono::Duration::microseconds(1);
         let epoch = private_epoch(owner.id, 91, opened_at);
+        let mut next_epoch = private_epoch(owner.id, 92, opened_at);
+        next_epoch.pool_id = epoch.pool_id;
         catalog
             .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(next_epoch.clone()))
             .await
             .unwrap();
         let sealed_at = opened_at + chrono::Duration::microseconds(1);
@@ -2946,6 +2999,8 @@ mod tests {
                 epoch: epoch.epoch,
                 branch_id: owner.id,
                 expected_revision: epoch.revision,
+                next_epoch: next_epoch.epoch,
+                expected_next_revision: next_epoch.revision,
                 sealed_at,
             })
             .await
@@ -3139,8 +3194,14 @@ mod tests {
         );
 
         let epoch = private_epoch(source_branch.id, 92, deleted_at);
+        let mut next_epoch = private_epoch(source_branch.id, 93, deleted_at);
+        next_epoch.pool_id = epoch.pool_id;
         catalog
             .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(next_epoch.clone()))
             .await
             .unwrap();
         let sealed_at = deleted_at + chrono::Duration::microseconds(1);
@@ -3149,6 +3210,8 @@ mod tests {
                 epoch: epoch.epoch,
                 branch_id: source_branch.id,
                 expected_revision: epoch.revision,
+                next_epoch: next_epoch.epoch,
+                expected_next_revision: next_epoch.revision,
                 sealed_at,
             })
             .await

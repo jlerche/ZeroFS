@@ -422,6 +422,22 @@ must authenticate the marker again, so registration is not deletion authority.
 An exact registration retry reconciles by immutable marker identity and original
 registration time, even if deletion has already advanced the record to
 `exposed`; it never requires or recreates the earlier `open` state.
+
+Sealing is reachable only through a filesystem-issued publisher-drain receipt.
+The filesystem serializes rotations, takes the FrameLoc publication barrier and
+database flush barrier exclusively, drains every in-flight/background seal,
+PUTs the old open segment, flushes its metadata, and installs a fresh counter
+namespace in an already-reserved successor epoch before writers resume. The
+catalog lifecycle used for sealing is first bound to that exact live
+`ExtentStore` publisher-instance capability. It rejects a receipt from any
+separately constructed store, even for the same epoch pair. It then
+reauthenticates both permanent branch-bound markers, requires both records to
+name the same exact ready branch/database/pool and the successor to remain
+`open`, and consumes the receipt's publisher identity and exact old/new epoch
+pair for one atomic transition that revision-fences both records while changing
+only the old epoch to `sealed_private`. Concurrent rotations form a strict epoch chain. A crash
+after rotation but before catalog sealing leaves the old epoch `open` and thus
+global-only; it never guesses or reconstructs local-GC eligibility.
 3. The collector holds an authoritative exclusion guard for that exact branch
    UUID, sealed epoch, and bounded batch. Guard acquisition and epoch-state
    validation are one atomic catalog transition. The guard is durable and does

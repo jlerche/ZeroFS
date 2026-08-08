@@ -219,7 +219,7 @@ impl ExtentStore {
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
             (
-                self.segments.epoch(),
+                self.segment_store().epoch(),
                 self.open.lock().unwrap().segid.counter,
             )
         };
@@ -483,7 +483,7 @@ impl ExtentStore {
                 fail_point!(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE);
                 fp::widen(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE).await;
             }
-            if let Err(e) = self.segments.delete_segment(segid).await {
+            if let Err(e) = self.segment_store().delete_segment(segid).await {
                 // Don't abort the pass: already-deleted segments still need
                 // their counters dropped. This one retries next pass.
                 error!("segment GC: delete of {segid:?} failed: {e}; skipping (retried next pass)");
@@ -813,7 +813,7 @@ impl ExtentStore {
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
             (
-                self.segments.epoch(),
+                self.segment_store().epoch(),
                 self.open.lock().unwrap().segid.counter,
             )
         };
@@ -828,7 +828,8 @@ impl ExtentStore {
         // orphan candidate. Cap the buffered set; the rest sweep next cadence.
         let mut orphans: Vec<Segid> = Vec::new();
         let mut scanned = 0usize;
-        let stream = self.segments.list_segments_stream();
+        let segments = self.segment_store();
+        let stream = segments.list_segments_stream();
         futures::pin_mut!(stream);
         while let Some(result) = futures::StreamExt::next(&mut stream).await {
             let (segid, _size, mtime) = result.map_err(|_| FsError::IoError)?;
@@ -874,7 +875,7 @@ impl ExtentStore {
                     continue;
                 }
             }
-            if let Err(e) = self.segments.delete_segment(segid).await {
+            if let Err(e) = self.segment_store().delete_segment(segid).await {
                 error!(
                     "orphan sweep: delete of {segid:?} failed: {e}; skipping (retried next sweep)"
                 );
@@ -950,7 +951,7 @@ impl ExtentStore {
     /// case this verify exists to catch, where a crash after the delete would
     /// leave the durable pointer dangling).
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
-        let dir = match self.segments.read_directory(segid).await {
+        let dir = match self.segment_store().read_directory(segid).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
             // Transient read error: fail-closed, keep the segment.

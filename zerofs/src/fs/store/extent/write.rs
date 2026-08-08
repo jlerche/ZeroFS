@@ -310,7 +310,7 @@ impl ExtentStore {
             s.iter().map(|(seg, b)| (*seg, b.clone())).collect()
         };
         for (segid, bytes) in pending {
-            self.segments
+            self.segment_store()
                 .put_segment(segid, bytes)
                 .await
                 .map_err(|_| FsError::IoError)?;
@@ -338,7 +338,7 @@ impl ExtentStore {
                 let k = open.dir.len() as u32;
                 let buf = std::mem::take(&mut open.buf);
                 open.dir.clear();
-                open.segid = self.segments.next_segid();
+                open.segid = self.segment_store().next_segid();
                 debug_assert_ne!(
                     open.segid, segid,
                     "rotated open segid must differ from the sealed one"
@@ -355,7 +355,7 @@ impl ExtentStore {
             }
         };
         if let Some((segid, bytes)) = current {
-            self.segments
+            self.segment_store()
                 .put_segment(segid, bytes)
                 .await
                 .map_err(|_| FsError::IoError)?;
@@ -391,7 +391,7 @@ impl ExtentStore {
             let k = open.dir.len() as u32;
             let buf = std::mem::take(&mut open.buf);
             open.dir.clear();
-            open.segid = self.segments.next_segid();
+            open.segid = self.segment_store().next_segid();
             debug_assert_ne!(
                 open.segid, segid,
                 "rotated open segid must differ from the sealed one"
@@ -411,7 +411,7 @@ impl ExtentStore {
         let Some((segid, bytes)) = prepared else {
             return;
         };
-        let segments = self.segments.clone();
+        let segments = self.segment_store();
         let sealing = self.sealing.clone();
         crate::task::spawn_named("segment-seal", async move {
             match segments.put_segment(segid, bytes).await {

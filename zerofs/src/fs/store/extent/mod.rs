@@ -31,6 +31,7 @@ use crate::fs::metrics::{SegmentFootprint, SegmentGcStats};
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::segment::Segid;
 use crate::segment_store::SegmentStore;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use foyer::{Cache, CacheBuilder};
@@ -44,6 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::error;
+use uuid::Uuid;
 pub(crate) use write::SEAL_THRESHOLD;
 use write::{MAX_INFLIGHT_SEALS, OpenSegment, TAIL_CACHE_BYTES};
 
@@ -57,6 +59,57 @@ pub enum TailUpdate {
     Set { extent_idx: u64, data: Bytes },
     Clear,
     Keep,
+}
+
+/// Move-only evidence that the filesystem rotated away from `old_epoch` while
+/// holding both publication barriers, durably flushed every old reference, and
+/// installed `next_epoch` before writers resumed.
+#[must_use = "the receipt must be consumed by private-epoch sealing"]
+#[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+pub(crate) struct PublisherDrainReceipt {
+    pub(crate) publisher_id: Uuid,
+    pub(crate) old_epoch: u64,
+    pub(crate) next_epoch: u64,
+    _private: (),
+}
+
+struct RotatingSegmentStore {
+    current: ArcSwap<SegmentStore>,
+}
+
+impl RotatingSegmentStore {
+    fn new(current: Arc<SegmentStore>) -> Self {
+        Self {
+            current: ArcSwap::from(current),
+        }
+    }
+
+    fn load(&self) -> Arc<SegmentStore> {
+        self.current.load_full()
+    }
+
+    #[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+    fn store(&self, next: Arc<SegmentStore>) {
+        self.current.store(next);
+    }
+
+    #[cfg(test)]
+    async fn list_segments(&self) -> Result<Vec<Segid>, crate::segment_store::SegmentStoreError> {
+        self.load().list_segments().await
+    }
+
+    #[cfg(test)]
+    fn read_calls(&self) -> u64 {
+        self.load().read_calls()
+    }
+
+    #[cfg(test)]
+    async fn delete_segment(
+        &self,
+        segid: Segid,
+    ) -> Result<(), crate::segment_store::SegmentStoreError> {
+        self.load().delete_segment(segid).await
+    }
 }
 
 /// Human-readable byte size for log lines, e.g. "3.1 GiB". Display-only.
@@ -79,7 +132,11 @@ pub(crate) fn human_bytes(n: u64) -> String {
 pub struct ExtentStore {
     db: Arc<Db>,
     key_codec: Arc<KeyCodec>,
-    segments: Arc<SegmentStore>,
+    segments: Arc<RotatingSegmentStore>,
+    /// Process-unique capability shared by clones of this exact live writer.
+    /// A separately constructed store over the same epoch pair gets a different
+    /// identity and cannot satisfy the catalog's publisher binding.
+    publisher_id: Arc<Uuid>,
     /// Same per-inode write lock the foreground path uses, so the coalescer's
     /// conditional swap can't be clobbered by a concurrent write.
     lock_manager: Arc<KeyedLockManager<InodeId>>,
@@ -164,7 +221,8 @@ impl ExtentStore {
         Self {
             db,
             key_codec,
-            segments,
+            segments: Arc::new(RotatingSegmentStore::new(segments)),
+            publisher_id: Arc::new(Uuid::new_v4()),
             lock_manager,
             codec,
             open,
@@ -190,6 +248,49 @@ impl ExtentStore {
     /// Reclaim/compaction metrics holder, for the Prometheus bridge.
     pub fn segment_gc_stats(&self) -> Arc<SegmentGcStats> {
         Arc::clone(&self.segment_gc_stats)
+    }
+
+    fn segment_store(&self) -> Arc<SegmentStore> {
+        self.segments.load()
+    }
+
+    pub(crate) fn publisher_id(&self) -> Uuid {
+        *self.publisher_id
+    }
+
+    /// Rotate allocation to a previously reserved epoch while holding the
+    /// complete FrameLoc publication and database flush barriers.
+    #[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+    pub(crate) async fn rotate_writer_epoch(
+        &self,
+        next_epoch: u64,
+    ) -> Result<PublisherDrainReceipt, FsError> {
+        if next_epoch == 0 {
+            return Err(FsError::InvalidArgument);
+        }
+        let _refs = self.extent_ref_barrier.clone().write_owned().await;
+        let _flush = self.db.flush_barrier().write_owned().await;
+        let _append = self.append_gate.lock().await;
+        let current = self.segment_store();
+        let old_epoch = current.epoch();
+        if next_epoch == old_epoch {
+            return Err(FsError::InvalidArgument);
+        }
+        self.seal_open().await?;
+        self.db.flush().await.map_err(|_| FsError::IoError)?;
+        let next = Arc::new(current.rotated(next_epoch));
+        {
+            let mut open = self.open.lock().unwrap();
+            debug_assert!(open.dir.is_empty() && open.buf.is_empty());
+            open.segid = next.next_segid();
+        }
+        self.segments.store(next);
+        Ok(PublisherDrainReceipt {
+            publisher_id: self.publisher_id(),
+            old_epoch,
+            next_epoch,
+            _private: (),
+        })
     }
 
     async fn new_extent_ref_guard(&self) -> ExtentRefGuard {
@@ -329,6 +430,47 @@ impl ExtentStore {
 mod tests {
     use super::test_util::*;
     use super::*;
+
+    #[tokio::test]
+    async fn writer_epoch_rotation_drains_old_publications_before_switching() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, b"old epoch").await;
+        let old = frameloc_of(&store, &db, 1, 0).await.unwrap();
+        assert_eq!(old.segid.epoch, 7);
+
+        let receipt = store.rotate_writer_epoch(8).await.unwrap();
+        assert_eq!(receipt.old_epoch, 7);
+        assert_eq!(receipt.next_epoch, 8);
+        assert_eq!(store.unflushed_bytes(), 0);
+
+        write_and_check(&store, &db, &mut model, EXTENT_SIZE, b"new epoch").await;
+        let new = frameloc_of(&store, &db, 1, 1).await.unwrap();
+        assert_eq!(new.segid.epoch, 8);
+        assert_eq!(frameloc_of(&store, &db, 1, 0).await.unwrap(), old);
+        store.seal_open().await.unwrap();
+        assert_read_matches(&store, &model).await;
+
+        let hold = store.extent_ref_barrier.clone().read_owned().await;
+        let first_store = store.clone();
+        let first = tokio::spawn(async move { first_store.rotate_writer_epoch(9).await.unwrap() });
+        let second_store = store.clone();
+        let second =
+            tokio::spawn(async move { second_store.rotate_writer_epoch(10).await.unwrap() });
+        tokio::task::yield_now().await;
+        drop(hold);
+        let receipts = [first.await.unwrap(), second.await.unwrap()];
+        let initial = receipts
+            .iter()
+            .find(|receipt| receipt.old_epoch == 8)
+            .unwrap();
+        let later = receipts
+            .iter()
+            .find(|receipt| receipt.old_epoch != 8)
+            .unwrap();
+        assert_eq!(later.old_epoch, initial.next_epoch);
+        db.close().await.unwrap();
+    }
 
     // The footprint gauges are maintained incrementally off the commit path, so
     // they must track writes and overwrites with no reclaim pass, and always

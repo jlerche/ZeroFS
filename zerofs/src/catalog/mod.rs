@@ -45,6 +45,7 @@ pub use lifecycle::{
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
     PrivateEpochLifecycle, PrivateEpochLifecycleError, PrivateEpochRegisterRequest,
+    PrivateEpochSealRequest,
 };
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
@@ -1698,6 +1699,8 @@ pub(crate) enum CatalogMutation {
         epoch: u64,
         branch_id: Uuid,
         expected_revision: u64,
+        next_epoch: u64,
+        expected_next_revision: u64,
         sealed_at: DateTime<Utc>,
     },
     ExposePrivateEpoch {

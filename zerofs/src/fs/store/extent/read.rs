@@ -91,7 +91,7 @@ impl ExtentStore {
             Self::validate_extent_frame(id, extent_idx, &frame)?;
             return Ok(Some(frame));
         }
-        match self.segments.read_extent(loc, id, extent_idx).await {
+        match self.segment_store().read_extent(loc, id, extent_idx).await {
             Ok(b) => {
                 Self::validate_extent_frame(id, extent_idx, &b)?;
                 Ok(Some(b))
@@ -121,7 +121,11 @@ impl ExtentStore {
                             Self::validate_extent_frame(id, extent_idx, &frame)?;
                             return Ok(Some(frame));
                         }
-                        match self.segments.read_extent(new_loc, id, extent_idx).await {
+                        match self
+                            .segment_store()
+                            .read_extent(new_loc, id, extent_idx)
+                            .await
+                        {
                             Ok(b) => {
                                 Self::validate_extent_frame(id, extent_idx, &b)?;
                                 Ok(Some(b))
@@ -463,7 +467,7 @@ impl ExtentStore {
                     // A GET error is swallowed: a compaction repoint+delete can 404
                     // this run's segment out from under us. Fall back to per-extent
                     // reads via `get`, which re-resolves each FrameLoc.
-                    self.segments
+                    self.segment_store()
                         .read_run(
                             first.segid,
                             first.byte_offset,

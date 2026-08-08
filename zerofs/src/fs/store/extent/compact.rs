@@ -249,7 +249,7 @@ impl ExtentStore {
         gathered: &mut u64,
     ) -> Result<(), FsError> {
         let dir = self
-            .segments
+            .segment_store()
             .read_directory(segid)
             .await
             .map_err(|_| FsError::IoError)?;
@@ -324,7 +324,7 @@ impl ExtentStore {
                 let store = self.clone();
                 async move {
                     let payloads = store
-                        .segments
+                        .segment_store()
                         .read_compressed_run(segid, byte_offset, total_len, first_frame, &slots)
                         .await
                         .map_err(|_| FsError::IoError)?;
@@ -366,7 +366,7 @@ impl ExtentStore {
         let extent_ref_guard = self.new_extent_ref_guard().await;
         let batch_len = batch.len();
         let new_locs = self
-            .segments
+            .segment_store()
             .seal_compressed(batch)
             .await
             .map_err(|_| FsError::IoError)?;
@@ -441,7 +441,7 @@ impl ExtentStore {
         let orphaned = swapped == 0;
         let mut orphan_note = "";
         if orphaned && let Some(segid) = new_segid {
-            orphan_note = match self.segments.delete_segment(segid).await {
+            orphan_note = match self.segment_store().delete_segment(segid).await {
                 Ok(()) => " (orphan, deleted)",
                 Err(e) => {
                     warn!(

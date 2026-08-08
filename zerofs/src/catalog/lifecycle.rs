@@ -68,6 +68,19 @@ impl BranchLifecycle {
         super::PrivateEpochLifecycle::new(Arc::clone(&self.catalog), segment_pool, authority)
     }
 
+    /// Internal production construction boundary for sealing: bind the
+    /// lifecycle to the exact mounted writer whose barriers issue receipts.
+    #[allow(dead_code)] // Wired when branch mounting replaces the ownerless server path.
+    pub(crate) fn private_epoch_publisher(
+        &self,
+        segment_pool: Arc<dyn object_store::ObjectStore>,
+        authority: crate::segment_store::SegmentPoolAuthority,
+        extent_store: &crate::fs::store::ExtentStore,
+    ) -> super::PrivateEpochLifecycle {
+        self.private_epochs(segment_pool, authority)
+            .with_publisher(extent_store)
+    }
+
     /// Resolve a checkpoint name once to its stable catalog UUID and exact
     /// SlateDB checkpoint/manifest identity, then use the same creation
     /// primitive as an already-resolved request.

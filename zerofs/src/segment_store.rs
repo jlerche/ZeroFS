@@ -295,6 +295,21 @@ pub struct SegmentStore {
 }
 
 impl SegmentStore {
+    /// Create a fresh writer term over the same authenticated pool and codec.
+    /// The caller must have already reserved `epoch`; counters restart at zero
+    /// only because the epoch namespace is permanent and never reused.
+    #[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
+    pub(crate) fn rotated(&self, epoch: u64) -> Self {
+        Self {
+            object_store: Arc::clone(&self.object_store),
+            codec: Arc::clone(&self.codec),
+            epoch,
+            counter: AtomicU64::new(0),
+            read_calls: AtomicU64::new(0),
+            warm: self.warm.clone(),
+        }
+    }
+
     /// Open the authenticated authority for an existing pool, or establish it
     /// with an immutable create only while the pool contains no data-plane or
     /// control-plane object other than its newly initialized wrapped key.
