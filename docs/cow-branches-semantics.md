@@ -404,6 +404,13 @@ An epoch is eligible for local GC only while every condition below is proven:
    publish a reference into that epoch. Pre-private-epoch reservations,
    missing/corrupt records, inherited epochs, and conflicting identities are
    always global-only.
+
+Catalog schema v12 stores these epoch records as independent SlateDB keys bound
+to the pool UUID, reservation UUID, branch UUID, epoch, and database identity.
+Registration begins only in `open`; revision-fenced transitions are monotonic
+to `sealed_private` or permanently `exposed`. Branch deletion atomically exposes
+all remaining private epochs before fencing the branch. These records alone do
+not authorize deletion and are absent from PostgreSQL/JSON customer projections.
 3. The collector holds an authoritative exclusion guard for that exact branch
    UUID, sealed epoch, and bounded batch. Guard acquisition and epoch-state
    validation are one atomic catalog transition. The guard is durable and does

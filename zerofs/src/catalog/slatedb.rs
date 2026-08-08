@@ -5,8 +5,8 @@ use super::{
     CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcDeletionPublication,
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
-    LeaseSubjectKind, LeaseTombstone, TombstoneKind, TombstoneRecord, validate_name, validate_root,
-    validate_timestamp,
+    LeaseSubjectKind, LeaseTombstone, PrivateEpochRecord, PrivateEpochState, TombstoneKind,
+    TombstoneRecord, validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,6 +34,7 @@ const GC_BLOCKER_PREFIX: &[u8] = b"catalog/gc-blocker/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
+const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -44,6 +45,7 @@ const GC_CAPTURE_SCHEMA_VERSION: u32 = 7;
 const GC_MARK_SCHEMA_VERSION: u32 = 8;
 const GC_QUARANTINE_SCHEMA_VERSION: u32 = 9;
 const GC_REVALIDATION_SCHEMA_VERSION: u32 = 10;
+const GC_DELETION_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -145,6 +147,7 @@ impl SlateDbCatalog {
             GC_MARK_SCHEMA_VERSION,
             GC_QUARANTINE_SCHEMA_VERSION,
             GC_REVALIDATION_SCHEMA_VERSION,
+            GC_DELETION_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -261,6 +264,9 @@ impl SlateDbCatalog {
         let lease_tombstones = self
             .scan_records::<LeaseTombstone>(LEASE_TOMBSTONE_PREFIX)
             .await?;
+        let private_epochs = self
+            .scan_records::<PrivateEpochRecord>(PRIVATE_EPOCH_PREFIX)
+            .await?;
         let snapshot = CatalogSnapshot {
             schema_version: state.schema_version,
             generation: state.generation,
@@ -295,6 +301,10 @@ impl SlateDbCatalog {
             tombstones: tombstones
                 .into_iter()
                 .map(|record| (record.id, record))
+                .collect(),
+            private_epochs: private_epochs
+                .into_iter()
+                .map(|record| (record.epoch, record))
                 .collect(),
         };
         snapshot.validate()?;
@@ -346,6 +356,125 @@ impl SlateDbCatalog {
         let mut batch = WriteBatch::new();
 
         match mutation {
+            CatalogMutation::RegisterPrivateEpoch(record) => {
+                record.validate()?;
+                ensure_initial_revision(record.revision)?;
+                if record.state != PrivateEpochState::Open
+                    || record.sealed_at.is_some()
+                    || record.exposed_at.is_some()
+                    || record.updated_at != record.created_at
+                {
+                    return Err(CatalogError::Invalid(
+                        "new private epoch must begin open at revision one".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .get_record::<PrivateEpochRecord>(private_epoch_key(record.epoch))
+                    .await?
+                {
+                    if existing == record {
+                        return Ok(state.generation);
+                    }
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {}",
+                        record.epoch
+                    )));
+                }
+                if !self
+                    .get_record::<BranchRecord>(branch_key(record.branch_id))
+                    .await?
+                    .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
+                    return Err(CatalogError::NotFound(format!(
+                        "ready private-epoch branch {}",
+                        record.branch_id
+                    )));
+                }
+                put_json(&mut batch, private_epoch_key(record.epoch), &record)?;
+            }
+            CatalogMutation::SealPrivateEpoch {
+                epoch,
+                branch_id,
+                expected_revision,
+                sealed_at,
+            } => {
+                validate_timestamp(sealed_at, "private epoch sealed_at")?;
+                let mut record = self
+                    .get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(format!("private epoch {epoch}")))?;
+                record.validate()?;
+                if record.state == PrivateEpochState::SealedPrivate
+                    && record.branch_id == branch_id
+                    && record.sealed_at == Some(sealed_at)
+                {
+                    return Ok(state.generation);
+                }
+                ensure_expected_revision(expected_revision, record.revision)?;
+                if record.branch_id != branch_id
+                    || record.state != PrivateEpochState::Open
+                    || sealed_at < record.updated_at
+                    || !self
+                        .get_record::<BranchRecord>(branch_key(branch_id))
+                        .await?
+                        .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {epoch}"
+                    )));
+                }
+                record.revision = record.revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("private epoch revision overflow".to_string())
+                })?;
+                record.state = PrivateEpochState::SealedPrivate;
+                record.updated_at = sealed_at;
+                record.sealed_at = Some(sealed_at);
+                record.validate()?;
+                put_json(&mut batch, private_epoch_key(epoch), &record)?;
+            }
+            CatalogMutation::ExposePrivateEpoch {
+                epoch,
+                branch_id,
+                expected_revision,
+                exposed_at,
+            } => {
+                validate_timestamp(exposed_at, "private epoch exposed_at")?;
+                let mut record = self
+                    .get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(format!("private epoch {epoch}")))?;
+                record.validate()?;
+                if record.state == PrivateEpochState::Exposed
+                    && record.branch_id == branch_id
+                    && record.exposed_at == Some(exposed_at)
+                {
+                    return Ok(state.generation);
+                }
+                ensure_expected_revision(expected_revision, record.revision)?;
+                if record.branch_id != branch_id
+                    || !matches!(
+                        record.state,
+                        PrivateEpochState::Open | PrivateEpochState::SealedPrivate
+                    )
+                    || exposed_at < record.updated_at
+                    || !self
+                        .get_record::<BranchRecord>(branch_key(branch_id))
+                        .await?
+                        .is_some_and(|branch| branch.state == BranchState::Ready)
+                {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "private epoch {epoch}"
+                    )));
+                }
+                record.revision = record.revision.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("private epoch revision overflow".to_string())
+                })?;
+                record.state = PrivateEpochState::Exposed;
+                record.updated_at = exposed_at;
+                record.exposed_at = Some(exposed_at);
+                record.validate()?;
+                put_json(&mut batch, private_epoch_key(epoch), &record)?;
+            }
             CatalogMutation::StartBranchDelete { operation } => {
                 operation.validate()?;
                 ensure_initial_revision(operation.revision)?;
@@ -385,6 +514,29 @@ impl SlateDbCatalog {
                     return Err(CatalogError::Invalid(
                         "branch deletion time cannot move backwards".to_string(),
                     ));
+                }
+                for mut epoch in self
+                    .scan_records::<PrivateEpochRecord>(PRIVATE_EPOCH_PREFIX)
+                    .await?
+                    .into_iter()
+                    .filter(|epoch| {
+                        epoch.branch_id == branch.id && epoch.state != PrivateEpochState::Exposed
+                    })
+                {
+                    epoch.validate()?;
+                    if operation.created_at < epoch.updated_at {
+                        return Err(CatalogError::Invalid(
+                            "branch deletion cannot precede private epoch state".to_string(),
+                        ));
+                    }
+                    epoch.revision = epoch.revision.checked_add(1).ok_or_else(|| {
+                        CatalogError::Corrupt("private epoch revision overflow".to_string())
+                    })?;
+                    epoch.state = PrivateEpochState::Exposed;
+                    epoch.updated_at = operation.created_at;
+                    epoch.exposed_at = Some(operation.created_at);
+                    epoch.validate()?;
+                    put_json(&mut batch, private_epoch_key(epoch.epoch), &epoch)?;
                 }
                 branch.revision = branch
                     .revision
@@ -1121,6 +1273,17 @@ impl Catalog for SlateDbCatalog {
         Ok(run)
     }
 
+    async fn private_epoch(&self, epoch: u64) -> Result<Option<PrivateEpochRecord>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        let record = self
+            .get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
+            .await?;
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        Ok(record)
+    }
+
     async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         let prefix = gc_blocker_run_prefix(run_id);
@@ -1622,6 +1785,10 @@ fn gc_run_key(id: Uuid) -> Bytes {
     joined_key(GC_RUN_PREFIX, id.to_string().as_bytes())
 }
 
+fn private_epoch_key(epoch: u64) -> Bytes {
+    joined_key(PRIVATE_EPOCH_PREFIX, format!("{epoch:016x}").as_bytes())
+}
+
 fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
     let mut suffix = run_id.to_string().into_bytes();
     suffix.push(b'/');
@@ -1826,6 +1993,22 @@ mod tests {
             issued_at,
             updated_at: issued_at,
             expires_at: issued_at + chrono::Duration::seconds(10),
+        }
+    }
+
+    fn private_epoch(branch_id: Uuid, epoch: u64, now: DateTime<Utc>) -> PrivateEpochRecord {
+        PrivateEpochRecord {
+            epoch,
+            revision: 1,
+            pool_id: Uuid::new_v4(),
+            reservation_id: Uuid::new_v4(),
+            branch_id,
+            database_identity: format!("branches/{branch_id}"),
+            state: PrivateEpochState::Open,
+            created_at: now,
+            updated_at: now,
+            sealed_at: None,
+            exposed_at: None,
         }
     }
 
@@ -2454,6 +2637,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_epoch_lifecycle_is_monotonic_exact_and_branch_bound() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("private-epoch-lifecycle");
+        let catalog = SlateDbCatalog::open(path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let owner = branch("private-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let opened_at = owner.updated_at + chrono::Duration::microseconds(1);
+        let record = private_epoch(owner.id, 41, opened_at);
+        let registered_generation = catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(record.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(record.clone()))
+                .await
+                .unwrap(),
+            registered_generation,
+            "exact registration retry is generation-neutral"
+        );
+        let mut conflicting = record.clone();
+        conflicting.reservation_id = Uuid::new_v4();
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(conflicting))
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let sealed_at = opened_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::SealPrivateEpoch {
+                epoch: record.epoch,
+                branch_id: owner.id,
+                expected_revision: 1,
+                sealed_at,
+            })
+            .await
+            .unwrap();
+        let sealed = catalog.private_epoch(record.epoch).await.unwrap().unwrap();
+        assert_eq!(sealed.state, PrivateEpochState::SealedPrivate);
+        assert_eq!(sealed.revision, 2);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::SealPrivateEpoch {
+                    epoch: record.epoch,
+                    branch_id: Uuid::new_v4(),
+                    expected_revision: 2,
+                    sealed_at,
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let exposed_at = sealed_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::ExposePrivateEpoch {
+                epoch: record.epoch,
+                branch_id: owner.id,
+                expected_revision: 2,
+                exposed_at,
+            })
+            .await
+            .unwrap();
+        let exposed = catalog.private_epoch(record.epoch).await.unwrap().unwrap();
+        assert_eq!(exposed.state, PrivateEpochState::Exposed);
+        assert_eq!(exposed.revision, 3);
+        assert_eq!(exposed.sealed_at, Some(sealed_at));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::SealPrivateEpoch {
+                    epoch: record.epoch,
+                    branch_id: owner.id,
+                    expected_revision: 3,
+                    sealed_at: exposed_at + chrono::Duration::microseconds(1),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+
+        let second = private_epoch(owner.id, 42, exposed_at);
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(second.clone()))
+            .await
+            .unwrap();
+        let delete_at = catalog_timestamp(Utc::now());
+        let operation = BranchDeleteOperation {
+            id: Uuid::new_v4(),
+            revision: 1,
+            branch_id: owner.id,
+            branch_name: owner.name.clone(),
+            expected_branch_revision: owner.revision,
+            root: owner.root.clone().unwrap(),
+            parent_id: owner.parent_id,
+            origin_checkpoint_id: owner.origin_checkpoint_id,
+            phase: BranchDeletePhase::Draining,
+            created_at: delete_at,
+            updated_at: delete_at,
+        };
+        catalog
+            .apply(CatalogMutation::StartBranchDelete {
+                operation: operation.clone(),
+            })
+            .await
+            .unwrap();
+        let deleting_snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(
+            deleting_snapshot.branches[&owner.id].state,
+            BranchState::Deleting
+        );
+        assert_eq!(
+            deleting_snapshot.private_epochs[&second.epoch].state,
+            PrivateEpochState::Exposed
+        );
+        catalog.close().await.unwrap();
+
+        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+        let reopened_snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(
+            reopened_snapshot.private_epochs[&second.epoch].state,
+            PrivateEpochState::Exposed
+        );
+        catalog
+            .apply(CatalogMutation::FinalizeBranchDelete {
+                operation_id: operation.id,
+                expected_revision: operation.revision,
+                deleted_at: delete_at,
+            })
+            .await
+            .unwrap();
+        let deleted_epoch = catalog.private_epoch(second.epoch).await.unwrap().unwrap();
+        assert_eq!(deleted_epoch.state, PrivateEpochState::Exposed);
+        assert!(deleted_epoch.exposed_at.is_some());
+        catalog.snapshot().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn migrates_v1_records_before_reading_them() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("migration-v1-v2");
@@ -2514,7 +2840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v10_catalogs_to_gc_deletion_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v11_catalogs_to_private_epoch_schema_without_rewriting_records() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -2525,9 +2851,10 @@ mod tests {
             GC_MARK_SCHEMA_VERSION,
             GC_QUARANTINE_SCHEMA_VERSION,
             GC_REVALIDATION_SCHEMA_VERSION,
+            GC_DELETION_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v5"));
+            let path = Path::from(format!("migration-v{prior_version}-v12"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -2556,6 +2883,7 @@ mod tests {
             assert!(snapshot.branch_create_operations.is_empty());
             assert!(snapshot.leases.is_empty());
             assert!(snapshot.lease_tombstones.is_empty());
+            assert!(snapshot.private_epochs.is_empty());
             catalog.close().await.unwrap();
         }
     }

@@ -45,7 +45,7 @@ pub use postgres::PostgresCatalogProjection;
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 11;
+pub const CATALOG_SCHEMA_VERSION: u32 = 12;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -483,6 +483,70 @@ pub struct TombstoneRecord {
     pub deletion_operation_id: Option<Uuid>,
     pub deleted_generation: u64,
     pub deleted_at: DateTime<Utc>,
+}
+
+/// Authoritative local-GC eligibility state for one authenticated pool epoch.
+/// Merely having this record never authorizes deletion; storage authentication,
+/// sealing, exclusion guards, and local liveness proof are separate gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateEpochState {
+    Open,
+    SealedPrivate,
+    Exposed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivateEpochRecord {
+    pub epoch: u64,
+    pub revision: u64,
+    pub pool_id: Uuid,
+    pub reservation_id: Uuid,
+    pub branch_id: Uuid,
+    pub database_identity: String,
+    pub state: PrivateEpochState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub sealed_at: Option<DateTime<Utc>>,
+    pub exposed_at: Option<DateTime<Utc>>,
+}
+
+impl PrivateEpochRecord {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.epoch == 0 {
+            return Err(CatalogError::Invalid(
+                "private segment epoch must be nonzero".to_string(),
+            ));
+        }
+        validate_revision(self.revision, "private segment epoch")?;
+        validate_id(self.pool_id, "private epoch pool")?;
+        validate_id(self.reservation_id, "private epoch reservation")?;
+        validate_id(self.branch_id, "private epoch branch")?;
+        if self.database_identity.is_empty()
+            || self.database_identity.len() > MAX_ROOT_IDENTIFIER_BYTES
+        {
+            return Err(CatalogError::Invalid(
+                "private epoch database identity must be nonempty and bounded".to_string(),
+            ));
+        }
+        validate_times(self.created_at, self.updated_at, "private segment epoch")?;
+        match self.state {
+            PrivateEpochState::Open if self.sealed_at.is_none() && self.exposed_at.is_none() => {}
+            PrivateEpochState::SealedPrivate
+                if self.sealed_at == Some(self.updated_at) && self.exposed_at.is_none() => {}
+            PrivateEpochState::Exposed
+                if self.exposed_at == Some(self.updated_at)
+                    && self
+                        .sealed_at
+                        .is_none_or(|sealed| sealed <= self.updated_at) => {}
+            _ => {
+                return Err(CatalogError::Invalid(
+                    "private epoch timestamps disagree with lifecycle state".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1207,6 +1271,8 @@ pub struct CatalogSnapshot {
     pub lease_tombstones: BTreeMap<Uuid, LeaseTombstone>,
     #[serde(default)]
     pub tombstones: BTreeMap<Uuid, TombstoneRecord>,
+    #[serde(default)]
+    pub private_epochs: BTreeMap<u64, PrivateEpochRecord>,
 }
 
 impl Default for CatalogSnapshot {
@@ -1222,6 +1288,7 @@ impl Default for CatalogSnapshot {
             leases: BTreeMap::new(),
             lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
+            private_epochs: BTreeMap::new(),
         }
     }
 }
@@ -1262,6 +1329,29 @@ impl CatalogSnapshot {
             |record| record.id,
             TombstoneRecord::validate,
         )?;
+        for (epoch, record) in &self.private_epochs {
+            record.validate()?;
+            if *epoch != record.epoch {
+                return Err(CatalogError::Corrupt(
+                    "private epoch key disagrees with its record".to_string(),
+                ));
+            }
+            let compatible_live = self.branches.get(&record.branch_id).is_some_and(|branch| {
+                branch.state == BranchState::Ready
+                    || record.state == PrivateEpochState::Exposed
+                        && branch.state == BranchState::Deleting
+            });
+            let deleted = self
+                .tombstones
+                .get(&record.branch_id)
+                .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Branch);
+            if !(compatible_live || record.state == PrivateEpochState::Exposed && deleted) {
+                return Err(CatalogError::Corrupt(format!(
+                    "private epoch {} has no compatible exact branch incarnation",
+                    record.epoch
+                )));
+            }
+        }
         if self
             .tombstones
             .values()
@@ -1507,6 +1597,19 @@ fn canonicalize_gc_root_pins(pins: &mut Vec<GcRootPin>) {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // General resource mutations are consumed by later lifecycle slices.
 pub(crate) enum CatalogMutation {
+    RegisterPrivateEpoch(PrivateEpochRecord),
+    SealPrivateEpoch {
+        epoch: u64,
+        branch_id: Uuid,
+        expected_revision: u64,
+        sealed_at: DateTime<Utc>,
+    },
+    ExposePrivateEpoch {
+        epoch: u64,
+        branch_id: Uuid,
+        expected_revision: u64,
+        exposed_at: DateTime<Utc>,
+    },
     StartBranchDelete {
         operation: BranchDeleteOperation,
     },
@@ -1661,6 +1764,11 @@ pub(crate) trait Catalog: Send + Sync {
     ) -> Result<Option<BranchDeleteOperation>, CatalogError>;
     async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError>;
     async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError>;
+    async fn private_epoch(&self, _epoch: u64) -> Result<Option<PrivateEpochRecord>, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support private epochs".to_string(),
+        ))
+    }
     /// Persist immutable root pins only if no root-affecting catalog mutation
     /// occurred since capture. The pins duplicate roots present at that same
     /// generation, so this bookkeeping write does not advance it.
