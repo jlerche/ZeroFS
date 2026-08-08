@@ -393,7 +393,9 @@ An epoch is eligible for local GC only while every condition below is proven:
 
 1. Its permanent pool reservation is authenticated by the volume key and binds
    the epoch to the exact, never-reused branch UUID. Path, name, parent, and
-   mutable branch revision are not identity.
+   mutable branch revision are not identity. Reservation format v2 includes an
+   optional authenticated branch UUID; an absent owner and every legacy v1
+   reservation are valid for global uniqueness but are permanently global-only.
 2. Authoritative SlateDB contains the matching private-epoch record in
    `sealed_private` state. Before that transition, the writer rotates away from
    the epoch and holds the branch-local FrameLoc/reference-publication barrier

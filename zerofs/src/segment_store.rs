@@ -28,7 +28,8 @@ use crate::segment::{
 };
 
 const SEGMENT_EPOCH_PREFIX: &str = "segment-epochs";
-const SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 1;
+const LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 1;
+const SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 2;
 const SEGMENT_POOL_GENESIS_PATH: &str = "segment-pool-genesis.json";
 const SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
 const SEGMENT_POOL_AUTH_INFO: &[u8] = b"zerofs-v1-segment-pool-authority";
@@ -55,6 +56,8 @@ struct SegmentEpochReservation {
     epoch: u64,
     reservation_id: uuid::Uuid,
     database_identity: String,
+    #[serde(default)]
+    branch_id: Option<uuid::Uuid>,
     auth_tag: [u8; 32],
 }
 
@@ -96,7 +99,8 @@ fn genesis_tag(key: &[u8; 32], pool_id: uuid::Uuid, database_identity: &str) -> 
     )
 }
 
-fn reservation_tag(
+#[cfg(test)]
+fn reservation_tag_v1(
     authority: &SegmentPoolAuthority,
     epoch: u64,
     reservation_id: uuid::Uuid,
@@ -106,13 +110,83 @@ fn reservation_tag(
         &authority.auth_key,
         &[
             b"epoch",
-            &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+            &LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
             authority.pool_id.as_bytes(),
             &epoch.to_be_bytes(),
             reservation_id.as_bytes(),
             database_identity.as_bytes(),
         ],
     )
+}
+
+fn reservation_tag(
+    authority: &SegmentPoolAuthority,
+    epoch: u64,
+    reservation_id: uuid::Uuid,
+    database_identity: &str,
+    branch_id: Option<uuid::Uuid>,
+) -> [u8; 32] {
+    let absent = [0u8; 16];
+    let branch = branch_id
+        .as_ref()
+        .map_or(absent.as_slice(), |id| id.as_bytes().as_slice());
+    authentication_tag(
+        &authority.auth_key,
+        &[
+            b"epoch",
+            &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+            authority.pool_id.as_bytes(),
+            &epoch.to_be_bytes(),
+            reservation_id.as_bytes(),
+            database_identity.as_bytes(),
+            &[u8::from(branch_id.is_some())],
+            branch,
+        ],
+    )
+}
+
+fn reservation_tag_is_valid(
+    authority: &SegmentPoolAuthority,
+    marker: &SegmentEpochReservation,
+) -> bool {
+    match marker.schema_version {
+        LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION if marker.branch_id.is_none() => {
+            authentication_tag_is_valid(
+                &authority.auth_key,
+                &[
+                    b"epoch",
+                    &LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+                    authority.pool_id.as_bytes(),
+                    &marker.epoch.to_be_bytes(),
+                    marker.reservation_id.as_bytes(),
+                    marker.database_identity.as_bytes(),
+                ],
+                &marker.auth_tag,
+            )
+        }
+        SEGMENT_EPOCH_RESERVATION_VERSION => {
+            let absent = [0u8; 16];
+            let branch = marker
+                .branch_id
+                .as_ref()
+                .map_or(absent.as_slice(), |id| id.as_bytes().as_slice());
+            authentication_tag_is_valid(
+                &authority.auth_key,
+                &[
+                    b"epoch",
+                    &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
+                    authority.pool_id.as_bytes(),
+                    &marker.epoch.to_be_bytes(),
+                    marker.reservation_id.as_bytes(),
+                    marker.database_identity.as_bytes(),
+                    &[u8::from(marker.branch_id.is_some())],
+                    branch,
+                ],
+                &marker.auth_tag,
+            )
+        }
+        _ => false,
+    }
 }
 
 async fn load_pool_authority(
@@ -320,23 +394,14 @@ impl SegmentStore {
                         segid.epoch
                     ))
                 })?;
-            let valid_tag = authentication_tag_is_valid(
-                &authority.auth_key,
-                &[
-                    b"epoch",
-                    &SEGMENT_EPOCH_RESERVATION_VERSION.to_be_bytes(),
-                    authority.pool_id.as_bytes(),
-                    &marker.epoch.to_be_bytes(),
-                    marker.reservation_id.as_bytes(),
-                    marker.database_identity.as_bytes(),
-                ],
-                &marker.auth_tag,
-            );
-            if marker.schema_version != SEGMENT_EPOCH_RESERVATION_VERSION
-                || marker.pool_id != authority.pool_id
+            if !matches!(
+                marker.schema_version,
+                LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION | SEGMENT_EPOCH_RESERVATION_VERSION
+            ) || marker.pool_id != authority.pool_id
                 || marker.epoch != segid.epoch
                 || marker.reservation_id.is_nil()
-                || !valid_tag
+                || marker.branch_id.is_some_and(|id| id.is_nil())
+                || !reservation_tag_is_valid(authority, &marker)
             {
                 return Err(SegmentStoreError::ObjectStore(format!(
                     "shared segment epoch {} has a mismatched reservation marker",
@@ -355,6 +420,34 @@ impl SegmentStore {
         object_store: Arc<dyn ObjectStore>,
         authority: &SegmentPoolAuthority,
         database_identity: &str,
+    ) -> Result<u64> {
+        Self::reserve_epoch_for_branch(object_store, authority, database_identity, None).await
+    }
+
+    /// Reserve an authenticated epoch owned by one exact branch incarnation.
+    /// This is necessary, but intentionally not sufficient, for private local
+    /// GC; authoritative catalog sealing/exposure state is required as well.
+    #[allow(dead_code)] // wired only after the authoritative epoch lifecycle lands
+    pub async fn reserve_branch_epoch(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_identity: &str,
+        branch_id: uuid::Uuid,
+    ) -> Result<u64> {
+        if branch_id.is_nil() {
+            return Err(SegmentStoreError::ObjectStore(
+                "segment epoch branch identity must be non-nil".to_string(),
+            ));
+        }
+        Self::reserve_epoch_for_branch(object_store, authority, database_identity, Some(branch_id))
+            .await
+    }
+
+    async fn reserve_epoch_for_branch(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_identity: &str,
+        branch_id: Option<uuid::Uuid>,
     ) -> Result<u64> {
         if database_identity.len() > 4 * 1024 {
             return Err(SegmentStoreError::ObjectStore(
@@ -377,7 +470,14 @@ impl SegmentStore {
                 epoch,
                 reservation_id,
                 database_identity: database_identity.to_string(),
-                auth_tag: reservation_tag(authority, epoch, reservation_id, database_identity),
+                branch_id,
+                auth_tag: reservation_tag(
+                    authority,
+                    epoch,
+                    reservation_id,
+                    database_identity,
+                    branch_id,
+                ),
             };
             let path = Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json"));
             match object_store
@@ -1075,6 +1175,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_epoch_reservation_authenticates_exact_incarnation() {
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let authority =
+            SegmentStore::open_or_create_pool_authority(pool.clone(), &[1u8; 32], "volume", true)
+                .await
+                .unwrap();
+        let branch_id = uuid::Uuid::new_v4();
+        let epoch = SegmentStore::reserve_branch_epoch(
+            pool.clone(),
+            &authority,
+            "branches/exact-incarnation",
+            branch_id,
+        )
+        .await
+        .unwrap();
+        let segid = Segid::new(epoch, 0);
+        pool.put(
+            &Path::from(segid.object_key()),
+            Bytes::from_static(b"branch-owned epoch segment").into(),
+        )
+        .await
+        .unwrap();
+        SegmentStore::validate_epoch_reservations(pool.clone(), &authority)
+            .await
+            .unwrap();
+
+        let marker_path = Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json"));
+        let mut marker: SegmentEpochReservation =
+            serde_json::from_slice(&pool.get(&marker_path).await.unwrap().bytes().await.unwrap())
+                .unwrap();
+        assert_eq!(marker.branch_id, Some(branch_id));
+        marker.branch_id = Some(uuid::Uuid::new_v4());
+        pool.put(&marker_path, serde_json::to_vec(&marker).unwrap().into())
+            .await
+            .unwrap();
+        assert!(
+            SegmentStore::validate_epoch_reservations(pool, &authority)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched reservation marker")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_authenticated_epoch_reservation_remains_global_only() {
+        let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let authority = SegmentStore::open_or_create_pool_authority(
+            pool.clone(),
+            &[1u8; 32],
+            "legacy-volume",
+            true,
+        )
+        .await
+        .unwrap();
+        let epoch = 17;
+        let reservation_id = uuid::Uuid::new_v4();
+        let marker = SegmentEpochReservation {
+            schema_version: LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION,
+            pool_id: authority.pool_id,
+            epoch,
+            reservation_id,
+            database_identity: "legacy-database".to_string(),
+            branch_id: None,
+            auth_tag: reservation_tag_v1(&authority, epoch, reservation_id, "legacy-database"),
+        };
+        pool.put(
+            &Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json")),
+            serde_json::to_vec(&marker).unwrap().into(),
+        )
+        .await
+        .unwrap();
+        pool.put(
+            &Path::from(Segid::new(epoch, 0).object_key()),
+            Bytes::from_static(b"legacy epoch segment").into(),
+        )
+        .await
+        .unwrap();
+
+        SegmentStore::validate_epoch_reservations(pool, &authority)
+            .await
+            .unwrap();
+        assert!(marker.branch_id.is_none());
+    }
+
+    #[tokio::test]
     async fn shared_pool_genesis_is_key_authenticated_and_empty_only() {
         let fresh_read_only: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         assert!(
@@ -1179,6 +1365,7 @@ mod tests {
             epoch: 7,
             reservation_id: uuid::Uuid::new_v4(),
             database_identity: "forged-migration".to_string(),
+            branch_id: None,
             auth_tag: [0u8; 32],
         };
         pool.put(
