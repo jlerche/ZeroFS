@@ -193,6 +193,15 @@ async fn async_main() -> Result<()> {
                 cli::branch::delete_branch(&config, id, &name, operation_id).await?;
             }
         },
+        cli::Commands::GlobalGc { subcommand } => match subcommand {
+            cli::GlobalGcCommands::Report {
+                config,
+                run_id,
+                confirm_offline,
+            } => {
+                cli::global_gc::report(&config, run_id, confirm_offline).await?;
+            }
+        },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
         }

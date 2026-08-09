@@ -98,6 +98,22 @@ impl CheckpointCatalogRuntime {
 }
 
 impl CatalogRuntime {
+    pub(crate) async fn global_gc_report(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> Result<zerofs::catalog::GcRunRecord> {
+        let gc = self.lifecycle.root_captures();
+        gc.begin(run_id)
+            .await
+            .context("Failed to capture the global GC root set")?;
+        gc.mark(run_id)
+            .await
+            .context("Failed to mark the global GC root set")?;
+        gc.report(run_id)
+            .await
+            .context("Failed to build the global GC inventory report")
+    }
+
     pub(crate) fn customer_catalog(&self) -> Option<zerofs::catalog::CustomerCatalog> {
         self.projection.as_ref().map(|projection| {
             zerofs::catalog::CustomerCatalog::new(self.volume_id, Arc::clone(projection))
@@ -260,7 +276,7 @@ pub(crate) struct ConfiguredBranchMount {
     pub(crate) preparation: zerofs::catalog::ServerWriterMountPreparation,
 }
 
-async fn open_catalog_runtime(
+pub(crate) async fn open_catalog_runtime(
     config: Option<&crate::config::BranchCatalogConfig>,
     object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,

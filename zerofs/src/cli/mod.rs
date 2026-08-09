@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
+pub mod global_gc;
 mod init;
 pub(crate) use init::{CatalogRuntime, CheckpointCatalogRuntime};
 pub mod migrate_legacy_pool;
@@ -77,6 +78,11 @@ pub enum Commands {
     Branch {
         #[command(subcommand)]
         subcommand: BranchCommands,
+    },
+    /// Offline global garbage-collection commands
+    GlobalGc {
+        #[command(subcommand)]
+        subcommand: GlobalGcCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -241,6 +247,21 @@ pub enum BranchCommands {
         /// Stable operation UUID for an exact retry
         #[arg(long)]
         operation_id: Option<uuid::Uuid>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GlobalGcCommands {
+    /// Capture roots and emit a terminal mark/inventory report without deleting data
+    Report {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Stable run UUID for an exact retry
+        #[arg(long)]
+        run_id: Option<uuid::Uuid>,
+        /// Confirm every volume reader, writer, GC, and maintenance process is stopped
+        #[arg(long)]
+        confirm_offline: bool,
     },
 }
 

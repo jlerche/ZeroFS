@@ -892,6 +892,19 @@ segment delete. Exact retries verify the report artifacts. PostgreSQL and JSON
 remain identical customer projections and receive none of the run, root,
 candidate, or report state.
 
+Operators can invoke this path with
+`zerofs global-gc report --config <path> --confirm-offline` while every reader,
+writer, mount, collector, replica, and maintenance process for the volume is
+stopped. `--run-id <UUID>` makes an ambiguous command retry exact; otherwise the
+command prints its generated UUID before capture begins. It opens the same
+authoritative SlateDB catalog, physical segment pool, data object store, and WAL
+configuration as serving, then performs only capture, mark, and terminal report.
+The command has no quarantine, revalidation, or deletion operation. Its JSON
+completion record includes the generation, cutoff, root digest, mark totals,
+inventory totals, proposed candidate objects/bytes, and an explicit false
+physical-deletion capability. PostgreSQL and JSON remain identical customer
+projections and receive no GC state.
+
 1. Capture generation `G`, immutable root list/digest, and an inventory cutoff;
    pin the list for the run.
 2. Enumerate each root once and emit segment IDs into memory-bounded sorted runs
