@@ -279,10 +279,10 @@
 - [x] Test branches and checkpoints created immediately before and after the inventory cutoff.
 - [x] Test deletion of parents and source checkpoints with surviving descendants.
 - [ ] Test active, expired, renewed, and corrupted leases.
-- [ ] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
+- [x] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
 - [ ] Test collector crashes and restarts in every persisted phase.
 - [ ] Test partial and ambiguous object-store deletes.
-- [ ] Assert that uncertainty always retains data.
+- [x] Assert that uncertainty always retains data.
 - [x] Assert eventual reclamation once an object is stably unreachable.
 
 ### Epic 5.3: Validate scale and operability
@@ -618,3 +618,9 @@
 - Four independently verifiable roots with distinct pool segments are prepared: a branch and named checkpoint are published before `RootCaptureLifecycle::begin`, then another branch and checkpoint are published immediately after its durable root snapshot and inventory cutoff. The captured run contains exactly the pre-cutoff catalog roots and excludes both post-cutoff roots; a fresh run contains all four.
 - The stale run may finish marking its immutable pins, but quarantine publication fails the captured catalog-generation fence after the post-cutoff catalog mutations. It remains in `Marking`, records no accepted unreachable observation, and every pool object is asserted present. This proves a branch/checkpoint racing the cutoff cannot turn its older physical segment into an accepted deletion candidate.
 - Branch roots use the production root-store ownership/result proof, checkpoint roots use exact SlateDB checkpoint identities, and both sides are authenticated during capture. This closes the catalog-driven cutoff creation case; mutations after later persisted GC phases remain in the broader phase matrix.
+
+### 2026-08-08: fail-closed mark artifact matrix
+
+- The mark reader is exercised against a missing object, a physically truncated object, a wrong authenticated header, a valid-body file with a corrupt checksum, and independently checksummed files containing duplicate or reordered segment identities. Missing storage is distinguished from corrupt encoding; every malformed present artifact is rejected before it can become an authoritative sorted set.
+- Duplicate and reordered fixtures carry internally consistent headers, counts, and checksums, so their rejection specifically proves the strict ordering/deduplication invariant rather than incidental checksum failure. The normal collector integration separately corrupts published mark and quarantine artifacts, records bounded `CorruptMetadata` blockers, and now explicitly rechecks that a quarantined pool candidate remains present after both failures.
+- Together with the cutoff generation fence, root-open failure, changed-object identity checks, and delete-time byte revalidation, these cases establish the operational rule that uncertainty retains. No corrupt or unavailable proof path reaches physical deletion; repair/restart behavior remains covered by the following persisted-phase work.

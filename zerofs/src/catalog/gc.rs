@@ -2221,6 +2221,16 @@ mod tests {
             lifecycle.mark(run.id).await,
             Err(RootCaptureLifecycleError::Mark(_))
         ));
+        assert!(
+            artifact_store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    Segid::new(8, 0).object_key()
+                )))
+                .await
+                .is_ok(),
+            "corrupt authoritative artifacts must fail closed without deleting a candidate"
+        );
         let blockers = catalog.gc_blockers(run.id).await.unwrap();
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0].kind, GcBlockerKind::CorruptMetadata);

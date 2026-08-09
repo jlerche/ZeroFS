@@ -617,6 +617,18 @@ pub(crate) enum GcMarkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
+
+    fn raw_mark_file(run_id: Uuid, digest: [u8; 32], shard: u8, values: &[Segid]) -> Vec<u8> {
+        let mut bytes = mark_header(run_id, digest, shard).to_vec();
+        for value in values {
+            bytes.extend_from_slice(&encode_segid(*value));
+        }
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+        bytes.extend_from_slice(&checksum);
+        bytes
+    }
 
     #[test]
     fn online_runs_keep_only_logarithmically_many_path_handles() {
@@ -635,6 +647,74 @@ mod tests {
             let logarithmic_bound = (u64::BITS - flushes.leading_zeros()) as usize;
             assert!(runs.resident_paths() <= logarithmic_bound);
             assert_eq!(runs.resident_paths(), flushes.count_ones() as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_missing_corrupt_truncated_duplicate_and_reordered_shards() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let run_id = Uuid::new_v4();
+        let digest = [7u8; 32];
+        let shard = 0;
+        let missing = Path::from("marks/missing");
+        assert!(matches!(
+            MarkReader::open(Arc::clone(&store), &missing, run_id, digest, shard).await,
+            Err(GcMarkError::ObjectStore(
+                object_store::Error::NotFound { .. }
+            ))
+        ));
+
+        let truncated = Path::from("marks/truncated");
+        store
+            .put(&truncated, bytes::Bytes::from_static(b"short").into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            MarkReader::open(Arc::clone(&store), &truncated, run_id, digest, shard).await,
+            Err(GcMarkError::Corrupt(_))
+        ));
+
+        let one = Segid::new(1, 0);
+        let two = Segid::new(1, 256);
+        let wrong_identity = Path::from("marks/wrong-identity");
+        let mut wrong_identity_bytes = raw_mark_file(run_id, digest, shard, &[one]);
+        wrong_identity_bytes[0] ^= 0xff;
+        store
+            .put(&wrong_identity, wrong_identity_bytes.into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            MarkReader::open(Arc::clone(&store), &wrong_identity, run_id, digest, shard,).await,
+            Err(GcMarkError::Corrupt(_))
+        ));
+
+        let bad_checksum = Path::from("marks/bad-checksum");
+        let mut bad_checksum_bytes = raw_mark_file(run_id, digest, shard, &[one]);
+        *bad_checksum_bytes.last_mut().unwrap() ^= 0xff;
+        store
+            .put(&bad_checksum, bad_checksum_bytes.into())
+            .await
+            .unwrap();
+        let mut reader = MarkReader::open(Arc::clone(&store), &bad_checksum, run_id, digest, shard)
+            .await
+            .unwrap();
+        assert_eq!(reader.next().await.unwrap(), Some(one));
+        assert!(matches!(
+            reader.finish().await,
+            Err(GcMarkError::Corrupt(_))
+        ));
+
+        for (name, values) in [("duplicate", vec![one, one]), ("reordered", vec![two, one])] {
+            let path = Path::from(format!("marks/{name}"));
+            store
+                .put(&path, raw_mark_file(run_id, digest, shard, &values).into())
+                .await
+                .unwrap();
+            let mut reader = MarkReader::open(Arc::clone(&store), &path, run_id, digest, shard)
+                .await
+                .unwrap();
+            assert_eq!(reader.next().await.unwrap(), Some(values[0]));
+            assert!(matches!(reader.next().await, Err(GcMarkError::Corrupt(_))));
         }
     }
 }
