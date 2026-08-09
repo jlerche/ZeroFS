@@ -95,16 +95,15 @@ impl CatalogRuntime {
             .publish_writer_head(grant)
             .await
             .context("Failed to publish configured branch writer head")?;
-        if let Some(projection) = &self.projection {
-            if let Err(error) = self
+        if let Some(projection) = &self.projection
+            && let Err(error) = self
                 .lifecycle
                 .reconcile_projection(self.volume_id, projection.as_ref())
                 .await
-            {
-                tracing::warn!(
-                    "Customer catalog projection reconciliation after head publication failed; authoritative SlateDB remains current: {error}"
-                );
-            }
+        {
+            tracing::warn!(
+                "Customer catalog projection reconciliation after head publication failed; authoritative SlateDB remains current: {error}"
+            );
         }
         Ok(())
     }

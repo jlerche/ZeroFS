@@ -2209,6 +2209,39 @@ pub struct CustomerCatalogRecord {
     pub customer_metadata: CustomerMetadata,
 }
 
+/// Keep customer projection reads bounded independently of the catalog's
+/// production admission limits.
+pub const MAX_CUSTOMER_CATALOG_PAGE_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustomerCatalogListRequest {
+    pub kind: Option<CustomerResourceKind>,
+    pub after: Option<Uuid>,
+    pub limit: usize,
+}
+
+impl CustomerCatalogListRequest {
+    fn validate(self) -> Result<(), CatalogError> {
+        if self.limit == 0 || self.limit > MAX_CUSTOMER_CATALOG_PAGE_SIZE {
+            return Err(CatalogError::Invalid(format!(
+                "customer catalog page size must be within 1..={MAX_CUSTOMER_CATALOG_PAGE_SIZE}"
+            )));
+        }
+        if self.after.is_some_and(|after| after.is_nil()) {
+            return Err(CatalogError::Invalid(
+                "customer catalog cursor UUID cannot be nil".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomerCatalogPage {
+    pub records: Vec<CustomerCatalogRecord>,
+    pub next_after: Option<Uuid>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog {resource} capacity of {limit} has been reached")]
@@ -2474,6 +2507,13 @@ pub trait CatalogProjection: Send + Sync {
         volume_id: Uuid,
         resource_id: Uuid,
     ) -> Result<Option<CustomerCatalogRecord>, CatalogError>;
+    /// List a stable UUID-ordered page from the root-free customer view.
+    /// Deleted and compacted (`absent`) records remain visible for audit.
+    async fn list(
+        &self,
+        volume_id: Uuid,
+        request: CustomerCatalogListRequest,
+    ) -> Result<CustomerCatalogPage, CatalogError>;
     async fn set_customer_metadata(
         &self,
         volume_id: Uuid,

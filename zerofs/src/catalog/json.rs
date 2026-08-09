@@ -1,10 +1,12 @@
 use super::{
     CATALOG_PROJECTION_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
-    CustomerCatalogRecord, CustomerMetadata, CustomerResourceKind, validate_metadata,
+    CustomerCatalogListRequest, CustomerCatalogPage, CustomerCatalogRecord, CustomerMetadata,
+    CustomerResourceKind, validate_metadata,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -132,6 +134,39 @@ impl CatalogProjection for JsonCatalogProjection {
             .cloned())
     }
 
+    async fn list(
+        &self,
+        volume_id: Uuid,
+        request: CustomerCatalogListRequest,
+    ) -> Result<CustomerCatalogPage, CatalogError> {
+        validate_volume_id(volume_id)?;
+        request.validate()?;
+        let _guard = self.lock.lock().await;
+        let document = self.load_unlocked().await?;
+        let Some(volume) = document.volumes.get(&volume_id) else {
+            return Ok(CustomerCatalogPage {
+                records: Vec::new(),
+                next_after: None,
+            });
+        };
+        let lower = request.after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut records = volume
+            .records
+            .range((lower, Bound::Unbounded))
+            .map(|(_, record)| record)
+            .filter(|record| request.kind.is_none_or(|kind| record.kind == kind))
+            .take(request.limit + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_after =
+            (records.len() > request.limit).then(|| records[request.limit - 1].resource_id);
+        records.truncate(request.limit);
+        Ok(CustomerCatalogPage {
+            records,
+            next_after,
+        })
+    }
+
     async fn set_customer_metadata(
         &self,
         volume_id: Uuid,
@@ -252,7 +287,10 @@ fn validate_volume_id(volume_id: Uuid) -> Result<(), CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{BranchRecord, BranchState, DurableRoot, catalog_timestamp};
+    use crate::catalog::{
+        BranchRecord, BranchState, CheckpointRecord, DurableRoot, MAX_CUSTOMER_CATALOG_PAGE_SIZE,
+        catalog_timestamp,
+    };
     use chrono::Utc;
     use serde_json::Value;
 
@@ -366,5 +404,138 @@ mod tests {
         let json = tokio::fs::read_to_string(projection.path()).await.unwrap();
         assert!(!json.contains("secret-root"));
         assert!(!json.contains("secret-manifest"));
+    }
+
+    #[tokio::test]
+    async fn lists_bounded_uuid_pages_with_identical_kind_filtering() {
+        let directory = tempfile::tempdir().unwrap();
+        let projection = JsonCatalogProjection::new(directory.path().join("projection.json"));
+        let volume_id = Uuid::new_v4();
+        let first_branch_id = Uuid::from_u128(1);
+        let checkpoint_id = Uuid::from_u128(2);
+        let second_branch_id = Uuid::from_u128(3);
+        let now = catalog_timestamp(Utc::now());
+        let mut snapshot = CatalogSnapshot {
+            generation: 1,
+            ..CatalogSnapshot::default()
+        };
+        for (id, name) in [(first_branch_id, "first"), (second_branch_id, "second")] {
+            snapshot.branches.insert(
+                id,
+                BranchRecord {
+                    id,
+                    revision: 1,
+                    name: name.to_string(),
+                    state: BranchState::Ready,
+                    root: Some(DurableRoot {
+                        identity: format!("branches/{id}"),
+                        manifest_id: format!("manifest-{id}"),
+                    }),
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        snapshot.checkpoints.insert(
+            checkpoint_id,
+            CheckpointRecord {
+                id: checkpoint_id,
+                revision: 1,
+                branch_id: first_branch_id,
+                name: "snapshot".to_string(),
+                root: DurableRoot {
+                    identity: "branches/first".to_string(),
+                    manifest_id: "checkpoint".to_string(),
+                },
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        projection.reconcile(volume_id, &snapshot).await.unwrap();
+
+        let first = projection
+            .list(
+                volume_id,
+                CustomerCatalogListRequest {
+                    kind: None,
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.resource_id)
+                .collect::<Vec<_>>(),
+            vec![first_branch_id, checkpoint_id]
+        );
+        assert_eq!(first.next_after, Some(checkpoint_id));
+
+        let second = projection
+            .list(
+                volume_id,
+                CustomerCatalogListRequest {
+                    kind: None,
+                    after: first.next_after,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|record| record.resource_id)
+                .collect::<Vec<_>>(),
+            vec![second_branch_id]
+        );
+        assert_eq!(second.next_after, None);
+
+        let branches = projection
+            .list(
+                volume_id,
+                CustomerCatalogListRequest {
+                    kind: Some(CustomerResourceKind::Branch),
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            branches
+                .records
+                .iter()
+                .map(|record| record.resource_id)
+                .collect::<Vec<_>>(),
+            vec![first_branch_id, second_branch_id]
+        );
+        assert_eq!(branches.next_after, None);
+
+        for request in [
+            CustomerCatalogListRequest {
+                kind: None,
+                after: None,
+                limit: 0,
+            },
+            CustomerCatalogListRequest {
+                kind: None,
+                after: None,
+                limit: MAX_CUSTOMER_CATALOG_PAGE_SIZE + 1,
+            },
+            CustomerCatalogListRequest {
+                kind: None,
+                after: Some(Uuid::nil()),
+                limit: 1,
+            },
+        ] {
+            assert!(projection.list(volume_id, request).await.is_err());
+        }
     }
 }

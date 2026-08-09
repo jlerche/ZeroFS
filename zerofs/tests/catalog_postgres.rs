@@ -3,9 +3,9 @@ use serde_json::Value;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 use zerofs::catalog::{
-    BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CustomerMetadata, DurableRoot,
-    PostgresCatalogProjection, RetiredCatalogId, RetiredCatalogKind, TombstoneKind,
-    TombstoneRecord, catalog_timestamp,
+    BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CustomerCatalogListRequest,
+    CustomerMetadata, CustomerResourceKind, DurableRoot, PostgresCatalogProjection,
+    RetiredCatalogId, RetiredCatalogKind, TombstoneKind, TombstoneRecord, catalog_timestamp,
 };
 
 async fn connect(url: &str) -> (PostgresCatalogProjection, tokio_postgres::Client) {
@@ -28,7 +28,8 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
     let (projection, inspection) = connect(&url).await;
     projection.migrate().await.unwrap();
     let volume_id = Uuid::new_v4();
-    let branch_id = Uuid::new_v4();
+    let branch_id = Uuid::from_u128(1);
+    let second_branch_id = Uuid::from_u128(3);
     let historical_parent = Uuid::new_v4();
     let now = catalog_timestamp(Utc::now());
     let mut snapshot = CatalogSnapshot {
@@ -52,7 +53,51 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
             updated_at: now,
         },
     );
+    snapshot.branches.insert(
+        second_branch_id,
+        BranchRecord {
+            id: second_branch_id,
+            revision: 1,
+            name: "second".to_string(),
+            state: BranchState::Ready,
+            root: Some(DurableRoot {
+                identity: "second-storage-root-secret".to_string(),
+                manifest_id: "second-manifest-secret".to_string(),
+            }),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        },
+    );
     projection.reconcile(volume_id, &snapshot).await.unwrap();
+
+    let first_page = projection
+        .list(
+            volume_id,
+            CustomerCatalogListRequest {
+                kind: Some(CustomerResourceKind::Branch),
+                after: None,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.records[0].resource_id, branch_id);
+    assert_eq!(first_page.next_after, Some(branch_id));
+    let second_page = projection
+        .list(
+            volume_id,
+            CustomerCatalogListRequest {
+                kind: Some(CustomerResourceKind::Branch),
+                after: first_page.next_after,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.records[0].resource_id, second_branch_id);
+    assert_eq!(second_page.next_after, None);
 
     let mut metadata = CustomerMetadata::new();
     metadata.insert("project".to_string(), Value::String("alpha".to_string()));
@@ -74,7 +119,7 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
 
     let deleted_at = catalog_timestamp(Utc::now());
     snapshot.generation = 3;
-    snapshot.branches.clear();
+    snapshot.branches.remove(&branch_id);
     snapshot.tombstones.insert(
         branch_id,
         TombstoneRecord {

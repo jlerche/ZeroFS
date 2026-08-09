@@ -365,6 +365,11 @@ reconstructible lifecycle and customer metadata, and neither is a mount, write,
 or GC authority. Durable roots, manifests, active leases, storage operation
 proofs, private epochs, GC guards, and permanent internal ID reservations remain
 in authoritative SlateDB for local and production deployments.
+Both backends expose the same bounded query contract: point lookup and stable
+UUID-ordered pages, optionally restricted to branches or checkpoints. A page is
+limited to 256 records and uses the last returned UUID as its exclusive cursor.
+Deleted and compacted `absent` records remain queryable for customer audit;
+pagination never consults or exposes SlateDB roots, leases, or storage proofs.
 
 The server's optional `[catalog]` settings own a stable volume UUID, the
 authoritative SlateDB path, private branch-database root, default-off lifecycle

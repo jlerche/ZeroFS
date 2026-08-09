@@ -1,7 +1,7 @@
 use super::{
     CATALOG_PROJECTION_SCHEMA_VERSION, CatalogError, CatalogProjection, CatalogSnapshot,
-    CustomerCatalogRecord, CustomerMetadata, CustomerResourceKind, TombstoneKind,
-    validate_metadata,
+    CustomerCatalogListRequest, CustomerCatalogPage, CustomerCatalogRecord, CustomerMetadata,
+    CustomerResourceKind, TombstoneKind, validate_metadata,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -230,6 +230,48 @@ impl CatalogProjection for PostgresCatalogProjection {
                 .await?
         };
         row.as_ref().map(record_from_row).transpose()
+    }
+
+    async fn list(
+        &self,
+        volume_id: Uuid,
+        request: CustomerCatalogListRequest,
+    ) -> Result<CustomerCatalogPage, CatalogError> {
+        validate_volume_id(volume_id)?;
+        request.validate()?;
+        let query = "SELECT volume_id, resource_id, kind, name, state, parent_id, \
+                     origin_checkpoint_id, observed_generation, created_at, updated_at, \
+                     deleted_at, customer_metadata \
+                     FROM zerofs_catalog_projection_resources \
+                     WHERE volume_id = $1 \
+                       AND ($2::text IS NULL OR kind = $2) \
+                       AND ($3::uuid IS NULL OR resource_id > $3) \
+                     ORDER BY resource_id LIMIT $4";
+        let kind = request.kind.map(CustomerResourceKind::as_str);
+        let limit = i64::try_from(request.limit + 1)
+            .expect("bounded customer catalog page size fits BIGINT");
+        let rows = if let Some(client) = &self.read_client {
+            client
+                .query(query, &[&volume_id, &kind, &request.after, &limit])
+                .await?
+        } else {
+            self.write_client
+                .lock()
+                .await
+                .query(query, &[&volume_id, &kind, &request.after, &limit])
+                .await?
+        };
+        let mut records = rows
+            .iter()
+            .map(record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_after =
+            (records.len() > request.limit).then(|| records[request.limit - 1].resource_id);
+        records.truncate(request.limit);
+        Ok(CustomerCatalogPage {
+            records,
+            next_after,
+        })
     }
 
     async fn set_customer_metadata(
