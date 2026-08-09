@@ -29,6 +29,72 @@ use std::sync::Arc;
 use tokio::sync::{Notify, watch};
 use tracing::info;
 
+pub(crate) struct CatalogRuntime {
+    #[allow(dead_code)] // Consumed by lifecycle APIs and mount wiring as they land.
+    lifecycle: zerofs::catalog::BranchLifecycle,
+    #[allow(dead_code)]
+    volume_id: uuid::Uuid,
+    #[allow(dead_code)]
+    projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
+}
+
+async fn open_catalog_runtime(
+    config: Option<&crate::config::BranchCatalogConfig>,
+    object_store: Arc<dyn object_store::ObjectStore>,
+    database_path: &str,
+    segment_pool_path: Option<&str>,
+) -> Result<Option<CatalogRuntime>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let pool = segment_pool_path
+        .ok_or_else(|| anyhow::anyhow!("catalog startup requires storage.segment_pool_path"))?;
+    let branch_database_root = Path::parse(&config.branch_database_root)
+        .context("Invalid catalog.branch_database_root")?;
+    let database_path = Path::from(database_path);
+    let catalog_path = Path::parse(&config.authority.slatedb_path)
+        .context("Invalid catalog.authority.slatedb_path")?;
+    if paths_overlap(&database_path, &catalog_path) {
+        anyhow::bail!(
+            "catalog.authority.slatedb_path must be disjoint from the SlateDB database path"
+        );
+    }
+    if paths_overlap(&database_path, &branch_database_root) {
+        anyhow::bail!(
+            "catalog.branch_database_root must be disjoint from the SlateDB database path"
+        );
+    }
+    let lifecycle = config
+        .authority
+        .open_branch_lifecycle(object_store, branch_database_root, Path::from(pool))
+        .await
+        .context("Failed to open authoritative SlateDB branch catalog")?;
+    let projection = match config.projection.open().await {
+        Ok(projection) => {
+            if let Err(error) = lifecycle
+                .reconcile_projection(config.volume_id, projection.as_ref())
+                .await
+            {
+                tracing::warn!(
+                    "Customer catalog projection reconciliation failed; authoritative SlateDB remains available: {error}"
+                );
+            }
+            Some(projection)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Customer catalog projection could not open; authoritative SlateDB remains available: {error}"
+            );
+            None
+        }
+    };
+    Ok(Some(CatalogRuntime {
+        lifecycle,
+        volume_id: config.volume_id,
+        projection,
+    }))
+}
+
 /// State retained across role-election and writer-open retries.
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -41,6 +107,7 @@ struct StartupContext {
     actual_db_path: String,
     segment_pool_path: Option<String>,
     segment_pool_authority: Option<crate::segment_store::SegmentPoolAuthority>,
+    catalog_runtime: Option<CatalogRuntime>,
     block_transformer: Arc<dyn BlockTransformer>,
     segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
@@ -201,6 +268,14 @@ impl StartupContext {
             .await?;
         }
 
+        let catalog_runtime = open_catalog_runtime(
+            settings.catalog.as_ref(),
+            Arc::clone(&object_store),
+            &actual_db_path,
+            segment_pool_path.as_deref(),
+        )
+        .await?;
+
         info!("Starting ZeroFS server with {} backend", object_store);
         info!("DB Path: {}", actual_db_path);
         info!(
@@ -327,6 +402,7 @@ impl StartupContext {
             actual_db_path,
             segment_pool_path,
             segment_pool_authority,
+            catalog_runtime,
             block_transformer,
             segment_codec: crate::frame_codec::FrameCodec::new(
                 &encryption_key,
@@ -943,6 +1019,7 @@ impl ReconciledDb {
             actual_db_path,
             segment_pool_path: _,
             segment_pool_authority,
+            catalog_runtime,
             block_transformer: _,
             segment_codec,
             cache_config: _,
@@ -1176,6 +1253,7 @@ impl ReconciledDb {
             db_path: actual_db_path,
             db_handle,
             authority,
+            catalog_runtime,
         })
     }
 }
@@ -1215,9 +1293,9 @@ pub async fn initialize_filesystem(
 mod role_decision_tests {
     use super::{
         ImmediateRoleDecision, StartupContext, ensure_shared_pool_has_no_legacy_segments,
-        immediate_role_decision,
+        immediate_role_decision, open_catalog_runtime,
     };
-    use crate::config::{CompressionConfig, ReplicationRole};
+    use crate::config::{BranchCatalogConfig, CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
     use crate::replication::ReplicationParams;
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -1258,6 +1336,90 @@ mod role_decision_tests {
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("legacy segment"));
+    }
+
+    #[tokio::test]
+    async fn catalog_runtime_keeps_slatedb_authority_when_projection_fails() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let directory = tempfile::tempdir().unwrap();
+        let projection_path = directory.path().join("customer-catalog.json");
+        let volume_id = uuid::Uuid::new_v4();
+        let config = BranchCatalogConfig {
+            volume_id,
+            authority: zerofs::catalog::CatalogConfig {
+                slatedb_path: "runtime/catalog".to_string(),
+                ..zerofs::catalog::CatalogConfig::default()
+            },
+            projection: zerofs::catalog::CatalogProjectionConfig::Json {
+                path: projection_path.clone(),
+            },
+            branch_database_root: "runtime/branches".to_string(),
+        };
+        let runtime = open_catalog_runtime(
+            Some(&config),
+            Arc::clone(&store),
+            "runtime/live",
+            Some("runtime/segments"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(runtime.volume_id, volume_id);
+        assert!(runtime.lifecycle.list_branches().await.unwrap().is_empty());
+        assert!(runtime.projection.is_some());
+        assert!(
+            !projection_path.exists(),
+            "generation-zero projection is a no-op"
+        );
+
+        let unavailable_projection = BranchCatalogConfig {
+            volume_id: uuid::Uuid::new_v4(),
+            authority: zerofs::catalog::CatalogConfig {
+                slatedb_path: "runtime/fallback-catalog".to_string(),
+                ..zerofs::catalog::CatalogConfig::default()
+            },
+            projection: zerofs::catalog::CatalogProjectionConfig::Json {
+                // Reading a directory as the projection document fails.
+                path: directory.path().to_path_buf(),
+            },
+            branch_database_root: "runtime/fallback-branches".to_string(),
+        };
+        let fallback = open_catalog_runtime(
+            Some(&unavailable_projection),
+            store,
+            "runtime/live",
+            Some("runtime/segments"),
+        )
+        .await
+        .expect("projection failure must not invalidate SlateDB authority")
+        .unwrap();
+        assert!(fallback.lifecycle.list_branches().await.unwrap().is_empty());
+        assert!(
+            fallback.projection.is_some(),
+            "an opened projection remains available for a later reconciliation retry"
+        );
+
+        let overlapping = BranchCatalogConfig {
+            volume_id: uuid::Uuid::new_v4(),
+            authority: zerofs::catalog::CatalogConfig {
+                slatedb_path: "runtime/live/catalog".to_string(),
+                ..zerofs::catalog::CatalogConfig::default()
+            },
+            projection: zerofs::catalog::CatalogProjectionConfig::Json {
+                path: directory.path().join("overlap.json"),
+            },
+            branch_database_root: "runtime/other-branches".to_string(),
+        };
+        let error = open_catalog_runtime(
+            Some(&overlapping),
+            Arc::new(InMemory::new()),
+            "runtime/live",
+            Some("runtime/segments"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("must be disjoint"));
     }
 
     #[tokio::test]
@@ -1333,6 +1495,7 @@ mod role_decision_tests {
             actual_db_path: "db".into(),
             segment_pool_path: None,
             segment_pool_authority: None,
+            catalog_runtime: None,
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
                 &[0; 32],
                 CompressionConfig::default(),

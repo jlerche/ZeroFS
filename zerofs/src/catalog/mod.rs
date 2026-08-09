@@ -134,8 +134,14 @@ impl CatalogConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CatalogProjectionConfig {
-    Json { path: PathBuf },
-    Postgres { connection_string: String },
+    Json {
+        #[serde(deserialize_with = "deserialize_projection_path")]
+        path: PathBuf,
+    },
+    Postgres {
+        #[serde(deserialize_with = "deserialize_projection_string")]
+        connection_string: String,
+    },
 }
 
 impl Default for CatalogProjectionConfig {
@@ -169,6 +175,24 @@ impl CatalogProjectionConfig {
             }
         }
     }
+}
+
+fn deserialize_projection_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    shellexpand::env(&value)
+        .map(|expanded| expanded.into_owned())
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_projection_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_projection_string(deserializer)?;
+    Ok(PathBuf::from(shellexpand::tilde(&value).into_owned()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

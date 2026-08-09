@@ -220,6 +220,23 @@ impl BranchLifecycle {
         )
     }
 
+    /// Rebuild one customer projection from a lock-consistent authoritative
+    /// SlateDB snapshot. Projection failure never changes lifecycle authority.
+    pub async fn reconcile_projection(
+        &self,
+        volume_id: Uuid,
+        projection: &dyn super::CatalogProjection,
+    ) -> Result<(), BranchLifecycleError> {
+        if volume_id.is_nil() {
+            return Err(
+                CatalogError::Invalid("projection volume UUID cannot be nil".to_string()).into(),
+            );
+        }
+        let snapshot = self.catalog.snapshot().await?;
+        projection.reconcile(volume_id, &snapshot).await?;
+        Ok(())
+    }
+
     pub fn deletions(&self) -> super::DeletionLifecycle {
         super::DeletionLifecycle::new_with_features(Arc::clone(&self.catalog), self.features)
     }
@@ -753,8 +770,8 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchDeleteRequest, BranchDeleteResult, CatalogMutation, CheckpointDeleteRequest,
-        CheckpointRecord, DurableRoot, LeaseAccessMode, LeaseAcquireRequest, SlateDbCatalog,
-        catalog_timestamp,
+        CheckpointRecord, DurableRoot, JsonCatalogProjection, LeaseAccessMode, LeaseAcquireRequest,
+        SlateDbCatalog, catalog_timestamp,
     };
     use slatedb::Db;
     use slatedb::admin::AdminBuilder;
@@ -1862,6 +1879,48 @@ mod tests {
             .await
             .unwrap();
         assert!(lifecycle.list_branches().await.unwrap().is_empty());
+
+        let projected_id = Uuid::new_v4();
+        let now = catalog_timestamp(Utc::now());
+        lifecycle
+            .catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: projected_id,
+                revision: 1,
+                name: "projected".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "feature-controls/projected".to_string(),
+                    manifest_id: format!("{}@1", Uuid::new_v4()),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        let projection_directory = tempfile::tempdir().unwrap();
+        let projection =
+            JsonCatalogProjection::new(projection_directory.path().join("catalog.json"));
+        let volume_id = Uuid::new_v4();
+        lifecycle
+            .reconcile_projection(volume_id, &projection)
+            .await
+            .unwrap();
+        let projected =
+            super::super::CatalogProjection::record(&projection, volume_id, projected_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(projected.resource_id, projected_id);
+        assert_eq!(projected.name, "projected");
+        assert!(matches!(
+            lifecycle
+                .reconcile_projection(Uuid::nil(), &projection)
+                .await,
+            Err(BranchLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
 
         let branch_id = Uuid::new_v4();
         let mount = BranchMountRequest {

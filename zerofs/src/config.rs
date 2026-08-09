@@ -156,6 +156,10 @@ pub struct Settings {
     /// HA replication. Absent means single-node (non-replicated behavior).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replication: Option<ReplicationConfig>,
+    /// Optional CoW branch catalog. SlateDB is authoritative; the selected
+    /// JSON/PostgreSQL backend is only a reconstructible customer projection.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub catalog: Option<BranchCatalogConfig>,
 }
 
 /// Node role within an HA pair.
@@ -361,6 +365,25 @@ pub struct StorageConfig {
         deserialize_with = "deserialize_optional_expandable_string"
     )]
     pub segment_pool_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BranchCatalogConfig {
+    /// Stable customer volume identity shared by both projection backends.
+    pub volume_id: uuid::Uuid,
+    /// Authoritative local/production SlateDB catalog selection and lifecycle
+    /// release controls.
+    #[serde(default)]
+    pub authority: zerofs::catalog::CatalogConfig,
+    /// Identical reconstructible customer projection: JSON locally or
+    /// PostgreSQL in production.
+    #[serde(default)]
+    pub projection: zerofs::catalog::CatalogProjectionConfig,
+    /// Private namespace below which independently mounted branch databases
+    /// are created.
+    #[serde(deserialize_with = "deserialize_expandable_string")]
+    pub branch_database_root: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -989,6 +1012,24 @@ impl Settings {
 
     /// Cross-section validation applied after deserialization.
     pub fn validate(&self) -> Result<()> {
+        if let Some(catalog) = &self.catalog {
+            if catalog.volume_id.is_nil() {
+                anyhow::bail!("[catalog] volume_id must not be nil");
+            }
+            if catalog.branch_database_root.trim().is_empty() {
+                anyhow::bail!("[catalog] branch_database_root must not be empty");
+            }
+            if self.storage.segment_pool_path.is_none() {
+                anyhow::bail!(
+                    "[catalog] requires storage.segment_pool_path so every branch shares one physical inventory"
+                );
+            }
+            if self.replication.is_some() {
+                anyhow::bail!(
+                    "[catalog] cannot be combined with [replication] until authoritative catalog ownership follows HA role election"
+                );
+            }
+        }
         if let Some(replication) = &self.replication {
             replication
                 .validate()
@@ -1101,6 +1142,7 @@ impl Settings {
             telemetry: None,
             prometheus: None,
             replication: None,
+            catalog: None,
         }
     }
 
@@ -1137,6 +1179,22 @@ impl Settings {
         toml_string.push_str("# default_region = \"us-east-1\"\n");
         toml_string.push_str("# allow_http = \"true\"  # For non-HTTPS endpoints\n");
         toml_string.push_str("# conditional_put = \"redis://localhost:6379\"  # For S3-compatible stores without conditional put support\n");
+
+        toml_string
+            .push_str("\n# Optional CoW branch catalog (requires storage.segment_pool_path)\n");
+        toml_string
+            .push_str("# Currently single-node only; [catalog] with [replication] is rejected.\n");
+        toml_string.push_str("# [catalog]\n");
+        toml_string.push_str("# volume_id = \"00000000-0000-4000-8000-000000000001\"\n");
+        toml_string.push_str("# branch_database_root = \".zerofs/branches\"\n");
+        toml_string.push_str("# [catalog.authority]\n");
+        toml_string.push_str("# slatedb_path = \".zerofs/catalog\"\n");
+        toml_string.push_str("# [catalog.authority.features]\n");
+        toml_string.push_str("# create = false\n# mount = false\n# checkpoint_delete = false\n# branch_delete = false\n");
+        toml_string.push_str("# [catalog.projection]\n");
+        toml_string
+            .push_str("# backend = \"json\"\n# path = \".zerofs/catalog-projection.json\"\n");
+        toml_string.push_str("# Production alternative: backend = \"postgres\", connection_string = \"${ZEROFS_CATALOG_DATABASE_URL}\"\n");
 
         toml_string.push_str("\n# Optional filesystem configuration\n");
         toml_string
@@ -2088,6 +2146,87 @@ segment_pool_path = "${ZEROFS_TEST_SEGMENT_POOL}"
             settings.storage.segment_pool_path.as_deref(),
             Some("volume/segment-pool")
         );
+    }
+
+    #[test]
+    fn catalog_config_selects_slatedb_authority_and_local_json_projection() {
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+segment_pool_path = "volume/segments"
+
+[servers]
+
+[catalog]
+volume_id = "11111111-1111-4111-8111-111111111111"
+branch_database_root = "volume/branches"
+
+[catalog.authority]
+slatedb_path = "volume/catalog"
+
+[catalog.authority.features]
+mount = true
+"#;
+        let catalog = write_and_load(content).unwrap().catalog.unwrap();
+        assert_eq!(
+            catalog.volume_id,
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()
+        );
+        assert_eq!(catalog.authority.slatedb_path, "volume/catalog");
+        assert!(catalog.authority.features.mount);
+        assert!(!catalog.authority.features.create);
+        assert!(matches!(
+            catalog.projection,
+            zerofs::catalog::CatalogProjectionConfig::Json { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_config_selects_postgres_projection_and_requires_shared_pool() {
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+segment_pool_path = "volume/segments"
+
+[servers]
+
+[catalog]
+volume_id = "22222222-2222-4222-8222-222222222222"
+branch_database_root = "volume/branches"
+
+[catalog.authority]
+slatedb_path = "volume/catalog"
+
+[catalog.projection]
+backend = "postgres"
+connection_string = "postgresql://catalog.invalid/zerofs"
+"#;
+        let catalog = write_and_load(content).unwrap().catalog.unwrap();
+        assert!(matches!(
+            catalog.projection,
+            zerofs::catalog::CatalogProjectionConfig::Postgres { connection_string }
+                if connection_string == "postgresql://catalog.invalid/zerofs"
+        ));
+
+        let without_pool = content.replace("segment_pool_path = \"volume/segments\"\n", "");
+        let error = format!("{:#}", write_and_load(&without_pool).unwrap_err());
+        assert!(error.contains("requires storage.segment_pool_path"));
+
+        let with_replication =
+            format!("{content}\n[replication]\nnode_id = \"n1\"\nrole = \"leader\"\n");
+        let error = format!("{:#}", write_and_load(&with_replication).unwrap_err());
+        assert!(error.contains("cannot be combined with [replication]"));
+        assert!(error.contains("HA role election"));
     }
 
     #[test]

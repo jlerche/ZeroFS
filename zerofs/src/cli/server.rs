@@ -809,6 +809,9 @@ pub struct InitResult {
     pub db_handle: SlateDbHandle,
     /// HA authority monitors retained through database close.
     pub authority: Option<crate::replication::AuthoritySupervisor>,
+    /// Retains the authoritative catalog lifecycle for the serving process;
+    /// lifecycle APIs and stable mount wiring consume it incrementally.
+    pub(crate) catalog_runtime: Option<crate::cli::init::CatalogRuntime>,
 }
 
 const STARTUP_BANNER: &str = r#"
@@ -890,6 +893,7 @@ pub async fn run_server(
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let fs = init_result.fs;
     let authority = init_result.authority;
+    let _catalog_runtime = init_result.catalog_runtime;
     let leadership_deposed = authority
         .as_ref()
         .map_or_else(CancellationToken::new, |authority| authority.loss_token());

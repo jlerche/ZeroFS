@@ -338,6 +338,20 @@ or GC authority. Durable roots, manifests, active leases, storage operation
 proofs, private epochs, GC guards, and permanent internal ID reservations remain
 in authoritative SlateDB for local and production deployments.
 
+The server's optional `[catalog]` settings own a stable volume UUID, the
+authoritative SlateDB path, private branch-database root, default-off lifecycle
+controls, and one projection selection. `backend = "json"` uses a local file;
+`backend = "postgres"` uses the same projection schema and accepts an
+environment-expanded connection string. Catalog startup requires the shared
+segment pool and retains the authoritative lifecycle for the serving process.
+The live database, catalog, private branch root, and shared pool must occupy
+pairwise-disjoint object-store namespaces.
+Projection open or reconciliation failure is logged but never invalidates the
+SlateDB authority; a later reconciliation can rebuild the projection.
+Catalog startup is currently single-node only: configuration rejects combining
+`[catalog]` with `[replication]` until catalog open and close follow elected
+active ownership and takeover rather than running independently on both nodes.
+
 Operational inspection reads one validated SlateDB generation and returns a
 bounded UUID-ordered page of one resource kind. The production maximum is 256
 records per page. Administrators can inspect live branch UUIDs and roots,

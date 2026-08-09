@@ -1,3 +1,5 @@
+extern crate self as zerofs;
+
 pub mod block_transformer;
 pub mod catalog;
 pub mod config;
