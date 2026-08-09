@@ -290,10 +290,10 @@
 
 - [ ] Establish supported production limits for branches, checkpoints, lineage depth, leases, and segment inventory.
 - [ ] Benchmark root capture and mark generation at those limits.
-- [ ] Verify memory use is bounded by run/shard size rather than total storage size.
+- [x] Verify memory use is bounded by run/shard size rather than total storage size.
 - [ ] Verify external work scales linearly with roots, references, and inventory.
 - [ ] Verify foreground branch and mount latency remains acceptable during GC.
-- [ ] Verify catalog mutations do not contend on one global multi-megabyte CAS object.
+- [x] Verify catalog mutations do not contend on one global multi-megabyte CAS object.
 - [x] Add metrics for phase duration, scanned references, inventory size, quarantined bytes, reclaimed bytes, aborted runs, retained-on-error objects, and backlog.
 - [x] Add alerts for repeated aborted runs, stalled phases, old quarantines, root-open failures, and catalog corruption.
 
@@ -671,3 +671,10 @@
 - Root authentication failures have a dedicated phase-and-reason counter in addition to the fail-closed retained/abort counters. Capture and second-observation verification both emit it before returning, while no error metric is used as deletion authority.
 - The shipped Prometheus rules cover repeated aborts, a phase active for 15 minutes, a quarantine older than 24 hours, root-open failures, and corrupt metadata. A process-local tracker emits the oldest timestamp across concurrently observed active runs and removes only completed or aborted runs; resuming a durable run after restart restores the signal.
 - Operator documentation lists every global collector series, counter aggregation/reset semantics, and the response boundary: keep deletion disabled and inspect authoritative SlateDB plus immutable root/run artifacts. PostgreSQL and JSON remain identical customer projections and are not recovery authority.
+
+### 2026-08-08: bounded-memory and catalog-contention audit
+
+- Mark generation holds at most 8192 segment identities across 256 shard buffers, uses 256 KiB streaming readers/writers, and retains only one binary-carry path per occupied merge level. Inventory likewise sorts at most 8192 physical records for one shard, uses two-reader streaming merges, and processes the fixed 256 pool prefixes sequentially. The million-flush tests prove resident spill paths equal the binary population count and never exceed the logarithmic level bound; the integrated 9000-reference/10001-object case verifies exact classification through the production paths.
+- Artifact descriptors and the durable typed root list are bounded run metadata, while segment references and physical inventory bodies remain external sorted streams. Memory therefore scales with the current buffers, merge levels, and captured root set—not the total number of segment objects or references in storage. Establishing a supported maximum root count and measuring latency/RSS at that envelope remain the adjacent production-limit and benchmark items.
+- Authoritative SlateDB stores branches, checkpoints, leases, tombstones, operations, and indexes under independent keys. A mutation holds the catalog writer lock for one bounded atomic batch and advances a small generation key, but unrelated updates compare only exact record revisions; no mutation reads, serializes, or compare-and-swaps a catalog-wide JSON document. JSON and PostgreSQL consume reconstructible snapshots only after authoritative commits and cannot introduce storage-authority contention.
+- The online binary-carry merge deliberately trades bounded memory for repeated external merge I/O, so the separate “external work scales linearly” item remains open pending measured request/byte amplification at the supported envelope.
