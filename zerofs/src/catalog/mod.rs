@@ -180,6 +180,10 @@ pub enum CatalogProjectionConfig {
     Postgres {
         #[serde(deserialize_with = "deserialize_projection_string")]
         connection_string: String,
+        /// Require certificate-authenticated TLS. Disable only for an isolated
+        /// local test database; secure transport remains the default.
+        #[serde(default = "default_postgres_tls")]
+        tls: bool,
     },
 }
 
@@ -207,13 +211,21 @@ impl CatalogProjectionConfig {
     pub async fn open(&self) -> Result<Arc<dyn CatalogProjection>, CatalogError> {
         match self {
             Self::Json { path } => Ok(Arc::new(JsonCatalogProjection::new(path))),
-            Self::Postgres { connection_string } => {
-                let projection = PostgresCatalogProjection::connect(connection_string).await?;
+            Self::Postgres {
+                connection_string,
+                tls,
+            } => {
+                let projection =
+                    PostgresCatalogProjection::connect_with_tls(connection_string, *tls).await?;
                 projection.migrate().await?;
                 Ok(Arc::new(projection))
             }
         }
     }
+}
+
+const fn default_postgres_tls() -> bool {
+    true
 }
 
 fn deserialize_projection_string<'de, D>(deserializer: D) -> Result<String, D::Error>

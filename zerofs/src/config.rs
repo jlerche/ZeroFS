@@ -1245,6 +1245,7 @@ impl Settings {
         toml_string
             .push_str("# backend = \"json\"\n# path = \".zerofs/catalog-projection.json\"\n");
         toml_string.push_str("# Production alternative: backend = \"postgres\", connection_string = \"${ZEROFS_CATALOG_DATABASE_URL}\"\n");
+        toml_string.push_str("# PostgreSQL TLS is required by default. For an isolated local test database only: tls = false\n");
 
         toml_string.push_str("\n# Optional filesystem configuration\n");
         toml_string
@@ -2274,8 +2275,18 @@ connection_string = "postgresql://catalog.invalid/zerofs"
         let catalog = write_and_load(content).unwrap().catalog.unwrap();
         assert!(matches!(
             catalog.projection,
-            zerofs::catalog::CatalogProjectionConfig::Postgres { connection_string }
-                if connection_string == "postgresql://catalog.invalid/zerofs"
+            zerofs::catalog::CatalogProjectionConfig::Postgres { connection_string, tls }
+                if connection_string == "postgresql://catalog.invalid/zerofs" && tls
+        ));
+
+        let plaintext = content.replace(
+            "connection_string = \"postgresql://catalog.invalid/zerofs\"",
+            "connection_string = \"postgresql://catalog.invalid/zerofs\"\ntls = false",
+        );
+        let catalog = write_and_load(&plaintext).unwrap().catalog.unwrap();
+        assert!(matches!(
+            catalog.projection,
+            zerofs::catalog::CatalogProjectionConfig::Postgres { tls: false, .. }
         ));
 
         let without_pool = content.replace("segment_pool_path = \"volume/segments\"\n", "");

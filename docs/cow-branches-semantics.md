@@ -408,8 +408,11 @@ The server's optional `[catalog]` settings own a stable volume UUID, the
 authoritative SlateDB path, private branch-database root, default-off lifecycle
 controls, and one projection selection. `backend = "json"` uses a local file;
 `backend = "postgres"` uses the same projection schema and accepts an
-environment-expanded connection string. Catalog startup requires the shared
-segment pool and retains the authoritative lifecycle for the serving process.
+environment-expanded connection string. PostgreSQL transport requires
+certificate-authenticated TLS by default. An isolated local test database may
+set `tls = false` in `[catalog.projection]`; production deployments must retain
+the secure default. Catalog startup requires the shared segment pool and
+retains the authoritative lifecycle for the serving process.
 The live database, catalog, private branch root, and shared pool must occupy
 pairwise-disjoint object-store namespaces.
 Projection open or reconciliation failure is logged but never invalidates the

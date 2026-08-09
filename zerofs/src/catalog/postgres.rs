@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, Row, Transaction, config::SslMode};
+use tokio_postgres::{Client, NoTls, Row, Transaction, config::SslMode};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -31,7 +31,32 @@ impl std::fmt::Debug for PostgresCatalogProjection {
 
 impl PostgresCatalogProjection {
     pub async fn connect(connection_string: &str) -> Result<Self, CatalogError> {
+        Self::connect_with_tls(connection_string, true).await
+    }
+
+    /// Connect with secure transport by default, with an explicit plaintext
+    /// escape hatch for isolated local test databases.
+    pub async fn connect_with_tls(
+        connection_string: &str,
+        tls: bool,
+    ) -> Result<Self, CatalogError> {
         let mut config = connection_string.parse::<tokio_postgres::Config>()?;
+        if !tls {
+            config.ssl_mode(SslMode::Disable);
+            let (read_client, read_connection) = config.connect(NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = read_connection.await {
+                    tracing::error!(%error, "catalog projection read connection failed");
+                }
+            });
+            let (write_client, write_connection) = config.connect(NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = write_connection.await {
+                    tracing::error!(%error, "catalog projection write connection failed");
+                }
+            });
+            return Ok(Self::from_clients(read_client, write_client));
+        }
         config.ssl_mode(SslMode::Require);
         let (tls, certificate_errors) =
             MakeRustlsConnect::with_native_certs().map_err(|errors| {

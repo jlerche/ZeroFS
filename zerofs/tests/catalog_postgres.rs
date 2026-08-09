@@ -24,6 +24,26 @@ async fn connect(url: &str) -> (PostgresCatalogProjection, tokio_postgres::Clien
 
 #[tokio::test]
 #[ignore = "requires ZEROFS_TEST_POSTGRES_URL pointing to a disposable PostgreSQL database"]
+async fn explicit_plaintext_connector_migrates_local_postgres() {
+    let url = std::env::var("ZEROFS_TEST_POSTGRES_URL").unwrap();
+    let projection = PostgresCatalogProjection::connect_with_tls(&url, false)
+        .await
+        .unwrap();
+    projection.migrate().await.unwrap();
+    projection
+        .reconcile(
+            Uuid::new_v4(),
+            &CatalogSnapshot {
+                generation: 1,
+                ..CatalogSnapshot::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires ZEROFS_TEST_POSTGRES_URL pointing to a disposable PostgreSQL database"]
 async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() {
     let url = std::env::var("ZEROFS_TEST_POSTGRES_URL").unwrap();
     let (projection, inspection) = connect(&url).await;
