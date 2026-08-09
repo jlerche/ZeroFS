@@ -8,7 +8,7 @@ use super::{
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
-use object_store::ObjectStoreExt;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -686,24 +686,7 @@ impl RootCaptureLifecycle {
         run_id: Uuid,
         policy: GcArtifactCleanupPolicy,
     ) -> Result<GcArtifactCleanupReport, RootCaptureLifecycleError> {
-        validate_timestamp(policy.observed_at, "GC artifact cleanup observation")?;
-        if !policy.enabled {
-            return Err(CatalogError::Invalid(
-                "GC artifact cleanup is disabled by policy".to_string(),
-            )
-            .into());
-        }
-        if policy.max_objects == 0 || policy.max_objects > MAX_ARTIFACT_CLEANUP_OBJECTS {
-            return Err(CatalogError::Invalid(format!(
-                "GC artifact cleanup batch must be between 1 and {MAX_ARTIFACT_CLEANUP_OBJECTS}"
-            ))
-            .into());
-        }
-        let retention = i64::try_from(policy.retention_seconds)
-            .map_err(|_| CatalogError::Invalid("GC artifact retention is too large".to_string()))?;
-        let retention_duration = Duration::try_seconds(retention).ok_or_else(|| {
-            CatalogError::Invalid("GC artifact retention is too large".to_string())
-        })?;
+        let (retention_duration, object_cutoff) = validate_cleanup_policy(policy)?;
         let run = self
             .catalog
             .gc_run(run_id)
@@ -731,21 +714,169 @@ impl RootCaptureLifecycle {
             ))
             .into());
         }
-        let object_cutoff = policy
-            .observed_at
-            .checked_sub_signed(retention_duration)
-            .ok_or_else(|| {
-                CatalogError::Invalid("GC artifact retention cutoff underflows".to_string())
-            })?;
-        let store = self.roots.object_store();
-        let prefix = object_store::path::Path::from(format!("{GC_ARTIFACT_PREFIX}/{run_id}"));
-        let mut listing = store.list(Some(&prefix));
-        let mut report = GcArtifactCleanupReport::default();
+        let mut prefixes = vec![object_store::path::Path::from(format!(
+            "{GC_ARTIFACT_PREFIX}/{run_id}"
+        ))];
+        if let Some(observation) = &run.revalidation
+            && observation.id != run_id
+        {
+            prefixes.push(object_store::path::Path::from(format!(
+                "{GC_ARTIFACT_PREFIX}/{}",
+                observation.id
+            )));
+        }
+        cleanup_artifact_prefixes(
+            self.roots.object_store(),
+            &prefixes,
+            object_cutoff,
+            policy.max_objects,
+        )
+        .await
+    }
 
-        while report.examined < policy.max_objects as u64 {
+    /// Delete bounded, phase-obsolete build artifacts while retaining every
+    /// shard still needed to retry or complete the active run. Completed runs
+    /// use [`Self::cleanup_artifacts`] so their one retention boundary also
+    /// covers the second observation's sibling namespace.
+    pub async fn cleanup_obsolete_artifacts(
+        &self,
+        run_id: Uuid,
+        policy: GcArtifactCleanupPolicy,
+    ) -> Result<GcArtifactCleanupReport, RootCaptureLifecycleError> {
+        let (retention_duration, object_cutoff) = validate_cleanup_policy(policy)?;
+        let run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        run.validate()?;
+        if run.phase == GcRunPhase::Completed {
+            return Err(CatalogError::OperationConflict(format!(
+                "GC run {run_id} is complete; use completed artifact cleanup"
+            ))
+            .into());
+        }
+        let retain_until = run
+            .updated_at
+            .checked_add_signed(retention_duration)
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC artifact retention deadline overflows".to_string())
+            })?;
+        if policy.observed_at < retain_until {
+            return Err(CatalogError::OperationConflict(format!(
+                "GC run {run_id} phase artifacts are retained until {retain_until}"
+            ))
+            .into());
+        }
+
+        let parent = format!("{GC_ARTIFACT_PREFIX}/{run_id}");
+        let mut prefixes = Vec::new();
+        if matches!(
+            run.phase,
+            GcRunPhase::Marking
+                | GcRunPhase::Quarantined
+                | GcRunPhase::Revalidating
+                | GcRunPhase::Validated
+                | GcRunPhase::Deleting
+        ) {
+            for class in ["mark-runs", "mark-merge", "mark-online"] {
+                prefixes.push(object_store::path::Path::from(format!("{parent}/{class}")));
+            }
+        }
+        if matches!(
+            run.phase,
+            GcRunPhase::Quarantined
+                | GcRunPhase::Revalidating
+                | GcRunPhase::Validated
+                | GcRunPhase::Deleting
+        ) {
+            for class in ["inventory-runs", "inventory-online", "inventory"] {
+                prefixes.push(object_store::path::Path::from(format!("{parent}/{class}")));
+            }
+        }
+        if matches!(run.phase, GcRunPhase::Validated | GcRunPhase::Deleting) {
+            for class in ["marks", "quarantine"] {
+                prefixes.push(object_store::path::Path::from(format!("{parent}/{class}")));
+            }
+            let observation = run.revalidation.as_ref().ok_or_else(|| {
+                CatalogError::Corrupt("validated GC run has no revalidation".to_string())
+            })?;
+            let observation_parent = format!("{GC_ARTIFACT_PREFIX}/{}", observation.id);
+            for class in ["mark-runs", "mark-merge", "mark-online"] {
+                prefixes.push(object_store::path::Path::from(format!(
+                    "{observation_parent}/{class}"
+                )));
+            }
+        }
+
+        cleanup_artifact_prefixes(
+            self.roots.object_store(),
+            &prefixes,
+            object_cutoff,
+            policy.max_objects,
+        )
+        .await
+    }
+
+    async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
+        if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
+            let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        let _ = self
+            .catalog
+            .record_gc_blocker(run_id, kind, detail, catalog_timestamp(Utc::now()))
+            .await;
+    }
+}
+
+fn validate_cleanup_policy(
+    policy: GcArtifactCleanupPolicy,
+) -> Result<(Duration, DateTime<Utc>), RootCaptureLifecycleError> {
+    validate_timestamp(policy.observed_at, "GC artifact cleanup observation")?;
+    if !policy.enabled {
+        return Err(
+            CatalogError::Invalid("GC artifact cleanup is disabled by policy".to_string()).into(),
+        );
+    }
+    if policy.max_objects == 0 || policy.max_objects > MAX_ARTIFACT_CLEANUP_OBJECTS {
+        return Err(CatalogError::Invalid(format!(
+            "GC artifact cleanup batch must be between 1 and {MAX_ARTIFACT_CLEANUP_OBJECTS}"
+        ))
+        .into());
+    }
+    let retention = i64::try_from(policy.retention_seconds)
+        .map_err(|_| CatalogError::Invalid("GC artifact retention is too large".to_string()))?;
+    let retention_duration = Duration::try_seconds(retention)
+        .ok_or_else(|| CatalogError::Invalid("GC artifact retention is too large".to_string()))?;
+    let object_cutoff = policy
+        .observed_at
+        .checked_sub_signed(retention_duration)
+        .ok_or_else(|| {
+            CatalogError::Invalid("GC artifact retention cutoff underflows".to_string())
+        })?;
+    Ok((retention_duration, object_cutoff))
+}
+
+async fn cleanup_artifact_prefixes(
+    store: Arc<dyn ObjectStore>,
+    prefixes: &[object_store::path::Path],
+    object_cutoff: DateTime<Utc>,
+    max_objects: usize,
+) -> Result<GcArtifactCleanupReport, RootCaptureLifecycleError> {
+    let mut report = GcArtifactCleanupReport::default();
+    for prefix in prefixes {
+        if report.examined == max_objects as u64 {
+            report.has_more = true;
+            return Ok(report);
+        }
+        let mut listing = store.list(Some(prefix));
+        while report.examined < max_objects as u64 {
             let Some(next) = listing.next().await else {
-                report.has_more = report.retained_too_young != 0;
-                return Ok(report);
+                break;
             };
             let meta =
                 next.map_err(|error| RootCaptureLifecycleError::Artifact(error.to_string()))?;
@@ -774,23 +905,9 @@ impl RootCaptureLifecycle {
                 }
             }
         }
-        report.has_more = true;
-        Ok(report)
     }
-
-    async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
-        if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
-            let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
-            while !detail.is_char_boundary(end) {
-                end -= 1;
-            }
-            detail.truncate(end);
-        }
-        let _ = self
-            .catalog
-            .record_gc_blocker(run_id, kind, detail, catalog_timestamp(Utc::now()))
-            .await;
-    }
+    report.has_more = report.retained_too_young != 0 || report.examined == max_objects as u64;
+    Ok(report)
 }
 
 fn classify_mark_error(error: &GcMarkError) -> GcBlockerKind {
@@ -1223,7 +1340,47 @@ mod tests {
             SlateDbRootStore::new(Arc::clone(&store), Path::from("gc-revalidation-branches"))
                 .with_segment_pool_root(segment_pool.clone()),
         );
-        lifecycle.mark(run.id).await.unwrap();
+        let marked = lifecycle.mark(run.id).await.unwrap();
+        let obsolete_policy = GcArtifactCleanupPolicy {
+            enabled: true,
+            retention_seconds: 1,
+            max_objects: MAX_ARTIFACT_CLEANUP_OBJECTS,
+            observed_at: marked.updated_at + Duration::seconds(1),
+        };
+        assert!(matches!(
+            lifecycle
+                .cleanup_obsolete_artifacts(
+                    run.id,
+                    GcArtifactCleanupPolicy {
+                        observed_at: marked.updated_at,
+                        ..obsolete_policy
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
+        assert!(
+            !lifecycle
+                .cleanup_obsolete_artifacts(run.id, obsolete_policy)
+                .await
+                .unwrap()
+                .has_more
+        );
+        for class in ["mark-runs", "mark-merge", "mark-online"] {
+            let prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}/{class}", run.id));
+            assert!(store.list(Some(&prefix)).next().await.is_none());
+        }
+        for shard in &marked.mark_shards {
+            assert!(
+                store
+                    .head(&Path::from(shard.location.clone()))
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(lifecycle.mark(run.id).await.unwrap(), marked);
         let quarantined = lifecycle.quarantine(run.id).await.unwrap();
         assert_eq!(
             quarantined
@@ -1233,6 +1390,30 @@ mod tests {
                 .candidate_objects,
             4
         );
+        let obsolete_policy = GcArtifactCleanupPolicy {
+            observed_at: quarantined.updated_at + Duration::seconds(1),
+            ..obsolete_policy
+        };
+        assert!(
+            !lifecycle
+                .cleanup_obsolete_artifacts(run.id, obsolete_policy)
+                .await
+                .unwrap()
+                .has_more
+        );
+        for class in ["inventory-runs", "inventory-online", "inventory"] {
+            let prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}/{class}", run.id));
+            assert!(store.list(Some(&prefix)).next().await.is_none());
+        }
+        for shard in &quarantined.quarantine_shards {
+            assert!(
+                store
+                    .head(&Path::from(shard.location.clone()))
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(lifecycle.quarantine(run.id).await.unwrap(), quarantined);
         store
             .delete(&Path::from(format!(
                 "{segment_pool}/{}",
@@ -1330,6 +1511,56 @@ mod tests {
         assert_eq!(stats.became_reachable, 1);
         assert_eq!(stats.already_absent, 1);
         assert_eq!(stats.retained_candidates, 2);
+        let observation = validated.revalidation.as_ref().unwrap();
+        let observation_prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}", observation.id));
+        assert!(store.list(Some(&observation_prefix)).next().await.is_some());
+        let obsolete_policy = GcArtifactCleanupPolicy {
+            observed_at: validated.updated_at + Duration::seconds(1),
+            ..obsolete_policy
+        };
+        assert!(
+            !lifecycle
+                .cleanup_obsolete_artifacts(run.id, obsolete_policy)
+                .await
+                .unwrap()
+                .has_more
+        );
+        for path in marked
+            .mark_shards
+            .iter()
+            .map(|shard| &shard.location)
+            .chain(
+                quarantined
+                    .quarantine_shards
+                    .iter()
+                    .map(|shard| &shard.location),
+            )
+        {
+            assert!(matches!(
+                store.head(&Path::from(path.clone())).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
+        for path in observation
+            .mark_shards
+            .iter()
+            .map(|shard| &shard.location)
+            .chain(
+                observation
+                    .candidate_shards
+                    .iter()
+                    .map(|shard| &shard.location),
+            )
+        {
+            assert!(store.head(&Path::from(path.clone())).await.is_ok());
+        }
+        assert_eq!(
+            lifecycle
+                .cleanup_obsolete_artifacts(run.id, obsolete_policy)
+                .await
+                .unwrap(),
+            GcArtifactCleanupReport::default()
+        );
         let mut malformed = validated.clone();
         malformed
             .revalidation
@@ -1425,8 +1656,23 @@ mod tests {
             lifecycle.delete_batch(run.id, policy).await.unwrap(),
             completed
         );
+        assert!(matches!(
+            lifecycle
+                .cleanup_obsolete_artifacts(
+                    run.id,
+                    GcArtifactCleanupPolicy {
+                        observed_at: completed.updated_at + Duration::seconds(1),
+                        ..obsolete_policy
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
         let artifact_prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}", run.id));
         assert!(store.list(Some(&artifact_prefix)).next().await.is_some());
+        assert!(store.list(Some(&observation_prefix)).next().await.is_some());
         let other_run_artifact =
             Path::from(format!("{GC_ARTIFACT_PREFIX}/{}/keep.bin", Uuid::new_v4()));
         store
@@ -1488,6 +1734,7 @@ mod tests {
         }
         assert!(cleanup_complete, "bounded artifact cleanup must converge");
         assert!(store.list(Some(&artifact_prefix)).next().await.is_none());
+        assert!(store.list(Some(&observation_prefix)).next().await.is_none());
         assert!(store.head(&other_run_artifact).await.is_ok());
         assert!(
             store

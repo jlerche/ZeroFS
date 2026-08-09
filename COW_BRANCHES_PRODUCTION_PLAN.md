@@ -258,7 +258,7 @@
 
 - [x] Remove old tombstones only after no active lease or GC run can observe their catalog generation.
 - [x] Remove completed GC run artifacts after a retention period.
-- [ ] Remove obsolete mark runs and quarantine records idempotently.
+- [x] Remove obsolete mark runs and quarantine records idempotently.
 - [ ] Bound cleanup work per pass and expose backlog metrics.
 
 ## Phase 5: Verification and fault testing
@@ -582,6 +582,13 @@
 ### 2026-08-08: retained completed-run artifact cleanup
 
 - A disabled-by-default cleanup entry point accepts one exact schema-valid `Completed` global GC run, an observation timestamp, a retention period, and a `1..=4096` object ceiling. It rejects active/incomplete runs and observations before `completed_at + retention`; catalog run records and their bounded deletion audit remain intact.
-- Cleanup is confined to the canonical `__zerofs_gc/<run UUID>/` prefix, disjoint from the segment pool, catalog, and branch namespaces. It removes final mark/inventory/quarantine/revalidation shards and intermediate run/merge files together, but retains any object whose own storage timestamp has not crossed the same retention cutoff.
+- Cleanup is confined to the canonical `__zerofs_gc/<run UUID>/` prefix plus the completed run's exact second-observation `__zerofs_gc/<observation UUID>/` mark prefix, both disjoint from the segment pool, catalog, and branch namespaces. It removes final mark/inventory/quarantine/revalidation shards and intermediate run/merge files together, but retains any object whose own storage timestamp has not crossed the same retention cutoff.
 - Each pass lists and confirm-deletes at most the configured ceiling. A confirmed absent object reconciles an ambiguous or lost delete response, the shrinking prefix is the crash-resumable cursor, an empty retry is an exact no-op, and the report exposes examined/deleted/already-absent/too-young counts plus conservative remaining work.
-- Executable proof runs the complete two-observation collector through physical deletion, rejects disabled and premature cleanup, drains its artifact namespace over bounded passes, verifies the segment-pool boundary, and proves an empty exact retry. Phase-aware cleanup of abandoned/obsolete artifacts without a completed run and exported backlog scheduling remain open in the following Epic 4.6 items.
+- Executable proof runs the complete two-observation collector through physical deletion, rejects disabled and premature cleanup, drains both exact artifact namespaces over bounded passes, verifies the segment-pool boundary, and proves an empty exact retry. Exported backlog scheduling remains open in the following Epic 4.6 item.
+
+### 2026-08-08: phase-aware GC artifact cleanup
+
+- A separate disabled-by-default operation cleans only artifact classes made obsolete by one exact schema-valid active run phase. It waits until `updated_at + retention`, applies the same per-object age fence and shared `1..=4096` ceiling, and rejects completed runs so their parent and sibling namespaces remain governed by the single completed-run retention boundary.
+- Published first marks survive through quarantine and revalidation; published quarantine shards survive until the second observation is validated. Validated and deleting runs may then discard those first-observation records, while the second observation's final marks and parent-owned revalidation candidates remain authoritative through deletion. Build runs, online merges, merge rounds, and superseded inventory files are removed as soon as their publishing phase makes them retry-independent.
+- Prefix selection is derived exclusively from the exact catalog run and observation UUID. Confirmed absence reconciles ambiguous delete responses, relisting is crash-resumable and idempotent, and reaching the object ceiling reports conservative remaining work even when the last selected prefix supplied the entire batch.
+- The complete lifecycle test cleans after mark publication, quarantine publication, and second-observation validation, verifies each exact retry still succeeds, completes physical deletion from the retained candidate shards, and finally proves completed cleanup drains both the parent run namespace and the sibling observation-mark namespace.
