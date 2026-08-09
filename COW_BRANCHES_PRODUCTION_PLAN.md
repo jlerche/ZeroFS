@@ -249,7 +249,7 @@
 ### Epic 4.5: Add fast local GC
 
 - [x] Define a proof that a segment is private to one exact branch incarnation.
-- [ ] Reclaim private segments without consulting every other branch or checkpoint.
+- [x] Reclaim private segments without consulting every other branch or checkpoint.
 - [x] Continue using global GC for inherited, shared, or ambiguous segments.
 - [x] Ensure local GC respects checkpoints and active leases on the same branch.
 - [x] Fall back to global retention whenever private ownership cannot be proven.
@@ -563,4 +563,11 @@
 
 - The coordinator no longer materializes a complete catalog snapshot to choose work. A backend-specific owner view reads only private-epoch and active-guard state plus the exact valid ready owner branch, requires its durable-root identity to equal the authenticated database identity, returns the oldest matching guard or a bounded list of matching sealed epochs, and validates every returned record.
 - The barrier-through-delete loop no longer reloads every branch, checkpoint, lease, operation, GC run, tombstone, and audit record for every candidate. One lock-consistent point-read view fetches only the exact guard, progress, guarded epoch, and current writer epoch; corrupt guard/progress retirement relationships fail closed.
-- The existing full-snapshot defaults remain only as safe compatibility behavior for test catalog wrappers. Authoritative SlateDB overrides them with targeted reads. Missing, malformed, non-ready, wrong-key, or wrong-root owner branches fail closed in both work selection and the deletion-capable guard view. The remaining Epic 4.5 item stays open until guard acquisition's broad root-blocker scans are replaced by atomic exact indexes.
+- The existing full-snapshot defaults remain only as safe compatibility behavior for test catalog wrappers. Authoritative SlateDB overrides them with targeted reads. Missing, malformed, non-ready, wrong-key, or wrong-root owner branches fail closed in both work selection and the deletion-capable guard view.
+
+### 2026-08-08: exact private-GC blocker indexes
+
+- Catalog schema v15 replaces guard admission's full checkpoint, lease, create-operation, and GC-run scans with one exact per-branch blocker record plus one global root-retaining-GC counter. The branch record counts only that exact never-reused branch's checkpoints, leases, and incomplete child creates; unrelated branches do not block local collection.
+- Every root-bearing lifecycle transition updates its record and blocker count in the same durable SlateDB batch. Checkpoint leases remain attributed through the live checkpoint or its root-free tombstone, deleted branch blocker records remain available until metadata retention is safe, and checked overflow/underflow or a missing record fails closed.
+- Upgrade rebuilds the derived records from authoritative roots before schema v15 publication. Full snapshots audit every derived count against those roots, while deletion-capable guard admission performs only exact keyed reads under the catalog mutation lock. PostgreSQL and JSON remain the same customer projection and receive none of these storage-authority indexes.
+- Focused proof covers same-branch checkpoint/lease/create blockers, unrelated branch roots that do not block, exact retry behavior, v2-through-v14 rebuilds, and corruption of either branch or global indexes. This closes the final Epic 4.5 scalability item; inherited, shared, global-GC-pinned, or ambiguous data still retains and falls back to the global collector.

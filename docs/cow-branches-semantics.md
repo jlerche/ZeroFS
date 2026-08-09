@@ -550,13 +550,25 @@ The authoritative SlateDB backend serves private collection through targeted,
 lock-consistent views. Work selection reads private epochs, active guards, and
 the exact validated ready owner branch rather than materializing every catalog
 collection. Its durable-root identity must equal the authenticated branch
-database identity. Each
-candidate transition point-reads only its guard, progress, guarded epoch, and
-current allocator epoch plus that exact owner branch while the filesystem
-publication barrier is held. Missing, malformed, non-ready, wrong-root, or
-internally inconsistent targeted records retain data. Atomic guard
-admission still performs the broader root-blocker checks described above; those
-checks are the remaining local-GC catalog-scaling boundary.
+database identity. Each candidate transition point-reads only its guard,
+progress, guarded epoch, current allocator epoch, and that exact owner branch
+while the filesystem publication barrier is held. Missing, malformed,
+non-ready, wrong-root, or internally inconsistent targeted records retain data.
+
+Guard admission also avoids catalog-wide root scans. Schema v15 maintains one
+derived blocker record for each exact branch incarnation, counting its live
+checkpoints, leases, and incomplete child creates, plus one singleton count of
+root-retaining global GC runs. The root mutation and its checked counter update
+share one durable SlateDB batch under the catalog mutation lock. A checkpoint
+lease remains attributed to its branch through the live checkpoint or its
+root-free tombstone, and branch blocker records survive logical branch deletion
+so later lease release can still decrement the exact owner. Admission reads
+only the requested branch record and the singleton; roots owned by another
+branch do not block it. Missing, overflowing, underflowing, or audit-mismatched
+records fail closed. Migration rebuilds the derived records from authoritative
+roots, and complete snapshots audit them. These internal indexes are storage
+authority only and are absent from the identical PostgreSQL and JSON customer
+projections.
 
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact

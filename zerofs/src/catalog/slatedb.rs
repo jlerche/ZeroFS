@@ -17,7 +17,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use slatedb::config::WriteOptions;
 use slatedb::object_store::path::Path;
 use slatedb::{Db, WriteBatch};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -38,6 +38,8 @@ const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
 const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
 const LOCAL_GC_PROGRESS_PREFIX: &[u8] = b"catalog/local-gc-progress/";
+const PRIVATE_GC_BRANCH_BLOCKER_PREFIX: &[u8] = b"catalog/private-gc-branch-blocker/";
+const PRIVATE_GC_GLOBAL_BLOCKER_KEY: &[u8] = b"catalog/private-gc-global-blocker";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -51,11 +53,57 @@ const GC_REVALIDATION_SCHEMA_VERSION: u32 = 10;
 const GC_DELETION_SCHEMA_VERSION: u32 = 11;
 const PRIVATE_EPOCH_SCHEMA_VERSION: u32 = 12;
 const LOCAL_GC_GUARD_SCHEMA_VERSION: u32 = 13;
+const TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
     schema_version: u32,
     generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PrivateGcBranchBlockers {
+    branch_id: Uuid,
+    checkpoints: u64,
+    leases: u64,
+    incomplete_children: u64,
+}
+
+impl PrivateGcBranchBlockers {
+    fn empty(branch_id: Uuid) -> Self {
+        Self {
+            branch_id,
+            checkpoints: 0,
+            leases: 0,
+            incomplete_children: 0,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CatalogError> {
+        if self.branch_id.is_nil() {
+            return Err(CatalogError::Corrupt(
+                "private GC blocker branch UUID is nil".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_clear(&self) -> bool {
+        self.checkpoints == 0 && self.leases == 0 && self.incomplete_children == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PrivateGcGlobalBlockers {
+    root_retaining_gc_runs: u64,
+}
+
+impl PrivateGcGlobalBlockers {
+    fn empty() -> Self {
+        Self {
+            root_retaining_gc_runs: 0,
+        }
+    }
 }
 
 /// Authoritative production catalog stored in a dedicated SlateDB database.
@@ -95,14 +143,16 @@ impl SlateDbCatalog {
                 schema_version: CATALOG_SCHEMA_VERSION,
                 generation: 0,
             };
+            let mut batch = WriteBatch::new();
+            put_json(&mut batch, Bytes::from_static(STATE_KEY), &state)?;
+            put_json(
+                &mut batch,
+                Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+                &PrivateGcGlobalBlockers::empty(),
+            )?;
             catalog
                 .db
-                .put_with_options(
-                    STATE_KEY,
-                    serde_json::to_vec(&state)?,
-                    &slatedb::config::PutOptions::default(),
-                    &durable_write_options(),
-                )
+                .write_with_options(batch, &durable_write_options())
                 .await?;
         } else {
             catalog.migrate_unlocked().await?;
@@ -155,6 +205,7 @@ impl SlateDbCatalog {
             GC_DELETION_SCHEMA_VERSION,
             PRIVATE_EPOCH_SCHEMA_VERSION,
             LOCAL_GC_GUARD_SCHEMA_VERSION,
+            TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -209,6 +260,14 @@ impl SlateDbCatalog {
                     .await?;
             }
         }
+        self.rebuild_private_gc_blockers_unlocked()
+            .await
+            .map_err(|error| {
+                CatalogError::Invalid(format!(
+                    "SlateDB catalog v{} cannot migrate to v{CATALOG_SCHEMA_VERSION}: {error}",
+                    state.schema_version
+                ))
+            })?;
         self.snapshot_unlocked(CatalogState {
             schema_version: CATALOG_SCHEMA_VERSION,
             generation: state.generation,
@@ -329,6 +388,7 @@ impl SlateDbCatalog {
                 .collect(),
         };
         snapshot.validate()?;
+        self.audit_private_gc_blockers_unlocked(&snapshot).await?;
         Ok(snapshot)
     }
 
@@ -415,6 +475,286 @@ impl SlateDbCatalog {
         Ok(branch)
     }
 
+    async fn lease_branch_id_unlocked(&self, lease: &LeaseRecord) -> Result<Uuid, CatalogError> {
+        match lease.subject_kind {
+            LeaseSubjectKind::Branch => Ok(lease.subject_id),
+            LeaseSubjectKind::Checkpoint => {
+                if let Some(checkpoint) = self
+                    .get_record::<CheckpointRecord>(checkpoint_key(lease.subject_id))
+                    .await?
+                {
+                    checkpoint.validate()?;
+                    return Ok(checkpoint.branch_id);
+                }
+                let tombstone = self
+                    .get_record::<TombstoneRecord>(tombstone_key(lease.subject_id))
+                    .await?
+                    .filter(|record| record.kind == TombstoneKind::Checkpoint)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt(format!(
+                            "checkpoint lease {} has no live or deleted subject",
+                            lease.id
+                        ))
+                    })?;
+                tombstone.parent_id.ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "checkpoint lease {} tombstone lost its branch",
+                        lease.id
+                    ))
+                })
+            }
+        }
+    }
+
+    async fn private_gc_branch_blockers_unlocked(
+        &self,
+        branch_id: Uuid,
+    ) -> Result<PrivateGcBranchBlockers, CatalogError> {
+        let record = self
+            .get_record::<PrivateGcBranchBlockers>(private_gc_branch_blocker_key(branch_id))
+            .await?
+            .ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "private GC blocker record for branch {branch_id} is missing"
+                ))
+            })?;
+        record.validate()?;
+        if record.branch_id != branch_id {
+            return Err(CatalogError::Corrupt(format!(
+                "private GC blocker key {branch_id} contains {}",
+                record.branch_id
+            )));
+        }
+        Ok(record)
+    }
+
+    async fn private_gc_global_blockers_unlocked(
+        &self,
+    ) -> Result<PrivateGcGlobalBlockers, CatalogError> {
+        self.get_record::<PrivateGcGlobalBlockers>(Bytes::from_static(
+            PRIVATE_GC_GLOBAL_BLOCKER_KEY,
+        ))
+        .await?
+        .ok_or_else(|| {
+            CatalogError::Corrupt("private GC global blocker record is missing".to_string())
+        })
+    }
+
+    async fn rebuild_private_gc_blockers_unlocked(&self) -> Result<(), CatalogError> {
+        let branches = self.scan_records::<BranchRecord>(BRANCH_PREFIX).await?;
+        let tombstones = self
+            .scan_records::<TombstoneRecord>(TOMBSTONE_PREFIX)
+            .await?;
+        let mut blockers = BTreeMap::new();
+        for branch in branches {
+            branch.validate()?;
+            blockers.insert(branch.id, PrivateGcBranchBlockers::empty(branch.id));
+        }
+        for tombstone in tombstones
+            .into_iter()
+            .filter(|record| record.kind == TombstoneKind::Branch)
+        {
+            tombstone.validate()?;
+            blockers
+                .entry(tombstone.id)
+                .or_insert_with(|| PrivateGcBranchBlockers::empty(tombstone.id));
+        }
+        for checkpoint in self
+            .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
+            .await?
+        {
+            checkpoint.validate()?;
+            let blocker = blockers.get_mut(&checkpoint.branch_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "checkpoint {} has no blocker owner branch {}",
+                    checkpoint.id, checkpoint.branch_id
+                ))
+            })?;
+            increment_blocker(&mut blocker.checkpoints, "checkpoint blocker")?;
+        }
+        for lease in self.scan_records::<LeaseRecord>(LEASE_PREFIX).await? {
+            lease.validate()?;
+            let branch_id = self.lease_branch_id_unlocked(&lease).await?;
+            let blocker = blockers.get_mut(&branch_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "lease {} has no blocker owner branch {branch_id}",
+                    lease.id
+                ))
+            })?;
+            increment_blocker(&mut blocker.leases, "lease blocker")?;
+        }
+        for operation in self
+            .scan_records::<BranchCreateOperation>(BRANCH_CREATE_OPERATION_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|operation| operation.phase != BranchCreatePhase::Published)
+        {
+            operation.validate()?;
+            let parent_id = operation.parent_id.ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "incomplete branch create {} lost its parent",
+                    operation.id
+                ))
+            })?;
+            let blocker = blockers.get_mut(&parent_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "branch create {} has no blocker parent {parent_id}",
+                    operation.id
+                ))
+            })?;
+            increment_blocker(&mut blocker.incomplete_children, "child-create blocker")?;
+        }
+        let mut global = PrivateGcGlobalBlockers::empty();
+        for run in self.scan_records::<GcRunRecord>(GC_RUN_PREFIX).await? {
+            run.validate()?;
+            if run.retains_roots() {
+                increment_blocker(
+                    &mut global.root_retaining_gc_runs,
+                    "root-retaining GC blocker",
+                )?;
+            }
+        }
+
+        let mut batch = WriteBatch::new();
+        let mut old = self
+            .db
+            .scan_prefix(PRIVATE_GC_BRANCH_BLOCKER_PREFIX, ..)
+            .await?;
+        while let Some(entry) = old.next().await? {
+            batch.delete(entry.key);
+        }
+        for blocker in blockers.values() {
+            put_json(
+                &mut batch,
+                private_gc_branch_blocker_key(blocker.branch_id),
+                blocker,
+            )?;
+        }
+        put_json(
+            &mut batch,
+            Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+            &global,
+        )?;
+        self.db
+            .write_with_options(batch, &durable_write_options())
+            .await?;
+        Ok(())
+    }
+
+    async fn audit_private_gc_blockers_unlocked(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(), CatalogError> {
+        let mut expected = BTreeMap::new();
+        for branch_id in snapshot.branches.keys().copied().chain(
+            snapshot
+                .tombstones
+                .values()
+                .filter(|record| record.kind == TombstoneKind::Branch)
+                .map(|record| record.id),
+        ) {
+            expected
+                .entry(branch_id)
+                .or_insert_with(|| PrivateGcBranchBlockers::empty(branch_id));
+        }
+        for checkpoint in snapshot.checkpoints.values() {
+            let blocker = expected.get_mut(&checkpoint.branch_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "checkpoint {} has no blocker owner branch {}",
+                    checkpoint.id, checkpoint.branch_id
+                ))
+            })?;
+            increment_blocker(&mut blocker.checkpoints, "checkpoint blocker")?;
+        }
+        for lease in snapshot.leases.values() {
+            let branch_id = match lease.subject_kind {
+                LeaseSubjectKind::Branch => lease.subject_id,
+                LeaseSubjectKind::Checkpoint => snapshot
+                    .checkpoints
+                    .get(&lease.subject_id)
+                    .map(|checkpoint| checkpoint.branch_id)
+                    .or_else(|| {
+                        snapshot
+                            .tombstones
+                            .get(&lease.subject_id)
+                            .filter(|record| record.kind == TombstoneKind::Checkpoint)
+                            .and_then(|record| record.parent_id)
+                    })
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt(format!(
+                            "checkpoint lease {} lost its branch",
+                            lease.id
+                        ))
+                    })?,
+            };
+            let blocker = expected.get_mut(&branch_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "lease {} has no blocker owner branch {branch_id}",
+                    lease.id
+                ))
+            })?;
+            increment_blocker(&mut blocker.leases, "lease blocker")?;
+        }
+        for operation in snapshot
+            .branch_create_operations
+            .values()
+            .filter(|operation| operation.phase != BranchCreatePhase::Published)
+        {
+            let parent_id = operation.parent_id.ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "incomplete branch create {} lost its parent",
+                    operation.id
+                ))
+            })?;
+            let blocker = expected.get_mut(&parent_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "branch create {} has no blocker parent {parent_id}",
+                    operation.id
+                ))
+            })?;
+            increment_blocker(&mut blocker.incomplete_children, "child-create blocker")?;
+        }
+
+        let mut actual = BTreeMap::new();
+        let mut iterator = self
+            .db
+            .scan_prefix(PRIVATE_GC_BRANCH_BLOCKER_PREFIX, ..)
+            .await?;
+        while let Some(entry) = iterator.next().await? {
+            let blocker = serde_json::from_slice::<PrivateGcBranchBlockers>(&entry.value)?;
+            blocker.validate()?;
+            if entry.key != private_gc_branch_blocker_key(blocker.branch_id)
+                || actual.insert(blocker.branch_id, blocker).is_some()
+            {
+                return Err(CatalogError::Corrupt(
+                    "private GC branch blocker index has a wrong or duplicate key".to_string(),
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(CatalogError::Corrupt(
+                "private GC branch blocker index disagrees with roots".to_string(),
+            ));
+        }
+        let expected_global = PrivateGcGlobalBlockers {
+            root_retaining_gc_runs: snapshot
+                .gc_runs
+                .values()
+                .filter(|run| run.retains_roots())
+                .count()
+                .try_into()
+                .map_err(|_| {
+                    CatalogError::Corrupt("root-retaining GC count overflow".to_string())
+                })?,
+        };
+        if self.private_gc_global_blockers_unlocked().await? != expected_global {
+            return Err(CatalogError::Corrupt(
+                "private GC global blocker index disagrees with GC runs".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn apply_unlocked(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
         let state = self.state_unlocked().await?;
         let next_generation = state
@@ -459,36 +799,16 @@ impl SlateDbCatalog {
                     || epoch.revision != guard.epoch_revision
                     || epoch.state != PrivateEpochState::SealedPrivate
                     || guard.created_at < epoch.updated_at
-                    || !self
-                        .get_record::<BranchRecord>(branch_key(guard.branch_id))
-                        .await?
-                        .is_some_and(|branch| branch.state == BranchState::Ready)
                 {
                     return Err(CatalogError::OperationConflict(guard.id.to_string()));
                 }
-                if self
-                    .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
-                    .await?
-                    .iter()
-                    .any(|checkpoint| checkpoint.branch_id == guard.branch_id)
-                    || !self
-                        .scan_records::<LeaseRecord>(LEASE_PREFIX)
-                        .await?
-                        .is_empty()
-                    || self
-                        .scan_records::<BranchCreateOperation>(BRANCH_CREATE_OPERATION_PREFIX)
-                        .await?
-                        .iter()
-                        .any(|operation| {
-                            operation.parent_id == Some(guard.branch_id)
-                                && operation.phase != BranchCreatePhase::Published
-                        })
-                    || self
-                        .scan_records::<GcRunRecord>(GC_RUN_PREFIX)
-                        .await?
-                        .iter()
-                        .any(GcRunRecord::retains_roots)
-                {
+                self.validate_private_gc_owner_unlocked(guard.branch_id, &epoch.database_identity)
+                    .await?;
+                let branch_blockers = self
+                    .private_gc_branch_blockers_unlocked(guard.branch_id)
+                    .await?;
+                let global_blockers = self.private_gc_global_blockers_unlocked().await?;
+                if !branch_blockers.is_clear() || global_blockers.root_retaining_gc_runs != 0 {
                     return Err(CatalogError::OperationConflict(format!(
                         "local GC guard {} has an authoritative root blocker",
                         guard.id
@@ -931,7 +1251,16 @@ impl SlateDbCatalog {
                         "branch {lease_branch_id} has an active local GC guard"
                     )));
                 }
+                let mut blockers = self
+                    .private_gc_branch_blockers_unlocked(lease_branch_id)
+                    .await?;
+                increment_blocker(&mut blockers.leases, "lease blocker")?;
                 put_json(&mut batch, lease_key(lease.id), &lease)?;
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(lease_branch_id),
+                    &blockers,
+                )?;
             }
             CatalogMutation::RenewLease {
                 id,
@@ -1019,7 +1348,17 @@ impl SlateDbCatalog {
                         "lease release cannot precede issuance".to_string(),
                     ));
                 }
+                let lease_branch_id = self.lease_branch_id_unlocked(&lease).await?;
+                let mut blockers = self
+                    .private_gc_branch_blockers_unlocked(lease_branch_id)
+                    .await?;
+                decrement_blocker(&mut blockers.leases, "lease blocker")?;
                 batch.delete(lease_key(id));
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(lease_branch_id),
+                    &blockers,
+                )?;
                 put_json(
                     &mut batch,
                     lease_tombstone_key(id),
@@ -1053,7 +1392,17 @@ impl SlateDbCatalog {
                 if observed_at < retention_deadline {
                     return Err(CatalogError::OperationConflict(id.to_string()));
                 }
+                let lease_branch_id = self.lease_branch_id_unlocked(&lease).await?;
+                let mut blockers = self
+                    .private_gc_branch_blockers_unlocked(lease_branch_id)
+                    .await?;
+                decrement_blocker(&mut blockers.leases, "lease blocker")?;
                 batch.delete(lease_key(id));
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(lease_branch_id),
+                    &blockers,
+                )?;
                 put_json(
                     &mut batch,
                     lease_tombstone_key(id),
@@ -1125,9 +1474,25 @@ impl SlateDbCatalog {
                 if let Some(parent_id) = operation.parent_id {
                     ensure_known_resource(self.db.as_ref(), parent_id, TombstoneKind::Branch)
                         .await?;
+                    let mut parent_blockers =
+                        self.private_gc_branch_blockers_unlocked(parent_id).await?;
+                    increment_blocker(
+                        &mut parent_blockers.incomplete_children,
+                        "child-create blocker",
+                    )?;
+                    put_json(
+                        &mut batch,
+                        private_gc_branch_blocker_key(parent_id),
+                        &parent_blockers,
+                    )?;
                 }
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
                 batch.put(branch_name_key(&branch.name), branch.id.to_string());
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(branch.id),
+                    &PrivateGcBranchBlockers::empty(branch.id),
+                )?;
                 put_json(
                     &mut batch,
                     branch_create_operation_key(operation.id),
@@ -1233,12 +1598,29 @@ impl SlateDbCatalog {
                 branch.state = BranchState::Ready;
                 branch.root = Some(root);
                 branch.updated_at = updated_at;
+                let parent_id = operation.parent_id.ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "branch create operation {} lost its parent",
+                        operation.id
+                    ))
+                })?;
+                let mut parent_blockers =
+                    self.private_gc_branch_blockers_unlocked(parent_id).await?;
+                decrement_blocker(
+                    &mut parent_blockers.incomplete_children,
+                    "child-create blocker",
+                )?;
                 put_json(
                     &mut batch,
                     branch_create_operation_key(operation.id),
                     &operation,
                 )?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(parent_id),
+                    &parent_blockers,
+                )?;
             }
             #[cfg(test)]
             CatalogMutation::CreateBranch(record) => {
@@ -1270,6 +1652,11 @@ impl SlateDbCatalog {
                 .await?;
                 put_json(&mut batch, branch_key(record.id), &record)?;
                 batch.put(branch_name_key(&record.name), record.id.to_string());
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(record.id),
+                    &PrivateGcBranchBlockers::empty(record.id),
+                )?;
             }
             #[cfg(test)]
             CatalogMutation::ReplaceBranch {
@@ -1344,11 +1731,20 @@ impl SlateDbCatalog {
                     &record.name,
                 )
                 .await?;
+                let mut blockers = self
+                    .private_gc_branch_blockers_unlocked(record.branch_id)
+                    .await?;
+                increment_blocker(&mut blockers.checkpoints, "checkpoint blocker")?;
                 put_json(&mut batch, checkpoint_key(record.id), &record)?;
                 batch.put(
                     checkpoint_name_key(record.branch_id, &record.name),
                     record.id.to_string(),
                 );
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(record.branch_id),
+                    &blockers,
+                )?;
             }
             #[cfg(test)]
             CatalogMutation::ReplaceCheckpoint {
@@ -1423,8 +1819,17 @@ impl SlateDbCatalog {
                     ));
                 }
                 ensure_absent(self.db.as_ref(), tombstone_key(id), &id.to_string()).await?;
+                let mut blockers = self
+                    .private_gc_branch_blockers_unlocked(old.branch_id)
+                    .await?;
+                decrement_blocker(&mut blockers.checkpoints, "checkpoint blocker")?;
                 batch.delete(checkpoint_key(id));
                 batch.delete(checkpoint_name_key(old.branch_id, &name));
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(old.branch_id),
+                    &blockers,
+                )?;
                 put_json(
                     &mut batch,
                     tombstone_key(id),
@@ -1750,13 +2155,20 @@ impl Catalog for SlateDbCatalog {
         }
         ensure_expected_revision(expected_generation, state.generation)?;
         ensure_resource_id_available(self.db.as_ref(), run.id).await?;
+        let mut global = self.private_gc_global_blockers_unlocked().await?;
+        increment_blocker(
+            &mut global.root_retaining_gc_runs,
+            "root-retaining GC blocker",
+        )?;
+        let mut batch = WriteBatch::new();
+        put_json(&mut batch, gc_run_key(run.id), &run)?;
+        put_json(
+            &mut batch,
+            Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+            &global,
+        )?;
         self.db
-            .put_with_options(
-                gc_run_key(run.id),
-                serde_json::to_vec(&run)?,
-                &slatedb::config::PutOptions::default(),
-                &durable_write_options(),
-            )
+            .write_with_options(batch, &durable_write_options())
             .await?;
         Ok(())
     }
@@ -2090,13 +2502,22 @@ impl Catalog for SlateDbCatalog {
         run.deletion = Some(progress);
         run.updated_at = updated_at;
         run.validate()?;
+        let mut batch = WriteBatch::new();
+        put_json(&mut batch, gc_run_key(run.id), &run)?;
+        if run.phase == GcRunPhase::Completed {
+            let mut global = self.private_gc_global_blockers_unlocked().await?;
+            decrement_blocker(
+                &mut global.root_retaining_gc_runs,
+                "root-retaining GC blocker",
+            )?;
+            put_json(
+                &mut batch,
+                Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+                &global,
+            )?;
+        }
         self.db
-            .put_with_options(
-                gc_run_key(run.id),
-                serde_json::to_vec(&run)?,
-                &slatedb::config::PutOptions::default(),
-                &durable_write_options(),
-            )
+            .write_with_options(batch, &durable_write_options())
             .await?;
         Ok(run)
     }
@@ -2222,6 +2643,13 @@ fn local_gc_progress_key(id: Uuid) -> Bytes {
     joined_key(LOCAL_GC_PROGRESS_PREFIX, id.to_string().as_bytes())
 }
 
+fn private_gc_branch_blocker_key(branch_id: Uuid) -> Bytes {
+    joined_key(
+        PRIVATE_GC_BRANCH_BLOCKER_PREFIX,
+        branch_id.to_string().as_bytes(),
+    )
+}
+
 fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
     let mut suffix = run_id.to_string().into_bytes();
     suffix.push(b'/');
@@ -2274,6 +2702,20 @@ fn put_json<T: Serialize>(
     value: &T,
 ) -> Result<(), CatalogError> {
     batch.put(key, serde_json::to_vec(value)?);
+    Ok(())
+}
+
+fn increment_blocker(value: &mut u64, label: &str) -> Result<(), CatalogError> {
+    *value = value
+        .checked_add(1)
+        .ok_or_else(|| CatalogError::Corrupt(format!("{label} count overflow")))?;
+    Ok(())
+}
+
+fn decrement_blocker(value: &mut u64, label: &str) -> Result<(), CatalogError> {
+    *value = value
+        .checked_sub(1)
+        .ok_or_else(|| CatalogError::Corrupt(format!("{label} count underflow")))?;
     Ok(())
 }
 
@@ -2876,6 +3318,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_fails_closed_when_private_gc_blocker_indexes_disagree() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("private-gc-blocker-audit"), store)
+            .await
+            .unwrap();
+        let owner = branch("blocker-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        catalog.snapshot().await.unwrap();
+
+        let mut missing_branch = WriteBatch::new();
+        missing_branch.delete(private_gc_branch_blocker_key(owner.id));
+        catalog
+            .db
+            .write_with_options(missing_branch, &durable_write_options())
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Corrupt(message)) if message.contains("branch blocker index")
+        ));
+
+        let mut wrong_global = WriteBatch::new();
+        put_json(
+            &mut wrong_global,
+            private_gc_branch_blocker_key(owner.id),
+            &PrivateGcBranchBlockers::empty(owner.id),
+        )
+        .unwrap();
+        put_json(
+            &mut wrong_global,
+            Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+            &PrivateGcGlobalBlockers {
+                root_retaining_gc_runs: 1,
+            },
+        )
+        .unwrap();
+        catalog
+            .db
+            .write_with_options(wrong_global, &durable_write_options())
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Corrupt(message)) if message.contains("global blocker index")
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn source_checkpoint_deletion_and_create_reservation_serialize_exactly() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = Arc::new(
@@ -3372,8 +3866,11 @@ mod tests {
             .await
             .unwrap();
         let opened_at = owner.updated_at + chrono::Duration::microseconds(1);
-        let epoch = private_epoch(owner.id, 91, opened_at);
+        let database_identity = owner.root.as_ref().unwrap().identity.clone();
+        let mut epoch = private_epoch(owner.id, 91, opened_at);
+        epoch.database_identity = database_identity.clone();
         let mut next_epoch = private_epoch(owner.id, 92, opened_at);
+        next_epoch.database_identity = database_identity;
         next_epoch.pool_id = epoch.pool_id;
         catalog
             .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
@@ -3426,6 +3923,27 @@ mod tests {
                 expected_revision: lease.revision,
                 token_hash: lease.token_hash.clone(),
                 ended_at: guard.created_at,
+            })
+            .await
+            .unwrap();
+
+        let unrelated = branch("unrelated-guard-blockers");
+        catalog
+            .apply(CatalogMutation::CreateBranch(unrelated.clone()))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(checkpoint(
+                Uuid::new_v4(),
+                unrelated.id,
+                "unrelated-checkpoint",
+            )))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: unrelated.revision,
+                lease: branch_lease(&unrelated, guard.created_at),
             })
             .await
             .unwrap();
@@ -3764,7 +4282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v13_catalogs_to_local_progress_schema_without_rewriting_records() {
+    async fn migrates_v2_through_v14_catalogs_to_targeted_blocker_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -3778,14 +4296,17 @@ mod tests {
             GC_DELETION_SCHEMA_VERSION,
             PRIVATE_EPOCH_SCHEMA_VERSION,
             LOCAL_GC_GUARD_SCHEMA_VERSION,
+            TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v14"));
+            let path = Path::from(format!("migration-v{prior_version}-v15"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
                 .unwrap();
             let existing = branch("existing");
+            let existing_checkpoint =
+                checkpoint(Uuid::new_v4(), existing.id, "existing-checkpoint");
             let mut batch = WriteBatch::new();
             put_json(
                 &mut batch,
@@ -3797,6 +4318,12 @@ mod tests {
             )
             .unwrap();
             put_json(&mut batch, branch_key(existing.id), &existing).unwrap();
+            put_json(
+                &mut batch,
+                checkpoint_key(existing_checkpoint.id),
+                &existing_checkpoint,
+            )
+            .unwrap();
             db.write_with_options(batch, &durable_write_options())
                 .await
                 .unwrap();
@@ -3806,12 +4333,29 @@ mod tests {
             let snapshot = catalog.snapshot().await.unwrap();
             assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
             assert_eq!(snapshot.branches[&existing.id], existing);
+            assert_eq!(
+                snapshot.checkpoints[&existing_checkpoint.id],
+                existing_checkpoint
+            );
             assert!(snapshot.branch_create_operations.is_empty());
             assert!(snapshot.leases.is_empty());
             assert!(snapshot.lease_tombstones.is_empty());
             assert!(snapshot.private_epochs.is_empty());
             assert!(snapshot.local_gc_guards.is_empty());
             assert!(snapshot.local_gc_progress.is_empty());
+            let mut expected_blockers = PrivateGcBranchBlockers::empty(existing.id);
+            expected_blockers.checkpoints = 1;
+            assert_eq!(
+                catalog
+                    .private_gc_branch_blockers_unlocked(existing.id)
+                    .await
+                    .unwrap(),
+                expected_blockers
+            );
+            assert_eq!(
+                catalog.private_gc_global_blockers_unlocked().await.unwrap(),
+                PrivateGcGlobalBlockers::empty()
+            );
             catalog.close().await.unwrap();
         }
     }
