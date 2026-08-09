@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -677,6 +677,58 @@ impl SegmentStore {
     ) -> Result<()> {
         let path = Path::from(format!("{PRIVATE_GC_ARTIFACT_PREFIX}/{guard_id}.bin"));
         self.put_segment_create(&path, bytes).await
+    }
+
+    /// Read one immutable private-GC artifact without permitting an untrusted
+    /// object to allocate beyond the caller's format bound.
+    #[allow(dead_code)] // Used by the disabled private-epoch collector coordinator.
+    pub(crate) async fn get_private_gc_artifact(
+        &self,
+        guard_id: uuid::Uuid,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        let path = Path::from(format!("{PRIVATE_GC_ARTIFACT_PREFIX}/{guard_id}.bin"));
+        let result = self
+            .object_store
+            .get(&path)
+            .await
+            .map_err(|error| match error {
+                slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
+                other => SegmentStoreError::ObjectStore(other.to_string()),
+            })?;
+        let expected_size = result.meta.size;
+        if expected_size > max_bytes {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "private GC artifact {guard_id} exceeds its format bound"
+            )));
+        }
+        let capacity = usize::try_from(expected_size).map_err(|_| {
+            SegmentStoreError::ObjectStore(format!(
+                "private GC artifact {guard_id} length cannot fit in memory"
+            ))
+        })?;
+        let mut bytes = BytesMut::with_capacity(capacity);
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "private GC artifact {guard_id} length overflow"
+                ))
+            })?;
+            if next_len as u64 > max_bytes {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "private GC artifact {guard_id} body exceeds its format bound"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 != expected_size {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "private GC artifact {guard_id} body length disagrees with object metadata"
+            )));
+        }
+        Ok(bytes.freeze())
     }
 
     async fn reconcile_segment_create(

@@ -67,6 +67,14 @@ const MAX_BATCHES_PER_PASS: usize = 32;
 /// (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 
+const PRIVATE_GC_ARTIFACT_MAGIC: &[u8; 8] = b"ZFPGCA01";
+const PRIVATE_GC_ARTIFACT_FIXED_BYTES: usize = 8 + 16 + 16 + 16 + 4 + 8 + 4 + 64;
+const PRIVATE_GC_CANDIDATE_MAX_BYTES: usize = 8 + 8 + 8 + 1 + 8 + 8 + 4 + 32;
+const PRIVATE_GC_DATABASE_IDENTITY_MAX_BYTES: usize = 4 * 1024;
+const PRIVATE_GC_ARTIFACT_MAX_BYTES: usize = PRIVATE_GC_ARTIFACT_FIXED_BYTES
+    + PRIVATE_GC_DATABASE_IDENTITY_MAX_BYTES
+    + crate::fs::MAX_LOCAL_GC_CANDIDATES * PRIVATE_GC_CANDIDATE_MAX_BYTES;
+
 /// Orphan-sweep age floor: an uncounted segment object must have been PUT at
 /// least this long ago before it is deletable. Guards the window where an
 /// object exists but its crediting commit is still in flight (a compaction
@@ -150,6 +158,24 @@ impl PersistedPrivateGcArtifact {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+pub(crate) struct DecodedPrivateGcArtifact {
+    guard_id: uuid::Uuid,
+    batch: PreparedPrivateGcBatch,
+}
+
+#[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+impl DecodedPrivateGcArtifact {
+    pub(crate) fn guard_id(&self) -> uuid::Uuid {
+        self.guard_id
+    }
+
+    pub(crate) fn batch(&self) -> &PreparedPrivateGcBatch {
+        &self.batch
+    }
+}
+
 fn private_candidate_digest(candidates: &[PrivateGcCandidate]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"zerofs-private-gc-candidates-v1");
@@ -178,7 +204,7 @@ fn private_candidate_digest(candidates: &[PrivateGcCandidate]) -> String {
 
 fn encode_private_gc_artifact(guard_id: uuid::Uuid, batch: &PreparedPrivateGcBatch) -> Bytes {
     let mut encoded = Vec::with_capacity(128 + batch.candidates.len() * 96);
-    encoded.extend_from_slice(b"ZFPGCA01");
+    encoded.extend_from_slice(PRIVATE_GC_ARTIFACT_MAGIC);
     encoded.extend_from_slice(guard_id.as_bytes());
     encoded.extend_from_slice(batch.publisher_id.as_bytes());
     encoded.extend_from_slice(batch.branch_id.as_bytes());
@@ -203,6 +229,148 @@ fn encode_private_gc_artifact(guard_id: uuid::Uuid, batch: &PreparedPrivateGcBat
         }
     }
     Bytes::from(encoded)
+}
+
+fn decode_private_gc_artifact(
+    expected_guard_id: uuid::Uuid,
+    bytes: &Bytes,
+) -> Result<DecodedPrivateGcArtifact, FsError> {
+    struct Reader<'a> {
+        remaining: &'a [u8],
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, len: usize) -> Result<&'a [u8], FsError> {
+            if self.remaining.len() < len {
+                return Err(FsError::InvalidArgument);
+            }
+            let (value, remaining) = self.remaining.split_at(len);
+            self.remaining = remaining;
+            Ok(value)
+        }
+
+        fn u32(&mut self) -> Result<u32, FsError> {
+            Ok(u32::from_be_bytes(
+                self.take(4)?
+                    .try_into()
+                    .map_err(|_| FsError::InvalidArgument)?,
+            ))
+        }
+
+        fn u64(&mut self) -> Result<u64, FsError> {
+            Ok(u64::from_be_bytes(
+                self.take(8)?
+                    .try_into()
+                    .map_err(|_| FsError::InvalidArgument)?,
+            ))
+        }
+
+        fn i64(&mut self) -> Result<i64, FsError> {
+            Ok(i64::from_be_bytes(
+                self.take(8)?
+                    .try_into()
+                    .map_err(|_| FsError::InvalidArgument)?,
+            ))
+        }
+
+        fn uuid(&mut self) -> Result<uuid::Uuid, FsError> {
+            uuid::Uuid::from_slice(self.take(16)?).map_err(|_| FsError::InvalidArgument)
+        }
+    }
+
+    if bytes.len() > PRIVATE_GC_ARTIFACT_MAX_BYTES {
+        return Err(FsError::InvalidArgument);
+    }
+    let mut reader = Reader { remaining: bytes };
+    if reader.take(PRIVATE_GC_ARTIFACT_MAGIC.len())? != PRIVATE_GC_ARTIFACT_MAGIC {
+        return Err(FsError::InvalidArgument);
+    }
+    let guard_id = reader.uuid()?;
+    let publisher_id = reader.uuid()?;
+    let branch_id = reader.uuid()?;
+    let database_len = reader.u32()? as usize;
+    if guard_id != expected_guard_id
+        || guard_id.is_nil()
+        || publisher_id.is_nil()
+        || branch_id.is_nil()
+        || database_len == 0
+        || database_len > PRIVATE_GC_DATABASE_IDENTITY_MAX_BYTES
+    {
+        return Err(FsError::InvalidArgument);
+    }
+    let database_identity = std::str::from_utf8(reader.take(database_len)?)
+        .map_err(|_| FsError::InvalidArgument)?
+        .to_string();
+    if database_identity.chars().any(char::is_control) {
+        return Err(FsError::InvalidArgument);
+    }
+    let epoch = reader.u64()?;
+    let candidate_count = reader.u32()? as usize;
+    let candidate_digest = std::str::from_utf8(reader.take(64)?)
+        .map_err(|_| FsError::InvalidArgument)?
+        .to_string();
+    if epoch == 0
+        || candidate_count == 0
+        || candidate_count > crate::fs::MAX_LOCAL_GC_CANDIDATES
+        || !candidate_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(FsError::InvalidArgument);
+    }
+    let mut candidates = Vec::with_capacity(candidate_count);
+    for _ in 0..candidate_count {
+        let segid = Segid::new(reader.u64()?, reader.u64()?);
+        let appended_bytes = reader.u64()?;
+        if segid.epoch != epoch {
+            return Err(FsError::InvalidArgument);
+        }
+        let object_identity = match reader.take(1)?[0] {
+            0 => None,
+            1 => {
+                let identity = SegmentObjectIdentity {
+                    segid,
+                    size: reader.u64()?,
+                    modified_seconds: reader.i64()?,
+                    modified_nanos: reader.u32()?,
+                    content_digest: reader
+                        .take(32)?
+                        .try_into()
+                        .map_err(|_| FsError::InvalidArgument)?,
+                };
+                if identity.modified_nanos >= 1_000_000_000 {
+                    return Err(FsError::InvalidArgument);
+                }
+                Some(identity)
+            }
+            _ => return Err(FsError::InvalidArgument),
+        };
+        candidates.push(PrivateGcCandidate {
+            segid,
+            appended_bytes,
+            object_identity,
+        });
+    }
+    if !reader.remaining.is_empty()
+        || candidates
+            .windows(2)
+            .any(|pair| pair[0].segid >= pair[1].segid)
+        || private_candidate_digest(&candidates) != candidate_digest
+    {
+        return Err(FsError::InvalidArgument);
+    }
+    let batch = PreparedPrivateGcBatch {
+        publisher_id,
+        branch_id,
+        database_identity,
+        epoch,
+        candidates,
+        candidate_digest,
+    };
+    if encode_private_gc_artifact(guard_id, &batch) != *bytes {
+        return Err(FsError::InvalidArgument);
+    }
+    Ok(DecodedPrivateGcArtifact { guard_id, batch })
 }
 
 /// What one reclaim pass did and whether it left actionable work behind —
@@ -245,6 +413,24 @@ pub enum PassStatus {
 }
 
 impl ExtentStore {
+    /// Recover and strictly decode one immutable candidate artifact. This is
+    /// read-only: catalog guard revalidation still precedes any future delete.
+    #[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+    pub(crate) async fn load_private_gc_artifact(
+        &self,
+        guard_id: uuid::Uuid,
+    ) -> Result<DecodedPrivateGcArtifact, FsError> {
+        if guard_id.is_nil() {
+            return Err(FsError::InvalidArgument);
+        }
+        let bytes = self
+            .segment_store()
+            .get_private_gc_artifact(guard_id, PRIVATE_GC_ARTIFACT_MAX_BYTES as u64)
+            .await
+            .map_err(|_| FsError::IoError)?;
+        decode_private_gc_artifact(guard_id, &bytes)
+    }
+
     /// Publish the exact bounded candidate descriptor set under an immutable
     /// operation key. Exact retries reconcile byte-for-byte; a conflicting use
     /// of the UUID fails and cannot be attached to catalog authority.
@@ -1633,6 +1819,25 @@ mod tests {
             .persist_private_gc_batch(guard_id, &first)
             .await
             .expect("exact immutable artifact retry reconciles");
+        let recovered = store.load_private_gc_artifact(guard_id).await.unwrap();
+        assert_eq!(recovered.guard_id(), guard_id);
+        assert_eq!(recovered.batch(), &first);
+        let canonical = encode_private_gc_artifact(guard_id, &first);
+        assert!(matches!(
+            decode_private_gc_artifact(uuid::Uuid::new_v4(), &canonical),
+            Err(FsError::InvalidArgument)
+        ));
+        let mut trailing = canonical.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            decode_private_gc_artifact(guard_id, &Bytes::from(trailing)),
+            Err(FsError::InvalidArgument)
+        ));
+        let truncated = canonical.slice(..canonical.len() - 1);
+        assert!(matches!(
+            decode_private_gc_artifact(guard_id, &truncated),
+            Err(FsError::InvalidArgument)
+        ));
 
         // The same operation UUID cannot be rebound after storage changes.
         store.segments.delete_segment(dead).await.unwrap();

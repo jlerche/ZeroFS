@@ -494,7 +494,14 @@ reauthenticates the permanent branch-epoch marker and exact authoritative
 blockers. Thus same-pool credentials cannot attach branch A's local candidates
 to a valid epoch owned by branch B. The artifact and guard remain
 SlateDB/object-store authority and are not projected to PostgreSQL or JSON.
-Physical deletion remains disabled pending durable artifact decode/recovery and
+Recovery reads the immutable object only after rejecting an oversized metadata
+length, then strictly decodes bounded fields, exact UTF-8 owner identity,
+same-epoch strictly ordered segment IDs, canonical optional object identities,
+the recomputed candidate digest, and the exact original canonical bytes. Wrong
+guard UUIDs, truncation, trailing bytes, malformed timestamps, duplicate or
+reordered candidates, and noncanonical encodings fail closed. This read-only
+primitive grants no deletion authority. Physical deletion remains disabled
+pending guard-bound recovery validation, former-writer fencing/quiescence, and
 the barrier-through-delete worker.
 
 Epoch reservations are globally unique but not numerically ordered. No local-GC
