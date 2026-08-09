@@ -166,6 +166,10 @@ impl RootCaptureLifecycle {
                 return Err(error.into());
             }
         };
+        if let Some(branch_id) = mutable_writer_branch(&snapshot) {
+            record_gc_capture_abort(GcBlockerKind::LeaseUncertainty);
+            return Err(CatalogError::WriterLeaseActive(branch_id).into());
+        }
         let inventory_cutoff = catalog_timestamp(Utc::now());
         let pins = snapshot.gc_root_pins();
         let root_store = self.roots.clone();
@@ -565,6 +569,15 @@ impl RootCaptureLifecycle {
                 });
             }
             let snapshot = self.snapshot_for_phase().await?;
+            if let Some(branch_id) = mutable_writer_branch(&snapshot) {
+                self.record_blocker(
+                    run_id,
+                    GcBlockerKind::LeaseUncertainty,
+                    format!("branch {branch_id} has an unreconciled mutable writer"),
+                )
+                .await;
+                return Err(CatalogError::WriterLeaseActive(branch_id).into());
+            }
             let pins = snapshot.gc_root_pins();
             let root_store = self.roots.clone();
             let mut verification = stream::iter(pins.iter().cloned())
@@ -1350,6 +1363,14 @@ fn classify_catalog_error(error: &CatalogError) -> GcBlockerKind {
     }
 }
 
+fn mutable_writer_branch(snapshot: &super::CatalogSnapshot) -> Option<Uuid> {
+    snapshot
+        .leases
+        .values()
+        .find(|lease| lease.access_mode == super::LeaseAccessMode::Write)
+        .map(|lease| lease.subject_id)
+}
+
 fn classify_inventory_error(error: &GcInventoryError) -> GcBlockerKind {
     match error {
         GcInventoryError::Corrupt(_) => GcBlockerKind::CorruptMetadata,
@@ -1921,6 +1942,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutable_writer_fences_root_capture_before_stale_checkpoint_marking() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-writer-fence"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        let branch = BranchRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            name: "mutable-writer".to_string(),
+            state: BranchState::Ready,
+            root: Some(DurableRoot {
+                identity: "gc-writer-branches/stale-root".to_string(),
+                manifest_id: format!("{}@1", Uuid::new_v4()),
+            }),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+        let writer = LeaseRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            subject_kind: LeaseSubjectKind::Branch,
+            subject_id: branch.id,
+            root: branch.root.clone().unwrap(),
+            access_mode: LeaseAccessMode::Write,
+            token_hash: "a".repeat(64),
+            issued_at: now,
+            updated_at: now,
+            expires_at: now + Duration::minutes(5),
+        };
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: branch.revision,
+                lease: writer,
+            })
+            .await
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, Path::from("gc-writer-branches")),
+        );
+        assert!(matches!(
+            lifecycle.begin(run_id).await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::WriterLeaseActive(id)
+            )) if id == branch.id
+        ));
+        assert!(catalog.gc_run(run_id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn generation_change_rejects_capture_without_partial_pins() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = Arc::new(
@@ -2251,13 +2333,55 @@ mod tests {
 
         let grace = Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64);
         let not_before = quarantined.quarantine_at.unwrap() + grace;
+        let writer = LeaseRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            subject_kind: LeaseSubjectKind::Branch,
+            subject_id: branch.id,
+            root: branch.root.clone().unwrap(),
+            access_mode: LeaseAccessMode::Write,
+            token_hash: "b".repeat(64),
+            issued_at: published_at,
+            updated_at: published_at,
+            expires_at: published_at + Duration::minutes(5),
+        };
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: branch.revision,
+                lease: writer.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle.revalidate_at(run_id, grace, not_before).await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::WriterLeaseActive(id)
+            )) if id == branch.id
+        ));
+        assert!(
+            catalog
+                .gc_blockers(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker.kind == GcBlockerKind::LeaseUncertainty)
+        );
+        catalog
+            .apply(CatalogMutation::EndLease {
+                id: writer.id,
+                expected_revision: writer.revision,
+                token_hash: writer.token_hash,
+                ended_at: published_at + Duration::microseconds(1),
+            })
+            .await
+            .unwrap();
         let validated = lifecycle
             .revalidate_at(run_id, grace, not_before)
             .await
             .unwrap();
         assert_eq!(validated.phase, GcRunPhase::Validated);
         let observation = validated.revalidation.as_ref().unwrap();
-        assert_eq!(observation.catalog_generation, 1);
+        assert_eq!(observation.catalog_generation, 3);
         assert!(observation.roots.contains(&GcRootPin {
             kind: GcRootKind::Branch,
             root: published_root,
@@ -2289,8 +2413,8 @@ mod tests {
                 .await,
             Err(RootCaptureLifecycleError::Catalog(
                 CatalogError::RevisionConflict {
-                    expected: 1,
-                    actual: 2
+                    expected: 3,
+                    actual: 4
                 }
             ))
         ));

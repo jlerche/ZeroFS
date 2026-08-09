@@ -38,6 +38,7 @@ const GC_RUN_PREFIX: &[u8] = b"catalog/gc-run/";
 const GC_BLOCKER_PREFIX: &[u8] = b"catalog/gc-blocker/";
 const BRANCH_CREATE_SOURCE_PREFIX: &[u8] = b"catalog/branch-create-source/";
 const LEASE_PREFIX: &[u8] = b"catalog/lease/";
+const WRITER_LEASE_PREFIX: &[u8] = b"catalog/private-writer-lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
 const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
@@ -65,6 +66,7 @@ const TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION: u32 = 14;
 const PRIVATE_GC_BLOCKER_SCHEMA_VERSION: u32 = 15;
 const TOMBSTONE_CLEANUP_SCHEMA_VERSION: u32 = 16;
 const SERVER_CATALOG_SCHEMA_VERSION: u32 = 17;
+const PRODUCTION_LIMITS_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -243,6 +245,7 @@ impl SlateDbCatalog {
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
             SERVER_CATALOG_SCHEMA_VERSION,
+            PRODUCTION_LIMITS_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -310,6 +313,14 @@ impl SlateDbCatalog {
             .map_err(|error| {
                 CatalogError::Invalid(format!(
                     "SlateDB catalog v{} cannot apply v{CATALOG_SCHEMA_VERSION} production limits: {error}",
+                    state.schema_version
+                ))
+            })?;
+        self.rebuild_writer_lease_index_unlocked()
+            .await
+            .map_err(|error| {
+                CatalogError::Invalid(format!(
+                    "SlateDB catalog v{} cannot establish exclusive writer authority for v{CATALOG_SCHEMA_VERSION}: {error}",
                     state.schema_version
                 ))
             })?;
@@ -449,6 +460,7 @@ impl SlateDbCatalog {
         };
         snapshot.validate()?;
         self.audit_private_gc_blockers_unlocked(&snapshot).await?;
+        self.audit_writer_lease_index_unlocked(&snapshot).await?;
         Ok(snapshot)
     }
 
@@ -652,6 +664,94 @@ impl SlateDbCatalog {
                     limit: MAX_ACTIVE_LEASES_PER_BRANCH,
                 });
             }
+        }
+        Ok(())
+    }
+
+    async fn rebuild_writer_lease_index_unlocked(&self) -> Result<(), CatalogError> {
+        let mut writers = BTreeMap::new();
+        for lease in self.scan_records::<LeaseRecord>(LEASE_PREFIX).await? {
+            lease.validate()?;
+            if lease.access_mode != LeaseAccessMode::Write {
+                continue;
+            }
+            if lease.subject_kind != LeaseSubjectKind::Branch {
+                return Err(CatalogError::Corrupt(format!(
+                    "writer lease {} is not branch-bound",
+                    lease.id
+                )));
+            }
+            if let Some(existing) = writers.insert(lease.subject_id, lease.id) {
+                return Err(CatalogError::Corrupt(format!(
+                    "branch {} has multiple writer leases {existing} and {}",
+                    lease.subject_id, lease.id
+                )));
+            }
+        }
+        let mut batch = WriteBatch::new();
+        let mut changed = false;
+        let mut old = self.db.scan_prefix(WRITER_LEASE_PREFIX, ..).await?;
+        while let Some(entry) = old.next().await? {
+            batch.delete(entry.key);
+            changed = true;
+        }
+        for (branch_id, lease_id) in writers {
+            batch.put(writer_lease_key(branch_id), lease_id.to_string());
+            changed = true;
+        }
+        if changed {
+            self.db
+                .write_with_options(batch, &durable_write_options())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn audit_writer_lease_index_unlocked(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(), CatalogError> {
+        let mut expected = BTreeMap::new();
+        for lease in snapshot
+            .leases
+            .values()
+            .filter(|lease| lease.access_mode == LeaseAccessMode::Write)
+        {
+            if lease.subject_kind != LeaseSubjectKind::Branch
+                || expected.insert(lease.subject_id, lease.id).is_some()
+            {
+                return Err(CatalogError::Corrupt(
+                    "writer leases are not exclusive branch capabilities".to_string(),
+                ));
+            }
+        }
+        let mut actual = BTreeMap::new();
+        let mut iterator = self.db.scan_prefix(WRITER_LEASE_PREFIX, ..).await?;
+        while let Some(entry) = iterator.next().await? {
+            let text = std::str::from_utf8(&entry.value).map_err(|error| {
+                CatalogError::Corrupt(format!("writer lease index is not UTF-8: {error}"))
+            })?;
+            let lease_id = Uuid::parse_str(text).map_err(|error| {
+                CatalogError::Corrupt(format!("writer lease index UUID is invalid: {error}"))
+            })?;
+            let lease = snapshot.leases.get(&lease_id).ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "writer lease index references missing lease {lease_id}"
+                ))
+            })?;
+            if entry.key != writer_lease_key(lease.subject_id)
+                || lease.access_mode != LeaseAccessMode::Write
+                || actual.insert(lease.subject_id, lease.id).is_some()
+            {
+                return Err(CatalogError::Corrupt(
+                    "writer lease index key or capability is invalid".to_string(),
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(CatalogError::Corrupt(
+                "writer lease index disagrees with authoritative leases".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1389,12 +1489,12 @@ impl SlateDbCatalog {
                 {
                     return Err(CatalogError::OperationConflict(operation_id.to_string()));
                 }
-                let leases = self.scan_records::<LeaseRecord>(LEASE_PREFIX).await?;
-                if leases.iter().any(|lease| {
-                    lease.subject_kind == LeaseSubjectKind::Branch
-                        && lease.subject_id == operation.branch_id
-                        && lease.access_mode == LeaseAccessMode::Write
-                }) {
+                if self
+                    .db
+                    .get(writer_lease_key(operation.branch_id))
+                    .await?
+                    .is_some()
+                {
                     return Err(CatalogError::WriterLeaseActive(operation.branch_id));
                 }
                 ensure_absent(
@@ -1500,6 +1600,17 @@ impl SlateDbCatalog {
                         limit: MAX_ACTIVE_LEASES_PER_BRANCH,
                     });
                 }
+                if lease.access_mode == LeaseAccessMode::Write {
+                    if self
+                        .db
+                        .get(writer_lease_key(lease_branch_id))
+                        .await?
+                        .is_some()
+                    {
+                        return Err(CatalogError::WriterLeaseActive(lease_branch_id));
+                    }
+                    batch.put(writer_lease_key(lease_branch_id), lease.id.to_string());
+                }
                 increment_blocker(&mut blockers.leases, "lease blocker")?;
                 put_json(&mut batch, lease_key(lease.id), &lease)?;
                 put_json(
@@ -1600,6 +1711,16 @@ impl SlateDbCatalog {
                     .await?;
                 decrement_blocker(&mut blockers.leases, "lease blocker")?;
                 batch.delete(lease_key(id));
+                if lease.access_mode == LeaseAccessMode::Write {
+                    let indexed = self.id_by_name(writer_lease_key(lease_branch_id)).await?;
+                    if indexed != Some(lease.id) {
+                        return Err(CatalogError::Corrupt(format!(
+                            "writer lease index for branch {lease_branch_id} lost lease {}",
+                            lease.id
+                        )));
+                    }
+                    batch.delete(writer_lease_key(lease_branch_id));
+                }
                 put_json(
                     &mut batch,
                     private_gc_branch_blocker_key(lease_branch_id),
@@ -1629,6 +1750,9 @@ impl SlateDbCatalog {
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
                 ensure_expected_revision(expected_revision, lease.revision)?;
+                if lease.access_mode == LeaseAccessMode::Write {
+                    return Err(CatalogError::WriterLeaseActive(lease.subject_id));
+                }
                 let retention_deadline = lease
                     .expires_at
                     .checked_add_signed(LEASE_CLOCK_SKEW)
@@ -3238,6 +3362,10 @@ fn lease_key(id: Uuid) -> Bytes {
     joined_key(LEASE_PREFIX, id.to_string().as_bytes())
 }
 
+fn writer_lease_key(branch_id: Uuid) -> Bytes {
+    joined_key(WRITER_LEASE_PREFIX, branch_id.to_string().as_bytes())
+}
+
 fn lease_tombstone_key(id: Uuid) -> Bytes {
     joined_key(LEASE_TOMBSTONE_PREFIX, id.to_string().as_bytes())
 }
@@ -3934,6 +4062,87 @@ mod tests {
             })
         ));
         assert!(catalog.lease(lease.id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_lease_is_exclusive_recovery_authority_until_exact_release() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("writer-authority"), store)
+            .await
+            .unwrap();
+        let owner = branch("writer-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let issued_at = catalog_timestamp(Utc::now());
+        let mut writer = branch_lease(&owner, issued_at);
+        writer.access_mode = LeaseAccessMode::Write;
+        let acquire = CatalogMutation::AcquireLease {
+            expected_subject_revision: owner.revision,
+            lease: writer.clone(),
+        };
+        let generation = catalog.apply(acquire.clone()).await.unwrap();
+        assert_eq!(catalog.apply(acquire).await.unwrap(), generation);
+        assert_eq!(
+            catalog
+                .id_by_name(writer_lease_key(owner.id))
+                .await
+                .unwrap(),
+            Some(writer.id)
+        );
+
+        let mut contender = branch_lease(&owner, issued_at);
+        contender.access_mode = LeaseAccessMode::Write;
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLease {
+                    expected_subject_revision: owner.revision,
+                    lease: contender.clone(),
+                })
+                .await,
+            Err(CatalogError::WriterLeaseActive(id)) if id == owner.id
+        ));
+        assert!(catalog.lease(contender.id).await.unwrap().is_none());
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ExpireLease {
+                    id: writer.id,
+                    expected_revision: writer.revision,
+                    observed_at: writer.expires_at + LEASE_CLOCK_SKEW,
+                })
+                .await,
+            Err(CatalogError::WriterLeaseActive(id)) if id == owner.id
+        ));
+        assert_eq!(
+            catalog.lease(writer.id).await.unwrap(),
+            Some(writer.clone())
+        );
+
+        catalog
+            .apply(CatalogMutation::EndLease {
+                id: writer.id,
+                expected_revision: writer.revision,
+                token_hash: writer.token_hash.clone(),
+                ended_at: writer.expires_at,
+            })
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: owner.revision,
+                lease: contender.clone(),
+            })
+            .await
+            .unwrap();
+        catalog.snapshot().await.unwrap();
+
+        catalog.db.delete(writer_lease_key(owner.id)).await.unwrap();
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Corrupt(message)) if message.contains("writer lease index")
+        ));
         catalog.close().await.unwrap();
     }
 
@@ -5458,7 +5667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v17_catalogs_to_production_limits_schema() {
+    async fn migrates_v2_through_v18_catalogs_to_writer_authority_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -5476,9 +5685,10 @@ mod tests {
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
             SERVER_CATALOG_SCHEMA_VERSION,
+            PRODUCTION_LIMITS_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v18"));
+            let path = Path::from(format!("migration-v{prior_version}-v19"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -5603,6 +5813,81 @@ mod tests {
             }
             catalog.close().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn v19_migration_rebuilds_one_writer_and_rejects_multiple_on_every_retry() {
+        let exact = v17_capacity_fixture("migration-v18-one-writer", 1, 0, 0).await;
+        let owner = exact.branch(Uuid::from_u128(1)).await.unwrap().unwrap();
+        let mut writer = branch_lease(&owner, catalog_timestamp(Utc::now()));
+        writer.access_mode = LeaseAccessMode::Write;
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: PRODUCTION_LIMITS_SCHEMA_VERSION,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        put_json(&mut batch, lease_key(writer.id), &writer).unwrap();
+        exact
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        exact.migrate_unlocked().await.unwrap();
+        assert_eq!(
+            exact.id_by_name(writer_lease_key(owner.id)).await.unwrap(),
+            Some(writer.id)
+        );
+        assert_eq!(
+            exact.state_unlocked().await.unwrap().schema_version,
+            CATALOG_SCHEMA_VERSION
+        );
+        exact.close().await.unwrap();
+
+        let duplicate = v17_capacity_fixture("migration-v18-two-writers", 1, 0, 0).await;
+        let owner = duplicate.branch(Uuid::from_u128(1)).await.unwrap().unwrap();
+        let mut left = branch_lease(&owner, catalog_timestamp(Utc::now()));
+        left.access_mode = LeaseAccessMode::Write;
+        let mut right = branch_lease(&owner, catalog_timestamp(Utc::now()));
+        right.access_mode = LeaseAccessMode::Write;
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: PRODUCTION_LIMITS_SCHEMA_VERSION,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        put_json(&mut batch, lease_key(left.id), &left).unwrap();
+        put_json(&mut batch, lease_key(right.id), &right).unwrap();
+        duplicate
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                duplicate.migrate_unlocked().await,
+                Err(CatalogError::Invalid(message))
+                    if message.contains("exclusive writer authority")
+                        && message.contains("multiple writer leases")
+            ));
+            assert_eq!(
+                serde_json::from_slice::<CatalogState>(
+                    &duplicate.db.get(STATE_KEY).await.unwrap().unwrap()
+                )
+                .unwrap()
+                .schema_version,
+                PRODUCTION_LIMITS_SCHEMA_VERSION
+            );
+        }
+        duplicate.close().await.unwrap();
     }
 
     #[tokio::test]

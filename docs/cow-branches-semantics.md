@@ -266,11 +266,11 @@ equivalent unforgeable binding. It is an authoritative GC root. Checkpoint
 leases are always read-only; write leases are valid only for branches.
 
 The production catalog caps every acquisition or renewal interval at five
-minutes and retains an expired root for an additional 30-second clock-skew
-window before an expiry mutation may tombstone it. Only a SHA-256 binding of
-the caller-held UUID renewal token is stored. A compact permanent lease
-tombstone retains that binding and UUID so exact release/expiry retries are
-idempotent and the lease incarnation can never be recreated.
+minutes and retains an expired read lease root for an additional 30-second
+clock-skew window before an expiry mutation may tombstone it. Only a SHA-256
+binding of the caller-held UUID renewal token is stored. A compact permanent
+lease tombstone retains that binding and UUID so exact release/expiry retries
+are idempotent and the lease incarnation can never be recreated.
 
 - Acquisition first authenticates that the candidate root is readable. It then
   atomically revalidates the exact subject kind/UUID, revision, mountable state,
@@ -286,15 +286,20 @@ idempotent and the lease incarnation can never be recreated.
   backward. Once deletion has fenced either a branch or checkpoint, renewal is
   rejected so every deleted subject has a bounded drain time.
 - Release is idempotent for the exact lease UUID/token.
-- Shutdown attempts release but correctness relies on expiry after a crash.
+- Shutdown attempts exact release. A read lease relies on bounded expiry after
+  a crash. An expired writer loses serving authority but remains an explicit
+  recovery blocker until a fenced recovery path publishes its durable head;
+  generic expiry cannot silently discard that mutable-head uncertainty.
 - Once expired or released, a lease UUID/token pair can never be resurrected.
 - Clock uncertainty extends retention; it never shortens it.
 
-A writer lease authorizes commits only while the branch remains `Ready`.
-Committed writes advance the authoritative branch head before acknowledgement;
-the lease itself never owns an unpublished mutable head. `Deleting` turns all
-remaining writer leases into read-only retention roots and waits for their
-release/expiry before removing the final branch head.
+A writer lease authorizes commits only while the branch remains `Ready`, and a
+branch may have exactly one writer lease. Committed writes must advance the
+authoritative branch head before acknowledgement. Until that transition is
+wired, the server cannot expose a writable branch mount. Global root capture
+and second observation fail closed while any writer lease record remains,
+including an expired crash-recovery blocker. `Deleting` waits for exact writer
+head reconciliation and release before removing the final branch head.
 
 ### Mount admission and restart
 
@@ -394,6 +399,14 @@ For a captured catalog generation, the complete root set is:
    clock skew;
 7. replication or recovery roots that can expose old data;
 8. immutable roots pinned by an accepted in-progress GC run.
+
+The immutable root stored in a writer lease cannot describe commits made after
+mount admission. Consequently, a writer lease is also a global collection
+fence: capture and second observation reject it as lease uncertainty rather
+than marking a stale checkpoint. Read leases continue to participate as exact
+immutable roots. This fence is removed only by exact writer release after head
+publication; elapsed wall time alone is not evidence that the mutable head was
+reconciled.
 
 Ancestry UUIDs, PostgreSQL rows, JSON rows, names, counters, Bloom filters, and
 unverified cache entries are not GC roots or evidence of unreachability.
