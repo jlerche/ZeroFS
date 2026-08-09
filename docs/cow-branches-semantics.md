@@ -238,10 +238,11 @@ final catalog/tombstone mutation and any lease requirements are satisfied.
 - Existing mounts continue read-only under their exact bounded leases. Deletion
   does not extend a lease and renewal after deletion is rejected. The data plane
   must observe the deletion fence before acknowledging any later write.
-- The `Deleting` record retains the final branch root until every writer lease
-  is released or conservatively expired. It may then atomically remove that GC
-  root and publish the root-free tombstone. Reader leases independently retain
-  the exact immutable roots from which those readers continue.
+- A writer lease rejects deletion before `Ready` can change. The writer must
+  stop, publish its immutable head, and retire through the dedicated atomic
+  transition; only then may deletion consume that new ready-branch revision.
+  Reader leases do not block deletion and independently retain the exact
+  immutable roots from which those readers continue.
 - A client without a lease loses access at deletion. A client with an unexpired
   lease may read its exact root until lease expiry or explicit release.
 - A delete request carries a deletion operation UUID. `Ready` to `Deleting`
@@ -285,21 +286,22 @@ are idempotent and the lease incarnation can never be recreated.
   higher revision and bounded, nondecreasing expiry; renewal time cannot move
   backward. Once deletion has fenced either a branch or checkpoint, renewal is
   rejected so every deleted subject has a bounded drain time.
-- Release is idempotent for the exact lease UUID/token.
-- Shutdown attempts exact release. A read lease relies on bounded expiry after
-  a crash. An expired writer loses serving authority but remains an explicit
-  recovery blocker until a fenced recovery path publishes its durable head;
-  generic expiry cannot silently discard that mutable-head uncertainty.
+- Generic release is idempotent for an exact read-lease UUID/token. It rejects
+  a live writer, just as generic expiry does; only the head-publication batch may
+  retire a writer. A read lease relies on bounded expiry after a crash. An
+  expired writer loses serving authority but remains an explicit recovery
+  blocker until a fenced recovery path publishes its durable head.
 - Once expired or released, a lease UUID/token pair can never be resurrected.
 - Clock uncertainty extends retention; it never shortens it.
 
 A writer lease authorizes commits only while the branch remains `Ready`, and a
 branch may have exactly one writer lease. Committed writes must advance the
-authoritative branch head before acknowledgement. Until that transition is
-wired, the server cannot expose a writable branch mount. Global root capture
-and second observation fail closed while any writer lease record remains,
-including an expired crash-recovery blocker. `Deleting` waits for exact writer
-head reconciliation and release before removing the final branch head.
+authoritative branch head before acknowledgement. The storage and catalog
+transition exists, but until the server opener invokes it at the write-response
+and shutdown boundaries, the server cannot expose a writable branch mount.
+Global root capture and second observation fail closed while any writer lease
+record remains, including an expired crash-recovery blocker. Deletion cannot
+enter `Deleting` until exact writer head reconciliation has completed.
 
 ### Mount admission and restart
 
@@ -321,8 +323,22 @@ lease request for the old UUID cannot use that reused name and fails rather
 than retargeting the mount.
 
 The server data-plane opener must consume only this stable grant. It owns lease
-renewal while serving and attempts exact release after the database is closed;
-crash safety continues to rely on bounded expiry, not shutdown callbacks.
+renewal while serving. After a writer has stopped serving, durably flushed, and
+closed, the root store creates a permanent internal checkpoint named for the
+exact writer lease and conditionally publishes an immutable head descriptor.
+SlateDB then atomically replaces the ready branch root, exposes every private
+epoch that the new head can reference, removes the writer/index and its GC
+blocker, and records the exact publication in the permanent lease tombstone.
+The old branch root and writer root remain authoritative until that single
+batch commits. A lost response retries to the same storage checkpoint and
+recorded catalog generation.
+
+A read mount may rely on bounded expiry after a crash. A crashed writer cannot:
+its retained record globally fences collection until a later recovery process
+proves a newer SlateDB writer incarnation, reconciles the durable latest
+manifest through the same head-publication transition, and retires the exact
+capability. That recovery opener is still required before writable mounts can
+be released.
 
 ## Customer projection and administrative inspection
 
@@ -404,9 +420,9 @@ The immutable root stored in a writer lease cannot describe commits made after
 mount admission. Consequently, a writer lease is also a global collection
 fence: capture and second observation reject it as lease uncertainty rather
 than marking a stale checkpoint. Read leases continue to participate as exact
-immutable roots. This fence is removed only by exact writer release after head
-publication; elapsed wall time alone is not evidence that the mutable head was
-reconciled.
+immutable roots. This fence is removed only by the atomic writer-head
+publication transition; generic release and elapsed wall time are not evidence
+that the mutable head was reconciled.
 
 Ancestry UUIDs, PostgreSQL rows, JSON rows, names, counters, Bloom filters, and
 unverified cache entries are not GC roots or evidence of unreachability.
@@ -493,6 +509,10 @@ Registration begins only in `open`; revision-fenced transitions are monotonic
 to `sealed_private` or permanently `exposed`. Branch deletion atomically exposes
 all remaining private epochs before fencing the branch. These records alone do
 not authorize deletion and are absent from PostgreSQL/JSON customer projections.
+SlateDB also maintains an audited branch-to-unexposed-epoch index and admits at
+most 64 such epochs per branch. Registration, exposure, deletion, and writer-head
+publication update the record and index in one durable batch, so branch-local
+publication work is bounded rather than scanning all epochs in the catalog.
 
 Private registration is admitted only after rereading the permanent epoch
 marker and verifying its v2 HMAC with the segment-pool authority. Pool UUID,
@@ -823,7 +843,8 @@ resumes exactly or aborts and leaks storage. Delete retries are idempotent.
 
 SlateDB admission enforces 4,096 simultaneous live branch records (including
 `Creating` and `Deleting`), 256 named checkpoints per branch, 64 active branch
-or checkpoint leases attributed to one branch, and 64 historical parent edges.
+or checkpoint leases attributed to one branch, 64 unexposed private epochs per
+branch, and 64 historical parent edges.
 Exact retries are reconciled before capacity checks, so reaching a ceiling does
 not break idempotency. Logical deletion frees branch/checkpoint/lease capacity;
 root-free tombstones and permanent UUID reservations do not consume live-branch

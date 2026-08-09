@@ -2366,12 +2366,18 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == GcBlockerKind::LeaseUncertainty)
         );
+        let advanced_root = root_store
+            .publish_writer_head(branch.id, writer.id, &writer.root)
+            .await
+            .unwrap();
         catalog
-            .apply(CatalogMutation::EndLease {
-                id: writer.id,
-                expected_revision: writer.revision,
+            .apply(CatalogMutation::PublishWriterHead {
+                lease_id: writer.id,
+                expected_lease_revision: writer.revision,
                 token_hash: writer.token_hash,
-                ended_at: published_at + Duration::microseconds(1),
+                previous_root: writer.root,
+                root: advanced_root.clone(),
+                published_at: published_at + Duration::microseconds(1),
             })
             .await
             .unwrap();
@@ -2384,17 +2390,18 @@ mod tests {
         assert_eq!(observation.catalog_generation, 3);
         assert!(observation.roots.contains(&GcRootPin {
             kind: GcRootKind::Branch,
-            root: published_root,
+            root: advanced_root.clone(),
         }));
         assert!(store.head(&candidate_path).await.is_ok());
 
         let changed_at = validated.updated_at + Duration::microseconds(1);
         let mut changed_branch = branch;
-        changed_branch.revision = 2;
+        changed_branch.revision = 3;
+        changed_branch.root = Some(advanced_root);
         changed_branch.updated_at = changed_at;
         catalog
             .apply(CatalogMutation::ReplaceBranch {
-                expected_revision: 1,
+                expected_revision: 2,
                 record: changed_branch,
             })
             .await

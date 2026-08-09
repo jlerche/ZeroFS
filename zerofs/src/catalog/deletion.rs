@@ -320,135 +320,13 @@ pub enum DeletionLifecycleError {
 mod tests {
     use super::*;
     use crate::catalog::{
-        BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, Catalog,
-        CatalogMutation, CheckpointRecord, DurableRoot, LeaseAccessMode, LeaseRecord,
-        LeaseSubjectKind, SlateDbCatalog, catalog_timestamp,
+        BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, CatalogMutation,
+        CheckpointRecord, DurableRoot, LeaseAccessMode, LeaseRecord, LeaseSubjectKind,
+        SlateDbCatalog, catalog_timestamp,
     };
     use object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct FinalizedAfterWriterConflictCatalog {
-        inner: Arc<SlateDbCatalog>,
-        writer: LeaseRecord,
-        intercept_once: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl Catalog for FinalizedAfterWriterConflictCatalog {
-        async fn snapshot(&self) -> Result<crate::catalog::CatalogSnapshot, CatalogError> {
-            self.inner.snapshot().await
-        }
-        async fn branch(&self, id: Uuid) -> Result<Option<BranchRecord>, CatalogError> {
-            self.inner.branch(id).await
-        }
-        async fn branch_by_name(&self, name: &str) -> Result<Option<BranchRecord>, CatalogError> {
-            self.inner.branch_by_name(name).await
-        }
-        async fn checkpoint(&self, id: Uuid) -> Result<Option<CheckpointRecord>, CatalogError> {
-            self.inner.checkpoint(id).await
-        }
-        async fn checkpoint_by_name(
-            &self,
-            branch_id: Uuid,
-            name: &str,
-        ) -> Result<Option<CheckpointRecord>, CatalogError> {
-            self.inner.checkpoint_by_name(branch_id, name).await
-        }
-        async fn branch_create_operation(
-            &self,
-            id: Uuid,
-        ) -> Result<Option<BranchCreateOperation>, CatalogError> {
-            self.inner.branch_create_operation(id).await
-        }
-        async fn branch_delete_operation(
-            &self,
-            id: Uuid,
-        ) -> Result<Option<BranchDeleteOperation>, CatalogError> {
-            self.inner.branch_delete_operation(id).await
-        }
-        async fn gc_run(
-            &self,
-            id: Uuid,
-        ) -> Result<Option<crate::catalog::GcRunRecord>, CatalogError> {
-            self.inner.gc_run(id).await
-        }
-        async fn gc_blockers(
-            &self,
-            run_id: Uuid,
-        ) -> Result<Vec<crate::catalog::GcBlockerRecord>, CatalogError> {
-            self.inner.gc_blockers(run_id).await
-        }
-        async fn begin_gc_run(
-            &self,
-            expected_generation: u64,
-            run: crate::catalog::GcRunRecord,
-        ) -> Result<(), CatalogError> {
-            self.inner.begin_gc_run(expected_generation, run).await
-        }
-        async fn publish_gc_marks(
-            &self,
-            id: Uuid,
-            expected_revision: u64,
-            root_digest: String,
-            mark_shards: Vec<crate::catalog::GcMarkShard>,
-            mark_stats: crate::catalog::GcMarkStats,
-            updated_at: chrono::DateTime<Utc>,
-        ) -> Result<crate::catalog::GcRunRecord, CatalogError> {
-            self.inner
-                .publish_gc_marks(
-                    id,
-                    expected_revision,
-                    root_digest,
-                    mark_shards,
-                    mark_stats,
-                    updated_at,
-                )
-                .await
-        }
-        async fn publish_gc_quarantine(
-            &self,
-            publication: crate::catalog::GcQuarantinePublication,
-        ) -> Result<crate::catalog::GcRunRecord, CatalogError> {
-            self.inner.publish_gc_quarantine(publication).await
-        }
-        async fn record_gc_blocker(
-            &self,
-            run_id: Uuid,
-            kind: crate::catalog::GcBlockerKind,
-            detail: String,
-            observed_at: chrono::DateTime<Utc>,
-        ) -> Result<crate::catalog::GcBlockerRecord, CatalogError> {
-            self.inner
-                .record_gc_blocker(run_id, kind, detail, observed_at)
-                .await
-        }
-        async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
-            self.inner.lease(id).await
-        }
-        async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError> {
-            self.inner.tombstone(id).await
-        }
-        async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
-            if matches!(&mutation, CatalogMutation::FinalizeBranchDelete { .. })
-                && self.intercept_once.swap(false, Ordering::SeqCst)
-            {
-                self.inner
-                    .apply(CatalogMutation::EndLease {
-                        id: self.writer.id,
-                        expected_revision: self.writer.revision,
-                        token_hash: self.writer.token_hash.clone(),
-                        ended_at: self.writer.updated_at,
-                    })
-                    .await?;
-                self.inner.apply(mutation).await?;
-                return Err(CatalogError::WriterLeaseActive(self.writer.subject_id));
-            }
-            self.inner.apply(mutation).await
-        }
-    }
-
     fn branch(name: &str, parent_id: Option<Uuid>, now: chrono::DateTime<Utc>) -> BranchRecord {
         BranchRecord {
             id: Uuid::new_v4(),
@@ -467,7 +345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_conflict_reconciles_when_a_concurrent_retry_publishes_deletion() {
+    async fn writer_blocks_deletion_before_the_draining_transition() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let inner = Arc::new(
             SlateDbCatalog::open(Path::from("branch-delete-writer-race"), store)
@@ -499,26 +377,32 @@ mod tests {
             })
             .await
             .unwrap();
-        let catalog: Arc<dyn Catalog> = Arc::new(FinalizedAfterWriterConflictCatalog {
-            inner: inner.clone(),
-            writer,
-            intercept_once: AtomicBool::new(true),
-        });
         let request = BranchDeleteRequest {
             operation_id: Uuid::new_v4(),
             branch_id: record.id,
             expected_revision: record.revision,
-            name: record.name,
+            name: record.name.clone(),
         };
         assert!(matches!(
-            DeletionLifecycle::new(catalog)
+            DeletionLifecycle::new(inner.clone())
                 .delete_branch(request.clone())
                 .await
-                .unwrap(),
-            BranchDeleteResult::Deleted(tombstone)
-                if tombstone.deletion_operation_id == Some(request.operation_id)
+                .unwrap_err(),
+            DeletionLifecycleError::Catalog(CatalogError::WriterLeaseActive(id))
+                if id == record.id
         ));
-        assert!(inner.branch(record.id).await.unwrap().is_none());
+        assert_eq!(inner.branch(record.id).await.unwrap(), Some(record.clone()));
+        assert_eq!(
+            inner.branch_by_name(&record.name).await.unwrap(),
+            Some(record)
+        );
+        assert!(
+            inner
+                .branch_delete_operation(request.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         inner.close().await.unwrap();
     }
 
@@ -696,11 +580,15 @@ mod tests {
             name: child.name.clone(),
         };
         assert!(matches!(
-            lifecycle.delete_branch(child_request.clone()).await.unwrap(),
-            BranchDeleteResult::Draining(branch) if branch.state == BranchState::Deleting
+            lifecycle.delete_branch(child_request.clone()).await,
+            Err(DeletionLifecycleError::Catalog(CatalogError::WriterLeaseActive(id)))
+                if id == child.id
         ));
-        assert!(catalog.branch_by_name(&child.name).await.unwrap().is_none());
-        assert!(matches!(
+        assert_eq!(
+            catalog.branch_by_name(&child.name).await.unwrap(),
+            Some(child.clone())
+        );
+        assert!(
             catalog
                 .apply(CatalogMutation::RenewLease {
                     id: writer.id,
@@ -709,18 +597,26 @@ mod tests {
                     renewed_at: now,
                     expires_at: writer.expires_at + chrono::Duration::seconds(1),
                 })
-                .await,
-            Err(CatalogError::OperationConflict(_))
-        ));
+                .await
+                .is_ok()
+        );
+        let advanced_root = DurableRoot {
+            identity: writer.root.identity.clone(),
+            manifest_id: "child-writer-head@2".to_string(),
+        };
         catalog
-            .apply(CatalogMutation::EndLease {
-                id: writer.id,
-                expected_revision: writer.revision,
+            .apply(CatalogMutation::PublishWriterHead {
+                lease_id: writer.id,
+                expected_lease_revision: writer.revision + 1,
                 token_hash: writer.token_hash,
-                ended_at: now,
+                previous_root: writer.root,
+                root: advanced_root,
+                published_at: now + chrono::Duration::microseconds(1),
             })
             .await
             .unwrap();
+        let mut child_request = child_request;
+        child_request.expected_revision += 1;
         assert!(matches!(
             lifecycle.delete_branch(child_request).await.unwrap(),
             BranchDeleteResult::Deleted(_)

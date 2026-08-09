@@ -7,10 +7,10 @@ use super::{
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
     LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
     MAX_ACTIVE_LEASES_PER_BRANCH, MAX_BRANCH_LINEAGE_DEPTH, MAX_LIVE_BRANCHES,
-    MAX_TOMBSTONE_CLEANUP_SCAN, PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView,
-    PrivateGcOwnerView, RetiredCatalogId, RetiredCatalogKind, TombstoneCleanupPolicy,
-    TombstoneCleanupReport, TombstoneKind, TombstoneRecord, validate_name, validate_root,
-    validate_timestamp,
+    MAX_TOMBSTONE_CLEANUP_SCAN, MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH, PrivateEpochRecord,
+    PrivateEpochState, PrivateGcGuardView, PrivateGcOwnerView, RetiredCatalogId,
+    RetiredCatalogKind, TombstoneCleanupPolicy, TombstoneCleanupReport, TombstoneKind,
+    TombstoneRecord, WriterHeadPublication, validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -41,6 +41,7 @@ const LEASE_PREFIX: &[u8] = b"catalog/lease/";
 const WRITER_LEASE_PREFIX: &[u8] = b"catalog/private-writer-lease/";
 const LEASE_TOMBSTONE_PREFIX: &[u8] = b"catalog/lease-tombstone/";
 const PRIVATE_EPOCH_PREFIX: &[u8] = b"catalog/private-epoch/";
+const PRIVATE_EPOCH_BRANCH_PREFIX: &[u8] = b"catalog/private-epoch-branch/";
 const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
 const LOCAL_GC_PROGRESS_PREFIX: &[u8] = b"catalog/local-gc-progress/";
 const PRIVATE_GC_BRANCH_BLOCKER_PREFIX: &[u8] = b"catalog/private-gc-branch-blocker/";
@@ -67,6 +68,7 @@ const PRIVATE_GC_BLOCKER_SCHEMA_VERSION: u32 = 15;
 const TOMBSTONE_CLEANUP_SCHEMA_VERSION: u32 = 16;
 const SERVER_CATALOG_SCHEMA_VERSION: u32 = 17;
 const PRODUCTION_LIMITS_SCHEMA_VERSION: u32 = 18;
+const WRITER_AUTHORITY_SCHEMA_VERSION: u32 = 19;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -246,6 +248,7 @@ impl SlateDbCatalog {
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
             SERVER_CATALOG_SCHEMA_VERSION,
             PRODUCTION_LIMITS_SCHEMA_VERSION,
+            WRITER_AUTHORITY_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -321,6 +324,14 @@ impl SlateDbCatalog {
             .map_err(|error| {
                 CatalogError::Invalid(format!(
                     "SlateDB catalog v{} cannot establish exclusive writer authority for v{CATALOG_SCHEMA_VERSION}: {error}",
+                    state.schema_version
+                ))
+            })?;
+        self.rebuild_private_epoch_branch_index_unlocked()
+            .await
+            .map_err(|error| {
+                CatalogError::Invalid(format!(
+                    "SlateDB catalog v{} cannot bound unpublished private epochs for v{CATALOG_SCHEMA_VERSION}: {error}",
                     state.schema_version
                 ))
             })?;
@@ -461,6 +472,8 @@ impl SlateDbCatalog {
         snapshot.validate()?;
         self.audit_private_gc_blockers_unlocked(&snapshot).await?;
         self.audit_writer_lease_index_unlocked(&snapshot).await?;
+        self.audit_private_epoch_branch_index_unlocked(&snapshot)
+            .await?;
         Ok(snapshot)
     }
 
@@ -717,6 +730,18 @@ impl SlateDbCatalog {
             .values()
             .filter(|lease| lease.access_mode == LeaseAccessMode::Write)
         {
+            if !snapshot
+                .branches
+                .get(&lease.subject_id)
+                .is_some_and(|branch| {
+                    branch.state == BranchState::Ready && branch.root.as_ref() == Some(&lease.root)
+                })
+            {
+                return Err(CatalogError::Corrupt(format!(
+                    "writer lease {} is not bound to its exact ready branch",
+                    lease.id
+                )));
+            }
             if lease.subject_kind != LeaseSubjectKind::Branch
                 || expected.insert(lease.subject_id, lease.id).is_some()
             {
@@ -751,6 +776,182 @@ impl SlateDbCatalog {
         if actual != expected {
             return Err(CatalogError::Corrupt(
                 "writer lease index disagrees with authoritative leases".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn rebuild_private_epoch_branch_index_unlocked(&self) -> Result<(), CatalogError> {
+        const MIGRATION_BATCH_SIZE: usize = 256;
+        loop {
+            let mut iterator = self.db.scan_prefix(PRIVATE_EPOCH_BRANCH_PREFIX, ..).await?;
+            let mut keys = Vec::with_capacity(MIGRATION_BATCH_SIZE);
+            while keys.len() < MIGRATION_BATCH_SIZE {
+                let Some(entry) = iterator.next().await? else {
+                    break;
+                };
+                keys.push(entry.key);
+            }
+            if keys.is_empty() {
+                break;
+            }
+            let mut batch = WriteBatch::new();
+            for key in keys {
+                batch.delete(key);
+            }
+            self.db
+                .write_with_options(batch, &durable_write_options())
+                .await?;
+        }
+
+        let mut counts = BTreeMap::<Uuid, usize>::new();
+        let mut iterator = self.db.scan_prefix(PRIVATE_EPOCH_PREFIX, ..).await?;
+        while let Some(entry) = iterator.next().await? {
+            let record: PrivateEpochRecord = serde_json::from_slice(&entry.value)?;
+            record.validate()?;
+            if record.state == PrivateEpochState::Exposed {
+                continue;
+            }
+            let branch = self
+                .get_record::<BranchRecord>(branch_key(record.branch_id))
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "unexposed private epoch {} has no live branch",
+                        record.epoch
+                    ))
+                })?;
+            if branch.state != BranchState::Ready {
+                return Err(CatalogError::Corrupt(format!(
+                    "unexposed private epoch {} is not bound to its exact ready branch",
+                    record.epoch
+                )));
+            }
+            let count = counts.entry(record.branch_id).or_default();
+            *count += 1;
+            if *count > MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH {
+                return Err(CatalogError::Capacity {
+                    resource: "unexposed private epoch per branch",
+                    limit: MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH,
+                });
+            }
+        }
+
+        let mut pending = Vec::with_capacity(MIGRATION_BATCH_SIZE);
+        let mut iterator = self.db.scan_prefix(PRIVATE_EPOCH_PREFIX, ..).await?;
+        while let Some(entry) = iterator.next().await? {
+            let record: PrivateEpochRecord = serde_json::from_slice(&entry.value)?;
+            if record.state != PrivateEpochState::Exposed {
+                pending.push((
+                    private_epoch_branch_key(record.branch_id, record.epoch),
+                    record.epoch.to_string(),
+                ));
+            }
+            if pending.len() == MIGRATION_BATCH_SIZE {
+                self.write_private_epoch_branch_index_batch(&mut pending)
+                    .await?;
+            }
+        }
+        self.write_private_epoch_branch_index_batch(&mut pending)
+            .await?;
+        Ok(())
+    }
+
+    async fn write_private_epoch_branch_index_batch(
+        &self,
+        pending: &mut Vec<(Bytes, String)>,
+    ) -> Result<(), CatalogError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        for (key, value) in pending.drain(..) {
+            batch.put(key, value);
+        }
+        self.db
+            .write_with_options(batch, &durable_write_options())
+            .await?;
+        Ok(())
+    }
+
+    async fn unexposed_private_epochs_for_branch_unlocked(
+        &self,
+        branch_id: Uuid,
+    ) -> Result<Vec<PrivateEpochRecord>, CatalogError> {
+        let mut records = Vec::with_capacity(MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH);
+        let mut iterator = self
+            .db
+            .scan_prefix(private_epoch_branch_prefix(branch_id), ..)
+            .await?;
+        while let Some(entry) = iterator.next().await? {
+            if records.len() == MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH {
+                return Err(CatalogError::Corrupt(format!(
+                    "branch {branch_id} exceeds its unexposed private epoch limit"
+                )));
+            }
+            let text = std::str::from_utf8(&entry.value).map_err(|error| {
+                CatalogError::Corrupt(format!("private epoch branch index is not UTF-8: {error}"))
+            })?;
+            let epoch = text.parse::<u64>().map_err(|_| {
+                CatalogError::Corrupt("private epoch branch index is not a u64".to_string())
+            })?;
+            if entry.key != private_epoch_branch_key(branch_id, epoch) {
+                return Err(CatalogError::Corrupt(
+                    "private epoch branch index key disagrees with its value".to_string(),
+                ));
+            }
+            let record = self
+                .get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "private epoch branch index references missing epoch {epoch}"
+                    ))
+                })?;
+            if record.branch_id != branch_id || record.state == PrivateEpochState::Exposed {
+                return Err(CatalogError::Corrupt(format!(
+                    "private epoch branch index references incompatible epoch {epoch}"
+                )));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    async fn audit_private_epoch_branch_index_unlocked(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<(), CatalogError> {
+        let expected = snapshot
+            .private_epochs
+            .values()
+            .filter(|record| record.state != PrivateEpochState::Exposed)
+            .map(|record| {
+                (
+                    private_epoch_branch_key(record.branch_id, record.epoch),
+                    record.epoch.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut actual = BTreeMap::new();
+        let mut iterator = self.db.scan_prefix(PRIVATE_EPOCH_BRANCH_PREFIX, ..).await?;
+        while let Some(entry) = iterator.next().await? {
+            let value = std::str::from_utf8(&entry.value)
+                .map_err(|error| {
+                    CatalogError::Corrupt(format!(
+                        "private epoch branch index is not UTF-8: {error}"
+                    ))
+                })?
+                .to_string();
+            if actual.insert(entry.key, value).is_some() {
+                return Err(CatalogError::Corrupt(
+                    "private epoch branch index contains duplicate keys".to_string(),
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(CatalogError::Corrupt(
+                "private epoch branch index disagrees with authoritative epochs".to_string(),
             ));
         }
         Ok(())
@@ -843,17 +1044,19 @@ impl SlateDbCatalog {
                 depths.insert(branch_id, depth);
             }
         }
-        let mut batch = WriteBatch::new();
-        for (branch_id, depth) in depths {
-            put_json(
-                &mut batch,
-                branch_lineage_depth_key(branch_id),
-                &BranchLineageDepth { branch_id, depth },
-            )?;
+        if !depths.is_empty() {
+            let mut batch = WriteBatch::new();
+            for (branch_id, depth) in depths {
+                put_json(
+                    &mut batch,
+                    branch_lineage_depth_key(branch_id),
+                    &BranchLineageDepth { branch_id, depth },
+                )?;
+            }
+            self.db
+                .write_with_options(batch, &durable_write_options())
+                .await?;
         }
-        self.db
-            .write_with_options(batch, &durable_write_options())
-            .await?;
         Ok(())
     }
 
@@ -1250,7 +1453,22 @@ impl SlateDbCatalog {
                         record.branch_id
                     )));
                 }
+                if self
+                    .unexposed_private_epochs_for_branch_unlocked(record.branch_id)
+                    .await?
+                    .len()
+                    >= MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH
+                {
+                    return Err(CatalogError::Capacity {
+                        resource: "unexposed private epoch per branch",
+                        limit: MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH,
+                    });
+                }
                 put_json(&mut batch, private_epoch_key(record.epoch), &record)?;
+                batch.put(
+                    private_epoch_branch_key(record.branch_id, record.epoch),
+                    record.epoch.to_string(),
+                );
             }
             CatalogMutation::SealPrivateEpoch {
                 epoch,
@@ -1358,6 +1576,7 @@ impl SlateDbCatalog {
                 record.exposed_at = Some(exposed_at);
                 record.validate()?;
                 put_json(&mut batch, private_epoch_key(epoch), &record)?;
+                batch.delete(private_epoch_branch_key(branch_id, epoch));
             }
             CatalogMutation::StartBranchDelete { operation } => {
                 operation.validate()?;
@@ -1401,6 +1620,14 @@ impl SlateDbCatalog {
                         operation.branch_id
                     )));
                 }
+                if self
+                    .db
+                    .get(writer_lease_key(operation.branch_id))
+                    .await?
+                    .is_some()
+                {
+                    return Err(CatalogError::WriterLeaseActive(operation.branch_id));
+                }
                 if operation.created_at < branch.created_at
                     || operation.created_at < branch.updated_at
                 {
@@ -1409,12 +1636,8 @@ impl SlateDbCatalog {
                     ));
                 }
                 for mut epoch in self
-                    .scan_records::<PrivateEpochRecord>(PRIVATE_EPOCH_PREFIX)
+                    .unexposed_private_epochs_for_branch_unlocked(branch.id)
                     .await?
-                    .into_iter()
-                    .filter(|epoch| {
-                        epoch.branch_id == branch.id && epoch.state != PrivateEpochState::Exposed
-                    })
                 {
                     epoch.validate()?;
                     if operation.created_at < epoch.updated_at {
@@ -1430,6 +1653,7 @@ impl SlateDbCatalog {
                     epoch.exposed_at = Some(operation.created_at);
                     epoch.validate()?;
                     put_json(&mut batch, private_epoch_key(epoch.epoch), &epoch)?;
+                    batch.delete(private_epoch_branch_key(branch.id, epoch.epoch));
                 }
                 branch.revision = branch
                     .revision
@@ -1697,6 +1921,9 @@ impl SlateDbCatalog {
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
                 ensure_expected_revision(expected_revision, lease.revision)?;
+                if lease.access_mode == LeaseAccessMode::Write {
+                    return Err(CatalogError::WriterLeaseActive(lease.subject_id));
+                }
                 if lease.token_hash != token_hash {
                     return Err(CatalogError::OperationConflict(id.to_string()));
                 }
@@ -1733,6 +1960,134 @@ impl SlateDbCatalog {
                         id,
                         token_hash,
                         ended_at,
+                        writer_head: None,
+                    },
+                )?;
+            }
+            CatalogMutation::PublishWriterHead {
+                lease_id,
+                expected_lease_revision,
+                token_hash,
+                previous_root,
+                root,
+                published_at,
+            } => {
+                validate_timestamp(published_at, "writer head published_at")?;
+                validate_root(&previous_root)?;
+                validate_root(&root)?;
+                if previous_root == root || previous_root.identity != root.identity {
+                    return Err(CatalogError::Invalid(
+                        "writer head must advance the same database identity".to_string(),
+                    ));
+                }
+                if let Some(tombstone) = self
+                    .get_record::<LeaseTombstone>(lease_tombstone_key(lease_id))
+                    .await?
+                {
+                    let Some(publication) = tombstone.writer_head else {
+                        return Err(CatalogError::OperationConflict(lease_id.to_string()));
+                    };
+                    if tombstone.token_hash == token_hash
+                        && publication.consumed_lease_revision == expected_lease_revision
+                        && publication.previous_root == previous_root
+                        && publication.root == root
+                    {
+                        return Ok(publication.published_generation);
+                    }
+                    return Err(CatalogError::OperationConflict(lease_id.to_string()));
+                }
+                let lease = self
+                    .get_record::<LeaseRecord>(lease_key(lease_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(lease_id.to_string()))?;
+                ensure_expected_revision(expected_lease_revision, lease.revision)?;
+                if lease.subject_kind != LeaseSubjectKind::Branch
+                    || lease.access_mode != LeaseAccessMode::Write
+                    || lease.token_hash != token_hash
+                    || lease.root != previous_root
+                    || published_at < lease.issued_at
+                {
+                    return Err(CatalogError::OperationConflict(lease_id.to_string()));
+                }
+                let mut branch = self
+                    .get_record::<BranchRecord>(branch_key(lease.subject_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(lease.subject_id.to_string()))?;
+                if branch.state != BranchState::Ready
+                    || branch.root.as_ref() != Some(&previous_root)
+                    || published_at < branch.updated_at
+                {
+                    return Err(CatalogError::OperationConflict(lease_id.to_string()));
+                }
+                if self.has_local_gc_guard_for_branch(branch.id).await? {
+                    return Err(CatalogError::OperationConflict(format!(
+                        "branch {} has an active local GC guard",
+                        branch.id
+                    )));
+                }
+                if self.id_by_name(writer_lease_key(branch.id)).await? != Some(lease_id) {
+                    return Err(CatalogError::Corrupt(format!(
+                        "writer lease index for branch {} lost lease {lease_id}",
+                        branch.id
+                    )));
+                }
+                for mut epoch in self
+                    .unexposed_private_epochs_for_branch_unlocked(branch.id)
+                    .await?
+                {
+                    epoch.validate()?;
+                    if published_at < epoch.updated_at {
+                        return Err(CatalogError::Invalid(
+                            "writer head publication cannot precede private epoch state"
+                                .to_string(),
+                        ));
+                    }
+                    epoch.revision = epoch.revision.checked_add(1).ok_or_else(|| {
+                        CatalogError::Corrupt("private epoch revision overflow".to_string())
+                    })?;
+                    epoch.state = PrivateEpochState::Exposed;
+                    epoch.updated_at = published_at;
+                    epoch.exposed_at = Some(published_at);
+                    epoch.validate()?;
+                    put_json(&mut batch, private_epoch_key(epoch.epoch), &epoch)?;
+                    batch.delete(private_epoch_branch_key(branch.id, epoch.epoch));
+                }
+                let consumed_branch_revision = branch.revision;
+                branch.revision = branch
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogError::Corrupt("branch revision overflow".to_string()))?;
+                branch.root = Some(root.clone());
+                branch.updated_at = published_at;
+                branch.validate()?;
+                let mut blockers = self.private_gc_branch_blockers_unlocked(branch.id).await?;
+                decrement_blocker(&mut blockers.leases, "lease blocker")?;
+                let publication = WriterHeadPublication {
+                    branch_id: branch.id,
+                    consumed_branch_revision,
+                    consumed_lease_revision: lease.revision,
+                    previous_root,
+                    root,
+                    published_generation: next_generation,
+                    published_at,
+                };
+                publication.validate()?;
+                batch.delete(lease_key(lease_id));
+                batch.delete(writer_lease_key(branch.id));
+                put_json(&mut batch, branch_key(branch.id), &branch)?;
+                put_json(
+                    &mut batch,
+                    private_gc_branch_blocker_key(branch.id),
+                    &blockers,
+                )?;
+                put_json(
+                    &mut batch,
+                    lease_tombstone_key(lease_id),
+                    &LeaseTombstone {
+                        id: lease_id,
+                        token_hash,
+                        ended_at: published_at,
+                        writer_head: Some(publication),
                     },
                 )?;
             }
@@ -1780,6 +2135,7 @@ impl SlateDbCatalog {
                         id,
                         token_hash: lease.token_hash,
                         ended_at: observed_at,
+                        writer_head: None,
                     },
                 )?;
             }
@@ -3053,6 +3409,11 @@ impl Catalog for SlateDbCatalog {
         self.get_record(lease_key(id)).await
     }
 
+    async fn lease_tombstone(&self, id: Uuid) -> Result<Option<LeaseTombstone>, CatalogError> {
+        let _guard = self.lock.lock().await;
+        self.get_record(lease_tombstone_key(id)).await
+    }
+
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError> {
         let _guard = self.lock.lock().await;
         self.get_record(tombstone_key(id)).await
@@ -3318,6 +3679,18 @@ fn gc_run_key(id: Uuid) -> Bytes {
 
 fn private_epoch_key(epoch: u64) -> Bytes {
     joined_key(PRIVATE_EPOCH_PREFIX, format!("{epoch:016x}").as_bytes())
+}
+
+fn private_epoch_branch_prefix(branch_id: Uuid) -> Bytes {
+    let mut suffix = branch_id.to_string().into_bytes();
+    suffix.push(b'/');
+    joined_key(PRIVATE_EPOCH_BRANCH_PREFIX, &suffix)
+}
+
+fn private_epoch_branch_key(branch_id: Uuid, epoch: u64) -> Bytes {
+    let mut key = private_epoch_branch_prefix(branch_id).to_vec();
+    key.extend_from_slice(format!("{epoch:016x}").as_bytes());
+    Bytes::from(key)
 }
 
 fn local_gc_guard_key(id: Uuid) -> Bytes {
@@ -4066,7 +4439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_lease_is_exclusive_recovery_authority_until_exact_release() {
+    async fn writer_lease_is_exclusive_recovery_authority_until_head_publication() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = SlateDbCatalog::open(Path::from("writer-authority"), store)
             .await
@@ -4120,18 +4493,36 @@ mod tests {
             Some(writer.clone())
         );
 
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::EndLease {
+                    id: writer.id,
+                    expected_revision: writer.revision,
+                    token_hash: writer.token_hash.clone(),
+                    ended_at: writer.expires_at,
+                })
+                .await,
+            Err(CatalogError::WriterLeaseActive(id)) if id == owner.id
+        ));
+        let advanced_root = DurableRoot {
+            identity: writer.root.identity.clone(),
+            manifest_id: "writer-authority-advanced".to_string(),
+        };
         catalog
-            .apply(CatalogMutation::EndLease {
-                id: writer.id,
-                expected_revision: writer.revision,
+            .apply(CatalogMutation::PublishWriterHead {
+                lease_id: writer.id,
+                expected_lease_revision: writer.revision,
                 token_hash: writer.token_hash.clone(),
-                ended_at: writer.expires_at,
+                previous_root: writer.root.clone(),
+                root: advanced_root.clone(),
+                published_at: writer.expires_at,
             })
             .await
             .unwrap();
+        contender.root = advanced_root;
         catalog
             .apply(CatalogMutation::AcquireLease {
-                expected_subject_revision: owner.revision,
+                expected_subject_revision: owner.revision + 1,
                 lease: contender.clone(),
             })
             .await
@@ -4143,6 +4534,80 @@ mod tests {
             catalog.snapshot().await,
             Err(CatalogError::Corrupt(message)) if message.contains("writer lease index")
         ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_head_transition_advances_root_exposes_epochs_and_retries_exactly() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("writer-head-transition"), store)
+            .await
+            .unwrap();
+        let owner = branch("head-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let issued_at = catalog_timestamp(Utc::now());
+        let mut writer = branch_lease(&owner, issued_at);
+        writer.access_mode = LeaseAccessMode::Write;
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: owner.revision,
+                lease: writer.clone(),
+            })
+            .await
+            .unwrap();
+        let epoch = private_epoch(owner.id, 44, issued_at);
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(epoch.clone()))
+            .await
+            .unwrap();
+        let root = DurableRoot {
+            identity: owner.root.as_ref().unwrap().identity.clone(),
+            manifest_id: "advanced-head".to_string(),
+        };
+        let published_at = issued_at + chrono::Duration::microseconds(1);
+        let publish = CatalogMutation::PublishWriterHead {
+            lease_id: writer.id,
+            expected_lease_revision: writer.revision,
+            token_hash: writer.token_hash.clone(),
+            previous_root: writer.root.clone(),
+            root: root.clone(),
+            published_at,
+        };
+        let generation = catalog.apply(publish.clone()).await.unwrap();
+        assert_eq!(catalog.apply(publish.clone()).await.unwrap(), generation);
+        let mut later_retry = publish.clone();
+        if let CatalogMutation::PublishWriterHead { published_at, .. } = &mut later_retry {
+            *published_at += chrono::Duration::microseconds(1);
+        }
+        assert_eq!(catalog.apply(later_retry).await.unwrap(), generation);
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.generation, generation);
+        assert_eq!(snapshot.branches[&owner.id].revision, owner.revision + 1);
+        assert_eq!(snapshot.branches[&owner.id].root.as_ref(), Some(&root));
+        assert!(!snapshot.leases.contains_key(&writer.id));
+        let publication = snapshot.lease_tombstones[&writer.id]
+            .writer_head
+            .as_ref()
+            .unwrap();
+        assert_eq!(publication.published_generation, generation);
+        assert_eq!(publication.consumed_branch_revision, owner.revision);
+        assert_eq!(
+            snapshot.private_epochs[&epoch.epoch].state,
+            PrivateEpochState::Exposed
+        );
+
+        let mut conflict = publish;
+        if let CatalogMutation::PublishWriterHead { root, .. } = &mut conflict {
+            root.manifest_id = "different-head".to_string();
+        }
+        assert!(matches!(
+            catalog.apply(conflict).await,
+            Err(CatalogError::OperationConflict(id)) if id == writer.id.to_string()
+        ));
+        assert_eq!(catalog.snapshot().await.unwrap().generation, generation);
         catalog.close().await.unwrap();
     }
 
@@ -5127,6 +5592,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unexposed_private_epoch_capacity_is_exact_reusable_and_index_audited() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("private-epoch-capacity"), store)
+            .await
+            .unwrap();
+        let owner = branch("private-epoch-capacity-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let now = owner.updated_at + chrono::Duration::microseconds(1);
+        let mut last = None;
+        for sequence in 0..MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH {
+            let record = private_epoch(owner.id, 10_000 + sequence as u64, now);
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(record.clone()))
+                .await
+                .unwrap();
+            last = Some(record);
+        }
+        let last = last.unwrap();
+        let generation_at_capacity = catalog.snapshot().await.unwrap().generation;
+        assert_eq!(
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(last))
+                .await
+                .unwrap(),
+            generation_at_capacity,
+            "an exact retry remains generation-neutral at capacity"
+        );
+
+        let overflow = private_epoch(owner.id, 20_000, now);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(overflow.clone()))
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "unexposed private epoch per branch",
+                limit: MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH,
+            })
+        ));
+        assert!(
+            catalog
+                .private_epoch(overflow.epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog.snapshot().await.unwrap().generation,
+            generation_at_capacity
+        );
+
+        catalog
+            .apply(CatalogMutation::ExposePrivateEpoch {
+                epoch: 10_000,
+                branch_id: owner.id,
+                expected_revision: 1,
+                exposed_at: now + chrono::Duration::microseconds(1),
+            })
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::RegisterPrivateEpoch(overflow.clone()))
+            .await
+            .unwrap();
+        catalog.snapshot().await.unwrap();
+
+        let mut corrupt = WriteBatch::new();
+        corrupt.delete(private_epoch_branch_key(owner.id, overflow.epoch));
+        catalog
+            .db
+            .write_with_options(corrupt, &durable_write_options())
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Corrupt(message)) if message.contains("private epoch branch index")
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn targeted_private_gc_views_require_the_exact_valid_ready_owner() {
         for corruption in ["missing", "non-ready", "malformed", "wrong-root"] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -5667,7 +6215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v18_catalogs_to_writer_authority_schema() {
+    async fn migrates_v2_through_v19_catalogs_to_writer_head_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -5686,9 +6234,10 @@ mod tests {
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
             SERVER_CATALOG_SCHEMA_VERSION,
             PRODUCTION_LIMITS_SCHEMA_VERSION,
+            WRITER_AUTHORITY_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v19"));
+            let path = Path::from(format!("migration-v{prior_version}-v20"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -5755,6 +6304,121 @@ mod tests {
                 catalog.private_gc_global_blockers_unlocked().await.unwrap(),
                 PrivateGcGlobalBlockers::empty()
             );
+            catalog.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn v19_lease_tombstones_migrate_without_inventing_head_publication() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("migration-v19-lease-tombstone");
+        let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
+            .build()
+            .await
+            .unwrap();
+        let lease_id = Uuid::new_v4();
+        let ended_at = catalog_timestamp(Utc::now());
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
+                generation: 3,
+            },
+        )
+        .unwrap();
+        batch.put(
+            lease_tombstone_key(lease_id),
+            serde_json::to_vec(&serde_json::json!({
+                "id": lease_id,
+                "token_hash": "a".repeat(64),
+                "ended_at": ended_at,
+            }))
+            .unwrap(),
+        );
+        db.write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let catalog = SlateDbCatalog::open(path, store).await.unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(snapshot.lease_tombstones[&lease_id].writer_head, None);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v19_private_epoch_index_migration_accepts_cap_and_rejects_cap_plus_one_on_retry() {
+        for (path, count, succeeds) in [
+            (
+                "migration-v19-private-epoch-cap",
+                MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH,
+                true,
+            ),
+            (
+                "migration-v19-private-epoch-over-cap",
+                MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH + 1,
+                false,
+            ),
+        ] {
+            let catalog = v17_capacity_fixture(path, 1, 0, 0).await;
+            let owner = catalog.branch(Uuid::from_u128(1)).await.unwrap().unwrap();
+            let now = owner.updated_at + chrono::Duration::microseconds(1);
+            let mut batch = WriteBatch::new();
+            put_json(
+                &mut batch,
+                Bytes::from_static(STATE_KEY),
+                &CatalogState {
+                    schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
+                    generation: 7,
+                },
+            )
+            .unwrap();
+            for sequence in 0..count {
+                let record = private_epoch(owner.id, 30_000 + sequence as u64, now);
+                put_json(&mut batch, private_epoch_key(record.epoch), &record).unwrap();
+            }
+            catalog
+                .db
+                .write_with_options(batch, &durable_write_options())
+                .await
+                .unwrap();
+
+            if succeeds {
+                catalog.migrate_unlocked().await.unwrap();
+                assert_eq!(
+                    catalog
+                        .unexposed_private_epochs_for_branch_unlocked(owner.id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH
+                );
+                assert_eq!(
+                    catalog.state_unlocked().await.unwrap().schema_version,
+                    CATALOG_SCHEMA_VERSION
+                );
+            } else {
+                for _ in 0..2 {
+                    assert!(matches!(
+                        catalog.migrate_unlocked().await,
+                        Err(CatalogError::Invalid(message))
+                            if message.contains("cannot bound unpublished private epochs")
+                                && message.contains("unexposed private epoch per branch")
+                    ));
+                    assert_eq!(
+                        serde_json::from_slice::<CatalogState>(
+                            &catalog.db.get(STATE_KEY).await.unwrap().unwrap()
+                        )
+                        .unwrap()
+                        .schema_version,
+                        WRITER_AUTHORITY_SCHEMA_VERSION
+                    );
+                }
+            }
             catalog.close().await.unwrap();
         }
     }
@@ -5888,6 +6552,67 @@ mod tests {
             );
         }
         duplicate.close().await.unwrap();
+
+        let stranded = v17_capacity_fixture("migration-v19-deleting-writer", 1, 0, 0).await;
+        let mut owner = stranded.branch(Uuid::from_u128(1)).await.unwrap().unwrap();
+        let original_revision = owner.revision;
+        let mut writer = branch_lease(&owner, catalog_timestamp(Utc::now()));
+        writer.access_mode = LeaseAccessMode::Write;
+        let operation = BranchDeleteOperation {
+            id: Uuid::new_v4(),
+            revision: 1,
+            branch_id: owner.id,
+            branch_name: owner.name.clone(),
+            expected_branch_revision: original_revision,
+            root: owner.root.clone().unwrap(),
+            parent_id: owner.parent_id,
+            origin_checkpoint_id: owner.origin_checkpoint_id,
+            phase: BranchDeletePhase::Draining,
+            created_at: owner.updated_at,
+            updated_at: owner.updated_at,
+        };
+        owner.revision += 1;
+        owner.state = BranchState::Deleting;
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
+                generation: 3,
+            },
+        )
+        .unwrap();
+        put_json(&mut batch, branch_key(owner.id), &owner).unwrap();
+        put_json(&mut batch, lease_key(writer.id), &writer).unwrap();
+        put_json(
+            &mut batch,
+            branch_delete_operation_key(operation.id),
+            &operation,
+        )
+        .unwrap();
+        batch.delete(branch_name_key(&owner.name));
+        stranded
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                stranded.migrate_unlocked().await,
+                Err(CatalogError::Invalid(message))
+                    if message.contains("not bound to its exact ready branch")
+            ));
+            assert_eq!(
+                serde_json::from_slice::<CatalogState>(
+                    &stranded.db.get(STATE_KEY).await.unwrap().unwrap()
+                )
+                .unwrap()
+                .schema_version,
+                WRITER_AUTHORITY_SCHEMA_VERSION
+            );
+        }
+        stranded.close().await.unwrap();
     }
 
     #[tokio::test]

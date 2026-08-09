@@ -1,9 +1,9 @@
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, Catalog, CatalogError, CatalogMutation, CatalogSnapshot,
-    ImmutableCheckpoint, LeaseAcquireRequest, LeaseGrant, LeaseRecord, RetiredCatalogKind,
-    RootStoreError, SlateDbRootStore, TombstoneKind, TombstoneRecord, catalog_timestamp,
-    validate_name,
+    ImmutableCheckpoint, LeaseAccessMode, LeaseAcquireRequest, LeaseGrant, LeaseRecord,
+    RetiredCatalogKind, RootStoreError, SlateDbRootStore, TombstoneKind, TombstoneRecord,
+    catalog_timestamp, validate_name,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,60 @@ impl BranchLifecycle {
             branch_name: request.branch_name,
             lease: grant,
         })
+    }
+
+    /// After the writable database has been fully flushed and closed, publish
+    /// its immutable latest head and retire the exact writer capability in one
+    /// authoritative catalog transition.
+    pub async fn publish_writer_head(
+        &self,
+        grant: &LeaseGrant,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
+        if !self.features.mount {
+            return Err(BranchLifecycleError::FeatureDisabled("branch mount"));
+        }
+        if grant.lease.access_mode != LeaseAccessMode::Write {
+            return Err(CatalogError::Invalid(
+                "head publication requires a writer lease".to_string(),
+            )
+            .into());
+        }
+        let root = self
+            .roots
+            .publish_writer_head(grant.lease.subject_id, grant.lease.id, &grant.lease.root)
+            .await?;
+        self.roots.verify(&root).await?;
+        let token_hash = super::lease::token_hash(grant.renewal_token);
+        let tombstone = self.catalog.lease_tombstone(grant.lease.id).await?;
+        let published_at = tombstone
+            .as_ref()
+            .filter(|tombstone| tombstone.token_hash == token_hash)
+            .and_then(|tombstone| tombstone.writer_head.as_ref())
+            .filter(|publication| {
+                publication.branch_id == grant.lease.subject_id
+                    && publication.consumed_lease_revision == grant.lease.revision
+                    && publication.previous_root == grant.lease.root
+                    && publication.root == root
+            })
+            .map_or_else(
+                || catalog_timestamp(Utc::now()),
+                |publication| publication.published_at,
+            );
+        self.catalog
+            .apply(CatalogMutation::PublishWriterHead {
+                lease_id: grant.lease.id,
+                expected_lease_revision: grant.lease.revision,
+                token_hash,
+                previous_root: grant.lease.root.clone(),
+                root: root.clone(),
+                published_at,
+            })
+            .await?;
+        self.catalog
+            .branch(grant.lease.subject_id)
+            .await?
+            .filter(|branch| branch.root.as_ref() == Some(&root))
+            .ok_or_else(|| CatalogError::OperationConflict(grant.lease.id.to_string()).into())
     }
 
     /// List every live branch from one lock-consistent authoritative snapshot.
@@ -781,6 +835,7 @@ mod tests {
         CheckpointRecord, DurableRoot, JsonCatalogProjection, LeaseAccessMode, LeaseAcquireRequest,
         SlateDbCatalog, catalog_timestamp,
     };
+    use crate::fs::key_codec::KeyCodec;
     use slatedb::Db;
     use slatedb::admin::AdminBuilder;
     use slatedb::config::{CheckpointOptions, CheckpointScope};
@@ -1091,14 +1146,25 @@ mod tests {
                 .expect("an ambiguous renewal retry must reconcile"),
             renewed
         );
-        leases
-            .release(renewed.id, renewed.revision, first_grant.renewal_token)
+        assert!(matches!(
+            leases
+                .release(renewed.id, renewed.revision, first_grant.renewal_token)
+                .await,
+            Err(crate::catalog::LeaseLifecycleError::Catalog(
+                CatalogError::WriterLeaseActive(id)
+            )) if id == left.id
+        ));
+        lifecycle
+            .publish_writer_head(&LeaseGrant {
+                lease: renewed.clone(),
+                renewal_token: first_grant.renewal_token,
+            })
             .await
             .unwrap();
         leases
             .release(renewed.id, renewed.revision, first_grant.renewal_token)
             .await
-            .expect("an exact release retry must return success");
+            .expect("release after exact head publication must reconcile");
         let retained_request = LeaseAcquireRequest {
             lease_id: Uuid::new_v4(),
             renewal_token: Uuid::new_v4(),
@@ -1127,20 +1193,46 @@ mod tests {
             renewal_token: writer.renewal_token,
             duration: chrono::Duration::minutes(2),
         };
-        let renewed_writer = leases.renew(writer_renewal.clone()).await.unwrap();
-        let deleting = BranchLifecycle::new(catalog.clone(), root_store.clone())
+        let current = catalog.branch(left.id).await.unwrap().unwrap();
+        assert!(matches!(
+            BranchLifecycle::new(catalog.clone(), root_store.clone())
             .deletions()
             .delete_branch(crate::catalog::BranchDeleteRequest {
                 operation_id: Uuid::new_v4(),
                 branch_id: left.id,
-                expected_revision: left.revision,
+                expected_revision: current.revision,
                 name: left.name.clone(),
+            })
+            .await,
+            Err(crate::catalog::DeletionLifecycleError::Catalog(
+                CatalogError::WriterLeaseActive(id)
+            )) if id == left.id
+        ));
+        assert_eq!(
+            catalog.branch_by_name(&left.name).await.unwrap(),
+            Some(current)
+        );
+        let renewed_writer = leases.renew(writer_renewal.clone()).await.unwrap();
+        lifecycle
+            .publish_writer_head(&LeaseGrant {
+                lease: renewed_writer.clone(),
+                renewal_token: writer.renewal_token,
             })
             .await
             .unwrap();
+        let current = catalog.branch(left.id).await.unwrap().unwrap();
         assert!(matches!(
-            deleting,
-            crate::catalog::BranchDeleteResult::Draining(_)
+            BranchLifecycle::new(catalog.clone(), root_store.clone())
+                .deletions()
+                .delete_branch(crate::catalog::BranchDeleteRequest {
+                    operation_id: Uuid::new_v4(),
+                    branch_id: left.id,
+                    expected_revision: current.revision,
+                    name: left.name.clone(),
+                })
+                .await
+                .unwrap(),
+            crate::catalog::BranchDeleteResult::Deleted(_)
         ));
         catalog
             .apply(CatalogMutation::CreateBranch(BranchRecord {
@@ -1169,7 +1261,7 @@ mod tests {
         assert!(matches!(
             leases.renew(writer_renewal).await,
             Err(crate::catalog::LeaseLifecycleError::Catalog(
-                CatalogError::OperationConflict(_)
+                CatalogError::NotFound(_)
             ))
         ));
         leases
@@ -1182,7 +1274,7 @@ mod tests {
             .unwrap();
         leases
             .release(
-                renewed_writer.id,
+                writer.lease.id,
                 renewed_writer.revision,
                 writer.renewal_token,
             )
@@ -1762,9 +1854,27 @@ mod tests {
                     expected_revision: branch.revision,
                     name: branch.name.clone(),
                 })
+                .await,
+            Err(crate::catalog::DeletionLifecycleError::Catalog(
+                CatalogError::WriterLeaseActive(id)
+            )) if id == branch_id
+        ));
+        let published = lifecycle
+            .publish_writer_head(&original.lease)
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .deletions()
+                .delete_branch(BranchDeleteRequest {
+                    operation_id: Uuid::new_v4(),
+                    branch_id,
+                    expected_revision: published.revision,
+                    name: branch.name.clone(),
+                })
                 .await
                 .unwrap(),
-            BranchDeleteResult::Draining(_)
+            BranchDeleteResult::Deleted(_)
         ));
         let replacement_id = Uuid::new_v4();
         catalog
@@ -1782,13 +1892,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            lifecycle
-                .mount_branch_by_name(request.clone())
-                .await
-                .expect("an exact mount retry must retain its original UUID and root"),
-            original
-        );
+        assert!(matches!(
+            lifecycle.mount_branch_by_name(request.clone()).await,
+            Err(BranchLifecycleError::Lease(
+                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::NotFound(_))
+            ))
+        ));
         let mut retarget = request;
         retarget.lease.lease_id = Uuid::new_v4();
         retarget.lease.renewal_token = Uuid::new_v4();
@@ -1798,6 +1907,133 @@ mod tests {
                 crate::catalog::LeaseLifecycleError::Catalog(CatalogError::NotFound(_))
             ))
         ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_publishes_head_and_releases_exact_capability_atomically() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("writer-shutdown/source");
+        let source_db = Db::builder(source_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let key = KeyCodec::new().inode_key(7);
+        source_db.put(&key, b"before").await.unwrap();
+        source_db.flush().await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+
+        let branch_id = Uuid::new_v4();
+        let roots =
+            SlateDbRootStore::new(Arc::clone(&store), Path::from("writer-shutdown/branches"));
+        let initial = roots
+            .create_from_checkpoint(
+                Uuid::new_v4(),
+                branch_id,
+                &ImmutableCheckpoint {
+                    database_path: source_path,
+                    checkpoint_id: checkpoint.id,
+                    manifest_id: checkpoint.manifest_id,
+                },
+            )
+            .await
+            .unwrap();
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("writer-shutdown/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: branch_id,
+                revision: 1,
+                name: "writable".to_string(),
+                state: BranchState::Ready,
+                root: Some(initial.clone()),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots.clone());
+        let mount = lifecycle
+            .mount_branch_by_name(BranchMountRequest {
+                branch_name: "writable".to_string(),
+                lease: LeaseAcquireRequest {
+                    lease_id: Uuid::new_v4(),
+                    renewal_token: Uuid::new_v4(),
+                    subject_id: branch_id,
+                    access_mode: LeaseAccessMode::Write,
+                    duration: chrono::Duration::minutes(2),
+                },
+            })
+            .await
+            .unwrap();
+        let writer = Db::builder(Path::from(initial.identity.clone()), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        writer.put(&key, b"after").await.unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let (left_publish, right_publish) = tokio::join!(
+            lifecycle.publish_writer_head(&mount.lease),
+            lifecycle.publish_writer_head(&mount.lease)
+        );
+        let published = left_publish.unwrap();
+        assert_eq!(right_publish.unwrap(), published);
+        assert_eq!(published.revision, 2);
+        assert_ne!(published.root.as_ref(), Some(&initial));
+        assert_eq!(
+            lifecycle.publish_writer_head(&mount.lease).await.unwrap(),
+            published
+        );
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert!(!snapshot.leases.contains_key(&mount.lease.lease.id));
+        let publication = snapshot
+            .lease_tombstones
+            .get(&mount.lease.lease.id)
+            .unwrap()
+            .writer_head
+            .as_ref()
+            .unwrap();
+        assert_eq!(publication.branch_id, branch_id);
+        assert_eq!(publication.previous_root, initial);
+        assert_eq!(publication.root, published.root.clone().unwrap());
+        assert_eq!(
+            roots
+                .checkpoint_reader(published.root.as_ref().unwrap())
+                .await
+                .unwrap()
+                .get(&key)
+                .await
+                .unwrap(),
+            Some(bytes::Bytes::from_static(b"after"))
+        );
+        let next_mount = lifecycle
+            .mount_branch_by_name(BranchMountRequest {
+                branch_name: "writable".to_string(),
+                lease: LeaseAcquireRequest {
+                    lease_id: Uuid::new_v4(),
+                    renewal_token: Uuid::new_v4(),
+                    subject_id: branch_id,
+                    access_mode: LeaseAccessMode::Write,
+                    duration: chrono::Duration::minutes(1),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(next_mount.lease.lease.root, published.root.unwrap());
         catalog.close().await.unwrap();
     }
 

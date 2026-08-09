@@ -11,8 +11,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const ROOT_CHECKPOINT_PREFIX: &str = "__zerofs_branch_root_";
+const HEAD_CHECKPOINT_PREFIX: &str = "__zerofs_branch_head_";
 const ROOT_OWNER_OBJECT: &str = "__zerofs_branch_root_owner.json";
 const ROOT_RESULT_OBJECT: &str = "__zerofs_branch_root_result.json";
+const HEAD_RESULT_PREFIX: &str = "__zerofs_branch_head_result_";
 const ROOT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 const ROOT_VERIFY_HEAD_CONCURRENCY: usize = 32;
 
@@ -30,6 +32,16 @@ struct RootOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RootResult {
     owner: RootOwner,
+    root: DurableRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WriterHeadResult {
+    schema_version: u32,
+    branch_id: Uuid,
+    writer_lease_id: Uuid,
+    destination_path: String,
+    previous_root: DurableRoot,
     root: DurableRoot,
 }
 
@@ -306,23 +318,116 @@ impl SlateDbRootStore {
         Ok(canonical)
     }
 
+    /// Publish the latest fully flushed manifest as an immutable branch head.
+    ///
+    /// The writable database must already be closed. The exact writer lease is
+    /// the idempotency identity: retries elect one permanent checkpoint and
+    /// never retarget a different branch or previous authoritative root.
+    pub async fn publish_writer_head(
+        &self,
+        branch_id: Uuid,
+        writer_lease_id: Uuid,
+        previous_root: &DurableRoot,
+    ) -> Result<DurableRoot, RootStoreError> {
+        if branch_id.is_nil() || writer_lease_id.is_nil() || branch_id == writer_lease_id {
+            return Err(RootStoreError::Invalid(
+                "branch and writer lease UUIDs must be distinct and non-nil".to_string(),
+            ));
+        }
+        self.verify(previous_root).await?;
+        let destination = Path::from(previous_root.identity.clone());
+        let owner = self
+            .read_optional::<RootOwner>(&owner_object_path(&destination))
+            .await?
+            .ok_or_else(|| RootStoreError::MissingOwner(destination.to_string()))?;
+        if owner.destination_id != branch_id || owner.destination_path != destination.to_string() {
+            return Err(RootStoreError::OwnershipConflict(destination.to_string()));
+        }
+        let result_path = head_result_object_path(&destination, writer_lease_id);
+        if let Some(existing) = self.read_optional::<WriterHeadResult>(&result_path).await? {
+            self.validate_writer_head_result(
+                &existing,
+                branch_id,
+                writer_lease_id,
+                previous_root,
+                &destination,
+            )?;
+            self.verify(&existing.root).await?;
+            return Ok(existing.root);
+        }
+
+        let checkpoint_name = format!("{HEAD_CHECKPOINT_PREFIX}{writer_lease_id}");
+        let admin = self.admin(destination.clone());
+        let mut checkpoints = admin.list_checkpoints(Some(&checkpoint_name)).await?;
+        checkpoints.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
+        let (checkpoint_id, checkpoint_manifest_id) =
+            if let Some(checkpoint) = checkpoints.into_iter().next() {
+                (checkpoint.id, checkpoint.manifest_id)
+            } else {
+                match admin
+                    .create_detached_checkpoint(&CheckpointOptions {
+                        name: Some(checkpoint_name.clone()),
+                        ..CheckpointOptions::default()
+                    })
+                    .await
+                {
+                    Ok(checkpoint) => (checkpoint.id, checkpoint.manifest_id),
+                    Err(error) => {
+                        if let Some(existing) =
+                            self.read_optional::<WriterHeadResult>(&result_path).await?
+                        {
+                            self.validate_writer_head_result(
+                                &existing,
+                                branch_id,
+                                writer_lease_id,
+                                previous_root,
+                                &destination,
+                            )?;
+                            self.verify(&existing.root).await?;
+                            return Ok(existing.root);
+                        }
+                        let mut recovered = admin.list_checkpoints(Some(&checkpoint_name)).await?;
+                        recovered.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
+                        let checkpoint = recovered.into_iter().next().ok_or(error)?;
+                        (checkpoint.id, checkpoint.manifest_id)
+                    }
+                }
+            };
+        let candidate = WriterHeadResult {
+            schema_version: ROOT_DESCRIPTOR_SCHEMA_VERSION,
+            branch_id,
+            writer_lease_id,
+            destination_path: destination.to_string(),
+            previous_root: previous_root.clone(),
+            root: DurableRoot {
+                identity: destination.to_string(),
+                manifest_id: encode_root_checkpoint(checkpoint_id, checkpoint_manifest_id),
+            },
+        };
+        self.verify_storage_root(&candidate.root, &checkpoint_name)
+            .await?;
+        let canonical = self
+            .publish_writer_head_result(&result_path, candidate)
+            .await?;
+        self.cleanup_named_checkpoints(&destination, &checkpoint_name, &canonical)
+            .await;
+        Ok(canonical)
+    }
+
     /// Authenticate the canonical operation-owned root, its reachable objects,
     /// and every external final-checkpoint pin it needs.
     pub async fn verify(&self, root: &DurableRoot) -> Result<(), RootStoreError> {
         validate_root(root).map_err(|error| RootStoreError::Invalid(error.to_string()))?;
         let destination = Path::from(root.identity.clone());
-        let result = self
-            .read_result(&destination)
-            .await?
-            .ok_or_else(|| RootStoreError::MissingResult(destination.to_string()))?;
-        if result.root != *root {
-            return Err(RootStoreError::NonCanonicalRoot(root.manifest_id.clone()));
-        }
         let owner = self
             .read_optional::<RootOwner>(&owner_object_path(&destination))
             .await?
             .ok_or_else(|| RootStoreError::MissingOwner(destination.to_string()))?;
-        if owner != result.owner
+        let initial = self
+            .read_result(&destination)
+            .await?
+            .ok_or_else(|| RootStoreError::MissingResult(destination.to_string()))?;
+        if owner != initial.owner
             || owner.schema_version != ROOT_DESCRIPTOR_SCHEMA_VERSION
             || owner.destination_path != destination.to_string()
             || destination
@@ -335,8 +440,62 @@ impl SlateDbRootStore {
         {
             return Err(RootStoreError::OwnershipConflict(destination.to_string()));
         }
-        let expected_name = format!("{ROOT_CHECKPOINT_PREFIX}{}", owner.operation_id);
+        let expected_name = if initial.root == *root {
+            format!("{ROOT_CHECKPOINT_PREFIX}{}", owner.operation_id)
+        } else {
+            let (checkpoint_id, _) = decode_root_checkpoint(&root.manifest_id)?;
+            let checkpoint = self
+                .admin(destination.clone())
+                .list_checkpoints(None)
+                .await?
+                .into_iter()
+                .find(|checkpoint| checkpoint.id == checkpoint_id)
+                .ok_or_else(|| RootStoreError::MissingRootCheckpoint(checkpoint_id.to_string()))?;
+            let name = checkpoint
+                .name
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            let lease_id = name
+                .strip_prefix(HEAD_CHECKPOINT_PREFIX)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            let head = self
+                .read_optional::<WriterHeadResult>(&head_result_object_path(&destination, lease_id))
+                .await?
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            if head.schema_version != ROOT_DESCRIPTOR_SCHEMA_VERSION
+                || head.branch_id != owner.destination_id
+                || head.writer_lease_id != lease_id
+                || head.destination_path != destination.to_string()
+                || head.root != *root
+                || head.previous_root.identity != root.identity
+                || head.previous_root == head.root
+            {
+                return Err(RootStoreError::NonCanonicalRoot(root.manifest_id.clone()));
+            }
+            name
+        };
         self.verify_storage_root(root, &expected_name).await
+    }
+
+    fn validate_writer_head_result(
+        &self,
+        result: &WriterHeadResult,
+        branch_id: Uuid,
+        writer_lease_id: Uuid,
+        previous_root: &DurableRoot,
+        destination: &Path,
+    ) -> Result<(), RootStoreError> {
+        if result.schema_version != ROOT_DESCRIPTOR_SCHEMA_VERSION
+            || result.branch_id != branch_id
+            || result.writer_lease_id != writer_lease_id
+            || result.destination_path != destination.to_string()
+            || result.previous_root != *previous_root
+            || result.root.identity != destination.to_string()
+            || result.root == result.previous_root
+        {
+            return Err(RootStoreError::OwnershipConflict(destination.to_string()));
+        }
+        Ok(())
     }
 
     async fn verify_storage_root(
@@ -619,6 +778,55 @@ impl SlateDbRootStore {
         Ok(canonical.root)
     }
 
+    async fn publish_writer_head_result(
+        &self,
+        path: &Path,
+        candidate: WriterHeadResult,
+    ) -> Result<DurableRoot, RootStoreError> {
+        match self
+            .object_store
+            .put_opts(
+                path,
+                serde_json::to_vec(&candidate)?.into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) => Ok(candidate.root),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let canonical = self
+                    .read_optional::<WriterHeadResult>(path)
+                    .await?
+                    .ok_or_else(|| RootStoreError::MissingResult(path.to_string()))?;
+                if canonical.schema_version != candidate.schema_version
+                    || canonical.branch_id != candidate.branch_id
+                    || canonical.writer_lease_id != candidate.writer_lease_id
+                    || canonical.destination_path != candidate.destination_path
+                    || canonical.previous_root != candidate.previous_root
+                {
+                    return Err(RootStoreError::OwnershipConflict(
+                        candidate.destination_path,
+                    ));
+                }
+                self.verify(&canonical.root).await?;
+                Ok(canonical.root)
+            }
+            Err(error) => {
+                if let Some(canonical) = self.read_optional::<WriterHeadResult>(path).await?
+                    && canonical.schema_version == candidate.schema_version
+                    && canonical.branch_id == candidate.branch_id
+                    && canonical.writer_lease_id == candidate.writer_lease_id
+                    && canonical.destination_path == candidate.destination_path
+                    && canonical.previous_root == candidate.previous_root
+                {
+                    self.verify(&canonical.root).await?;
+                    return Ok(canonical.root);
+                }
+                Err(error.into())
+            }
+        }
+    }
+
     async fn cleanup_operation_checkpoints(
         &self,
         destination: &Path,
@@ -632,6 +840,32 @@ impl SlateDbRootStore {
         let Ok(checkpoints) = self
             .admin(destination.clone())
             .list_checkpoints(Some(&name))
+            .await
+        else {
+            return;
+        };
+        for checkpoint in checkpoints {
+            if checkpoint.id != canonical_checkpoint {
+                let _ = self
+                    .admin(destination.clone())
+                    .delete_checkpoint(checkpoint.id)
+                    .await;
+            }
+        }
+    }
+
+    async fn cleanup_named_checkpoints(
+        &self,
+        destination: &Path,
+        name: &str,
+        canonical: &DurableRoot,
+    ) {
+        let Ok((canonical_checkpoint, _)) = decode_root_checkpoint(&canonical.manifest_id) else {
+            return;
+        };
+        let Ok(checkpoints) = self
+            .admin(destination.clone())
+            .list_checkpoints(Some(name))
             .await
         else {
             return;
@@ -726,6 +960,12 @@ fn owner_object_path(destination: &Path) -> Path {
 
 fn result_object_path(destination: &Path) -> Path {
     destination.clone().join(ROOT_RESULT_OBJECT)
+}
+
+fn head_result_object_path(destination: &Path, writer_lease_id: Uuid) -> Path {
+    destination
+        .clone()
+        .join(format!("{HEAD_RESULT_PREFIX}{writer_lease_id}.json"))
 }
 
 fn encode_root_checkpoint(checkpoint_id: Uuid, manifest_id: u64) -> String {
@@ -1018,6 +1258,89 @@ mod tests {
         assert!(matches!(
             roots.verify(&root).await,
             Err(RootStoreError::MissingExternalPin { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn writer_head_publication_is_immutable_exact_and_advances_readable_state() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("root-store/head-source");
+        let source_db = Db::builder(source_path.clone(), Arc::clone(&object_store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let key = KeyCodec::new().inode_key(1);
+        source_db.put(&key, b"source").await.unwrap();
+        source_db.flush().await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+
+        let branch_id = Uuid::new_v4();
+        let roots = SlateDbRootStore::new(Arc::clone(&object_store), Path::from("root-store"));
+        let initial = roots
+            .create_from_checkpoint(
+                Uuid::new_v4(),
+                branch_id,
+                &ImmutableCheckpoint {
+                    database_path: source_path,
+                    checkpoint_id: checkpoint.id,
+                    manifest_id: checkpoint.manifest_id,
+                },
+            )
+            .await
+            .unwrap();
+        let destination = Path::from(initial.identity.clone());
+        let writer = Db::builder(destination, Arc::clone(&object_store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        writer.put(&key, b"writer").await.unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let lease_id = Uuid::new_v4();
+        let (left, right) = tokio::join!(
+            roots.publish_writer_head(branch_id, lease_id, &initial),
+            roots.publish_writer_head(branch_id, lease_id, &initial)
+        );
+        let head = left.unwrap();
+        assert_eq!(right.unwrap(), head);
+        assert_ne!(head, initial);
+        assert_eq!(
+            roots
+                .checkpoint_reader(&initial)
+                .await
+                .unwrap()
+                .get(&key)
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"source"))
+        );
+        assert_eq!(
+            roots
+                .checkpoint_reader(&head)
+                .await
+                .unwrap()
+                .get(&key)
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"writer"))
+        );
+        roots.verify(&head).await.unwrap();
+        assert!(matches!(
+            roots
+                .publish_writer_head(Uuid::new_v4(), lease_id, &initial)
+                .await,
+            Err(RootStoreError::OwnershipConflict(_))
+        ));
+        assert!(matches!(
+            roots.publish_writer_head(branch_id, lease_id, &head).await,
+            Err(RootStoreError::OwnershipConflict(_))
         ));
     }
 

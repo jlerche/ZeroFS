@@ -56,7 +56,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 19;
+pub const CATALOG_SCHEMA_VERSION: u32 = 20;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -69,6 +69,8 @@ pub const MAX_LIVE_BRANCHES: usize = 4_096;
 pub const MAX_CHECKPOINTS_PER_BRANCH: usize = 256;
 /// Maximum active branch and checkpoint leases attributed to one branch.
 pub const MAX_ACTIVE_LEASES_PER_BRANCH: usize = 64;
+/// Maximum private allocation epochs awaiting publication for one branch.
+pub const MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH: usize = 64;
 /// Maximum retained historical parent edges admitted for a new branch.
 pub const MAX_BRANCH_LINEAGE_DEPTH: usize = 64;
 
@@ -355,6 +357,19 @@ pub struct LeaseTombstone {
     pub id: Uuid,
     pub token_hash: String,
     pub ended_at: DateTime<Utc>,
+    #[serde(default)]
+    pub writer_head: Option<WriterHeadPublication>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WriterHeadPublication {
+    pub branch_id: Uuid,
+    pub consumed_branch_revision: u64,
+    pub consumed_lease_revision: u64,
+    pub previous_root: DurableRoot,
+    pub root: DurableRoot,
+    pub published_generation: u64,
+    pub published_at: DateTime<Utc>,
 }
 
 impl LeaseTombstone {
@@ -366,6 +381,35 @@ impl LeaseTombstone {
         {
             return Err(CatalogError::Invalid(
                 "lease tombstone token hash must be 64 hexadecimal bytes".to_string(),
+            ));
+        }
+        if let Some(publication) = &self.writer_head {
+            publication.validate()?;
+            if publication.published_at != self.ended_at {
+                return Err(CatalogError::Invalid(
+                    "writer head publication and lease tombstone times must match".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WriterHeadPublication {
+    fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.branch_id, "writer head branch")?;
+        validate_revision(self.consumed_branch_revision, "writer head branch")?;
+        validate_revision(self.consumed_lease_revision, "writer head lease")?;
+        validate_root(&self.previous_root)?;
+        validate_root(&self.root)?;
+        validate_timestamp(self.published_at, "writer head published_at")?;
+        if self.previous_root == self.root
+            || self.previous_root.identity != self.root.identity
+            || self.published_generation == 0
+        {
+            return Err(CatalogError::Invalid(
+                "writer head must advance one database identity at a nonzero generation"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -1654,6 +1698,7 @@ impl CatalogSnapshot {
             |record| record.id,
             RetiredCatalogId::validate,
         )?;
+        let mut unexposed_private_epoch_counts = BTreeMap::<Uuid, usize>::new();
         for (epoch, record) in &self.private_epochs {
             record.validate()?;
             if *epoch != record.epoch {
@@ -1681,6 +1726,18 @@ impl CatalogSnapshot {
                     "private epoch {} has no compatible exact branch incarnation",
                     record.epoch
                 )));
+            }
+            if record.state != PrivateEpochState::Exposed {
+                let count = unexposed_private_epoch_counts
+                    .entry(record.branch_id)
+                    .or_default();
+                *count += 1;
+                if *count > MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH {
+                    return Err(CatalogError::Capacity {
+                        resource: "unexposed private epoch per branch",
+                        limit: MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH,
+                    });
+                }
             }
         }
         validate_records(
@@ -2044,6 +2101,14 @@ pub(crate) enum CatalogMutation {
         token_hash: String,
         ended_at: DateTime<Utc>,
     },
+    PublishWriterHead {
+        lease_id: Uuid,
+        expected_lease_revision: u64,
+        token_hash: String,
+        previous_root: DurableRoot,
+        root: DurableRoot,
+        published_at: DateTime<Utc>,
+    },
     ExpireLease {
         id: Uuid,
         expected_revision: u64,
@@ -2355,6 +2420,9 @@ pub(crate) trait Catalog: Send + Sync {
         observed_at: DateTime<Utc>,
     ) -> Result<GcBlockerRecord, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
+    async fn lease_tombstone(&self, id: Uuid) -> Result<Option<LeaseTombstone>, CatalogError> {
+        Ok(self.snapshot().await?.lease_tombstones.get(&id).cloned())
+    }
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
     async fn cleanup_tombstones(
         &self,

@@ -325,7 +325,7 @@ fn validate_duration(duration: Duration) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn token_hash(token: Uuid) -> String {
+pub(crate) fn token_hash(token: Uuid) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
