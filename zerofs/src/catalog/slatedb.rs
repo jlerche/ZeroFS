@@ -6,8 +6,8 @@ use super::{
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
     LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
-    PrivateEpochRecord, PrivateEpochState, TombstoneKind, TombstoneRecord, validate_name,
-    validate_root, validate_timestamp,
+    PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView, PrivateGcOwnerView, TombstoneKind,
+    TombstoneRecord, validate_name, validate_root, validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -382,6 +382,37 @@ impl SlateDbCatalog {
             records.push(serde_json::from_slice(&entry.value)?);
         }
         Ok(records)
+    }
+
+    async fn validate_private_gc_owner_unlocked(
+        &self,
+        branch_id: Uuid,
+        database_identity: &str,
+    ) -> Result<BranchRecord, CatalogError> {
+        let branch = self
+            .get_record::<BranchRecord>(branch_key(branch_id))
+            .await?
+            .ok_or_else(|| {
+                CatalogError::Corrupt(format!("private GC owner branch {branch_id} is missing"))
+            })?;
+        branch.validate()?;
+        if branch.id != branch_id {
+            return Err(CatalogError::Corrupt(format!(
+                "private GC owner branch key {branch_id} contains {}",
+                branch.id
+            )));
+        }
+        if branch.state != BranchState::Ready
+            || branch
+                .root
+                .as_ref()
+                .is_none_or(|root| root.identity != database_identity)
+        {
+            return Err(CatalogError::OperationConflict(format!(
+                "private GC owner branch {branch_id} is not the exact ready database"
+            )));
+        }
+        Ok(branch)
     }
 
     async fn apply_unlocked(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
@@ -1505,6 +1536,177 @@ impl Catalog for SlateDbCatalog {
             record.validate()?;
         }
         Ok(record)
+    }
+
+    async fn private_gc_owner_view(
+        &self,
+        branch_id: Uuid,
+        database_identity: &str,
+        epoch_limit: usize,
+    ) -> Result<PrivateGcOwnerView, CatalogError> {
+        let _guard = self.lock.lock().await;
+        let branch = self
+            .validate_private_gc_owner_unlocked(branch_id, database_identity)
+            .await?;
+        let mut guard_iterator = self.db.scan_prefix(LOCAL_GC_GUARD_PREFIX, ..).await?;
+        let mut active_guard: Option<LocalGcGuardRecord> = None;
+        while let Some(entry) = guard_iterator.next().await? {
+            let guard = serde_json::from_slice::<LocalGcGuardRecord>(&entry.value)?;
+            guard.validate()?;
+            if guard.branch_id != branch_id {
+                continue;
+            }
+            let epoch = self
+                .get_record::<PrivateEpochRecord>(private_epoch_key(guard.epoch))
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "local GC guard {} refers to missing epoch {}",
+                        guard.id, guard.epoch
+                    ))
+                })?;
+            epoch.validate()?;
+            if epoch.branch_id != branch.id
+                || guard.epoch_revision != epoch.revision
+                || epoch.state != PrivateEpochState::SealedPrivate
+            {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC guard {} lost its exact sealed owner",
+                    guard.id
+                )));
+            }
+            if epoch.database_identity == database_identity {
+                let replace = active_guard.as_ref().is_none_or(|current| {
+                    (guard.created_at, guard.id) < (current.created_at, current.id)
+                });
+                if replace {
+                    active_guard = Some(guard);
+                }
+            }
+        }
+        if active_guard.is_some() {
+            return Ok(PrivateGcOwnerView {
+                active_guard,
+                sealed_epochs: Vec::new(),
+            });
+        }
+
+        let mut epoch_iterator = self.db.scan_prefix(PRIVATE_EPOCH_PREFIX, ..).await?;
+        let mut sealed_epochs = Vec::with_capacity(epoch_limit.min(32));
+        while sealed_epochs.len() < epoch_limit {
+            let Some(entry) = epoch_iterator.next().await? else {
+                break;
+            };
+            let epoch = serde_json::from_slice::<PrivateEpochRecord>(&entry.value)?;
+            epoch.validate()?;
+            if epoch.state == PrivateEpochState::SealedPrivate
+                && epoch.branch_id == branch_id
+                && epoch.database_identity == database_identity
+            {
+                sealed_epochs.push(epoch);
+            }
+        }
+        Ok(PrivateGcOwnerView {
+            active_guard: None,
+            sealed_epochs,
+        })
+    }
+
+    async fn private_gc_guard_view(
+        &self,
+        guard_id: Uuid,
+        writer_epoch_id: u64,
+    ) -> Result<PrivateGcGuardView, CatalogError> {
+        let _guard = self.lock.lock().await;
+        let guard = self
+            .get_record::<LocalGcGuardRecord>(local_gc_guard_key(guard_id))
+            .await?;
+        let progress = self
+            .get_record::<LocalGcProgressRecord>(local_gc_progress_key(guard_id))
+            .await?;
+        if let Some(record) = &guard {
+            record.validate()?;
+            if record.id != guard_id {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC guard key {guard_id} contains {}",
+                    record.id
+                )));
+            }
+        }
+        if let Some(record) = &progress {
+            record.validate()?;
+            if record.id != guard_id {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC progress key {guard_id} contains {}",
+                    record.id
+                )));
+            }
+        }
+        if let Some(progress) = &progress {
+            match (progress.completed_at, guard.as_ref()) {
+                (None, Some(guard)) if progress.matches_guard(guard) => {}
+                (Some(_), None) => {}
+                _ => {
+                    return Err(CatalogError::Corrupt(format!(
+                        "local GC progress {guard_id} disagrees with guard retirement"
+                    )));
+                }
+            }
+        }
+        let guarded_epoch_id = match (&guard, &progress) {
+            (Some(guard), Some(progress)) if guard.epoch != progress.epoch => {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC guard {guard_id} disagrees with its progress epoch"
+                )));
+            }
+            (Some(guard), _) => Some(guard.epoch),
+            (_, Some(progress)) => Some(progress.epoch),
+            (None, None) => None,
+        };
+        let guarded_epoch = match guarded_epoch_id {
+            Some(epoch) => {
+                self.get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
+                    .await?
+            }
+            None => None,
+        };
+        let writer_epoch = match &guarded_epoch {
+            Some(guarded) if guarded.epoch == writer_epoch_id => Some(guarded.clone()),
+            _ => {
+                self.get_record::<PrivateEpochRecord>(private_epoch_key(writer_epoch_id))
+                    .await?
+            }
+        };
+        if let Some(record) = &guarded_epoch {
+            record.validate()?;
+        }
+        if let Some(record) = &writer_epoch {
+            record.validate()?;
+        }
+        if let Some(guard) = &guard {
+            let guarded = guarded_epoch.as_ref().ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "local GC guard {guard_id} refers to a missing epoch"
+                ))
+            })?;
+            if guarded.epoch != guard.epoch
+                || guarded.branch_id != guard.branch_id
+                || guarded.revision != guard.epoch_revision
+                || guarded.state != PrivateEpochState::SealedPrivate
+            {
+                return Err(CatalogError::Corrupt(format!(
+                    "local GC guard {guard_id} lost its exact sealed epoch"
+                )));
+            }
+            self.validate_private_gc_owner_unlocked(guard.branch_id, &guarded.database_identity)
+                .await?;
+        }
+        Ok(PrivateGcGuardView {
+            guard,
+            progress,
+            guarded_epoch,
+            writer_epoch,
+        })
     }
 
     async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError> {
@@ -3043,6 +3245,118 @@ mod tests {
         assert!(deleted_epoch.exposed_at.is_some());
         catalog.snapshot().await.unwrap();
         catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_private_gc_views_require_the_exact_valid_ready_owner() {
+        for corruption in ["missing", "non-ready", "malformed", "wrong-root"] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let catalog =
+                SlateDbCatalog::open(Path::from(format!("private-gc-owner-{corruption}")), store)
+                    .await
+                    .unwrap();
+            let owner = branch(&format!("owner-{corruption}"));
+            let database_identity = owner.root.as_ref().unwrap().identity.clone();
+            catalog
+                .apply(CatalogMutation::CreateBranch(owner.clone()))
+                .await
+                .unwrap();
+            let opened_at = owner.updated_at + chrono::Duration::microseconds(1);
+            let mut guarded_epoch = private_epoch(owner.id, 301, opened_at);
+            guarded_epoch.database_identity = database_identity.clone();
+            let mut writer_epoch = private_epoch(owner.id, 302, opened_at);
+            writer_epoch.database_identity = database_identity.clone();
+            writer_epoch.pool_id = guarded_epoch.pool_id;
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(guarded_epoch.clone()))
+                .await
+                .unwrap();
+            catalog
+                .apply(CatalogMutation::RegisterPrivateEpoch(writer_epoch.clone()))
+                .await
+                .unwrap();
+            let sealed_at = opened_at + chrono::Duration::microseconds(1);
+            catalog
+                .apply(CatalogMutation::SealPrivateEpoch {
+                    epoch: guarded_epoch.epoch,
+                    branch_id: owner.id,
+                    expected_revision: guarded_epoch.revision,
+                    next_epoch: writer_epoch.epoch,
+                    expected_next_revision: writer_epoch.revision,
+                    sealed_at,
+                })
+                .await
+                .unwrap();
+            let guard = LocalGcGuardRecord {
+                id: Uuid::new_v4(),
+                revision: 1,
+                branch_id: owner.id,
+                epoch: guarded_epoch.epoch,
+                epoch_revision: 2,
+                candidate_count: 1,
+                candidate_digest: "a".repeat(64),
+                created_at: sealed_at + chrono::Duration::microseconds(1),
+            };
+            catalog
+                .apply(CatalogMutation::AcquireLocalGcGuard(guard.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog
+                    .private_gc_owner_view(owner.id, &database_identity, 1)
+                    .await
+                    .unwrap()
+                    .active_guard,
+                Some(guard.clone())
+            );
+            assert_eq!(
+                catalog
+                    .private_gc_guard_view(guard.id, writer_epoch.epoch)
+                    .await
+                    .unwrap()
+                    .guard,
+                Some(guard.clone())
+            );
+
+            let mut corrupt = WriteBatch::new();
+            match corruption {
+                "missing" => corrupt.delete(branch_key(owner.id)),
+                "non-ready" => {
+                    let mut changed = owner.clone();
+                    changed.state = BranchState::Deleting;
+                    put_json(&mut corrupt, branch_key(owner.id), &changed).unwrap();
+                }
+                "malformed" => {
+                    corrupt.put(branch_key(owner.id), b"{}".as_slice());
+                }
+                "wrong-root" => {
+                    let mut changed = owner.clone();
+                    changed.root.as_mut().unwrap().identity = "root/other-database".to_string();
+                    put_json(&mut corrupt, branch_key(owner.id), &changed).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            catalog
+                .db
+                .write_with_options(corrupt, &durable_write_options())
+                .await
+                .unwrap();
+            assert!(
+                catalog
+                    .private_gc_owner_view(owner.id, &database_identity, 1)
+                    .await
+                    .is_err(),
+                "owner view accepted {corruption} owner"
+            );
+            assert!(
+                catalog
+                    .private_gc_guard_view(guard.id, writer_epoch.epoch)
+                    .await
+                    .is_err(),
+                "deletion view accepted {corruption} owner"
+            );
+            catalog.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -546,6 +546,18 @@ root-retaining global GC runs. A blocker or any ambiguous ownership retains the
 object for global GC. Normal ownerless mounts cannot construct this coordinator,
 and no normal-server configuration enables it yet.
 
+The authoritative SlateDB backend serves private collection through targeted,
+lock-consistent views. Work selection reads private epochs, active guards, and
+the exact validated ready owner branch rather than materializing every catalog
+collection. Its durable-root identity must equal the authenticated branch
+database identity. Each
+candidate transition point-reads only its guard, progress, guarded epoch, and
+current allocator epoch plus that exact owner branch while the filesystem
+publication barrier is held. Missing, malformed, non-ready, wrong-root, or
+internally inconsistent targeted records retain data. Atomic guard
+admission still performs the broader root-blocker checks described above; those
+checks are the remaining local-GC catalog-scaling boundary.
+
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
 active writer, and authoritative guard attachment proves the requested term was

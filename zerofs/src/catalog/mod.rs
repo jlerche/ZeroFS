@@ -688,6 +688,20 @@ impl LocalGcProgressRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrivateGcOwnerView {
+    pub active_guard: Option<LocalGcGuardRecord>,
+    pub sealed_epochs: Vec<PrivateEpochRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrivateGcGuardView {
+    pub guard: Option<LocalGcGuardRecord>,
+    pub progress: Option<LocalGcProgressRecord>,
+    pub guarded_epoch: Option<PrivateEpochRecord>,
+    pub writer_epoch: Option<PrivateEpochRecord>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GcRootKind {
@@ -1977,6 +1991,100 @@ pub(crate) trait Catalog: Send + Sync {
         Err(CatalogError::Invalid(
             "catalog backend does not support private epochs".to_string(),
         ))
+    }
+    async fn private_gc_owner_view(
+        &self,
+        branch_id: Uuid,
+        database_identity: &str,
+        epoch_limit: usize,
+    ) -> Result<PrivateGcOwnerView, CatalogError> {
+        let snapshot = self.snapshot().await?;
+        if !snapshot.branches.get(&branch_id).is_some_and(|branch| {
+            branch.state == BranchState::Ready
+                && branch
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| root.identity == database_identity)
+        }) {
+            return Err(CatalogError::OperationConflict(format!(
+                "private GC owner branch {branch_id} is not the exact ready database"
+            )));
+        }
+        let active_guard = snapshot
+            .local_gc_guards
+            .values()
+            .filter(|guard| {
+                snapshot
+                    .private_epochs
+                    .get(&guard.epoch)
+                    .is_some_and(|epoch| {
+                        epoch.branch_id == branch_id && epoch.database_identity == database_identity
+                    })
+            })
+            .min_by_key(|guard| (guard.created_at, guard.id))
+            .cloned();
+        let sealed_epochs = if active_guard.is_some() {
+            Vec::new()
+        } else {
+            snapshot
+                .private_epochs
+                .values()
+                .filter(|epoch| {
+                    epoch.state == PrivateEpochState::SealedPrivate
+                        && epoch.branch_id == branch_id
+                        && epoch.database_identity == database_identity
+                })
+                .take(epoch_limit)
+                .cloned()
+                .collect()
+        };
+        Ok(PrivateGcOwnerView {
+            active_guard,
+            sealed_epochs,
+        })
+    }
+    async fn private_gc_guard_view(
+        &self,
+        guard_id: Uuid,
+        writer_epoch: u64,
+    ) -> Result<PrivateGcGuardView, CatalogError> {
+        let snapshot = self.snapshot().await?;
+        let guard = snapshot.local_gc_guards.get(&guard_id).cloned();
+        let progress = snapshot.local_gc_progress.get(&guard_id).cloned();
+        let guarded_epoch_id = guard
+            .as_ref()
+            .map(|record| record.epoch)
+            .or_else(|| progress.as_ref().map(|record| record.epoch));
+        let guarded_epoch =
+            guarded_epoch_id.and_then(|epoch| snapshot.private_epochs.get(&epoch).cloned());
+        if let Some(guard) = &guard {
+            let epoch = guarded_epoch.as_ref().ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "local GC guard {guard_id} refers to a missing epoch"
+                ))
+            })?;
+            if !snapshot
+                .branches
+                .get(&guard.branch_id)
+                .is_some_and(|branch| {
+                    branch.state == BranchState::Ready
+                        && branch
+                            .root
+                            .as_ref()
+                            .is_some_and(|root| root.identity == epoch.database_identity)
+                })
+            {
+                return Err(CatalogError::OperationConflict(format!(
+                    "private GC guard {guard_id} lost its exact ready owner"
+                )));
+            }
+        }
+        Ok(PrivateGcGuardView {
+            guard,
+            progress,
+            guarded_epoch,
+            writer_epoch: snapshot.private_epochs.get(&writer_epoch).cloned(),
+        })
     }
     /// Persist immutable root pins only if no root-affecting catalog mutation
     /// occurred since capture. The pins duplicate roots present at that same

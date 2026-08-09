@@ -125,21 +125,15 @@ impl PrivateEpochLifecycle {
             .into());
         }
 
-        let snapshot = self.catalog.snapshot().await?;
-        let active = snapshot
-            .local_gc_guards
-            .values()
-            .filter(|guard| {
-                snapshot
-                    .private_epochs
-                    .get(&guard.epoch)
-                    .is_some_and(|epoch| {
-                        epoch.branch_id == publisher.branch_id
-                            && epoch.database_identity == publisher.database_identity
-                    })
-            })
-            .min_by_key(|guard| (guard.created_at, guard.id));
-        if let Some(guard) = active {
+        let owner_view = self
+            .catalog
+            .private_gc_owner_view(
+                publisher.branch_id,
+                &publisher.database_identity,
+                policy.epoch_scan_limit as usize,
+            )
+            .await?;
+        if let Some(guard) = owner_view.active_guard {
             let decoded = extent_store
                 .load_private_gc_artifact(guard.id)
                 .await
@@ -163,16 +157,7 @@ impl PrivateEpochLifecycle {
                 .map(Some);
         }
 
-        for epoch in snapshot
-            .private_epochs
-            .values()
-            .filter(|epoch| {
-                epoch.state == PrivateEpochState::SealedPrivate
-                    && epoch.branch_id == publisher.branch_id
-                    && epoch.database_identity == publisher.database_identity
-            })
-            .take(policy.epoch_scan_limit as usize)
-        {
+        for epoch in owner_view.sealed_epochs {
             let batch = extent_store
                 .prepare_private_gc_batch(epoch.epoch, policy.batch_size as usize)
                 .await
@@ -316,14 +301,20 @@ impl PrivateEpochLifecycle {
                 .map_err(|_| {
                     CatalogError::OperationConflict("private GC serving authority".to_string())
                 })?;
-            let snapshot = self.catalog.snapshot().await?;
-            if let Some(progress) = snapshot.local_gc_progress.get(&guard_id)
+            let writer_epoch = extent_store.private_writer_segment_epoch().ok_or_else(|| {
+                CatalogError::OperationConflict("private GC writer epoch is not bound".to_string())
+            })?;
+            let view = self
+                .catalog
+                .private_gc_guard_view(guard_id, writer_epoch)
+                .await?;
+            if let Some(progress) = view.progress.as_ref()
                 && progress.completed_at.is_some()
             {
                 validate_progress_artifact(progress, guard_id, batch)?;
                 return Ok(progress.clone());
             }
-            let guard = snapshot.local_gc_guards.get(&guard_id).ok_or_else(|| {
+            let guard = view.guard.as_ref().ok_or_else(|| {
                 CatalogError::OperationConflict(format!(
                     "private GC guard {} is not active",
                     guard_id
@@ -336,9 +327,9 @@ impl PrivateEpochLifecycle {
                 guard.epoch,
             )
             .await?;
-            let epoch = snapshot
-                .private_epochs
-                .get(&guard.epoch)
+            let epoch = view
+                .guarded_epoch
+                .as_ref()
                 .ok_or_else(|| CatalogError::NotFound(format!("private epoch {}", guard.epoch)))?;
             if !record_matches_proof(epoch, &proof)
                 || epoch.state != PrivateEpochState::SealedPrivate
@@ -352,9 +343,6 @@ impl PrivateEpochLifecycle {
                 ))
                 .into());
             }
-            let writer_epoch = extent_store.private_writer_segment_epoch().ok_or_else(|| {
-                CatalogError::OperationConflict("private GC writer epoch is not bound".to_string())
-            })?;
             if writer_epoch == guard.epoch {
                 return Err(CatalogError::OperationConflict(format!(
                     "private GC writer epoch {writer_epoch} is the guarded sealed epoch"
@@ -367,7 +355,7 @@ impl PrivateEpochLifecycle {
                 writer_epoch,
             )
             .await?;
-            let writer = snapshot.private_epochs.get(&writer_epoch).ok_or_else(|| {
+            let writer = view.writer_epoch.as_ref().ok_or_else(|| {
                 CatalogError::NotFound(format!("private writer epoch {writer_epoch}"))
             })?;
             if !record_matches_proof(writer, &writer_proof)
@@ -381,7 +369,7 @@ impl PrivateEpochLifecycle {
                 ))
                 .into());
             }
-            let current = match snapshot.local_gc_progress.get(&guard.id) {
+            let current = match view.progress.as_ref() {
                 Some(progress) => {
                     validate_progress_artifact(progress, guard_id, batch)?;
                     progress.clone()
