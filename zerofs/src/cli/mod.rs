@@ -10,6 +10,7 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
+pub(crate) use init::CheckpointCatalogRuntime;
 pub mod monitor;
 pub mod otrace;
 pub mod password;
@@ -165,6 +166,9 @@ pub enum CheckpointCommands {
         config: PathBuf,
         /// Checkpoint name to delete
         name: String,
+        /// Stable checkpoint UUID for an exact retry after an ambiguous response
+        #[arg(long)]
+        id: Option<uuid::Uuid>,
     },
     /// Get checkpoint information
     Info {

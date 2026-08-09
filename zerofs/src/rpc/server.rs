@@ -31,6 +31,42 @@ fn customer_catalog_status(error: CatalogError) -> Status {
     }
 }
 
+#[async_trait::async_trait]
+pub(crate) trait CheckpointCatalogAuthority: Send + Sync {
+    fn branch_id(&self) -> uuid::Uuid;
+    async fn publish(
+        &self,
+        request: zerofs::catalog::CheckpointCreateRequest,
+    ) -> anyhow::Result<zerofs::catalog::CheckpointRecord>;
+    async fn delete(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        name: String,
+    ) -> anyhow::Result<zerofs::catalog::TombstoneRecord>;
+}
+
+#[async_trait::async_trait]
+impl CheckpointCatalogAuthority for crate::cli::CheckpointCatalogRuntime {
+    fn branch_id(&self) -> uuid::Uuid {
+        self.branch_id()
+    }
+
+    async fn publish(
+        &self,
+        request: zerofs::catalog::CheckpointCreateRequest,
+    ) -> anyhow::Result<zerofs::catalog::CheckpointRecord> {
+        self.publish(request).await
+    }
+
+    async fn delete(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        name: String,
+    ) -> anyhow::Result<zerofs::catalog::TombstoneRecord> {
+        self.delete(checkpoint_id, name).await
+    }
+}
+
 /// Gate successful stream items at the admin service response boundary.
 fn gate_serving_stream<T, S>(
     stream: S,
@@ -159,6 +195,8 @@ fn trash_sweep_lock() -> Arc<tokio::sync::Mutex<()>> {
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
+    checkpoint_catalog: Option<Arc<dyn CheckpointCatalogAuthority>>,
+    catalog_configured: bool,
     customer_catalog: Option<CustomerCatalog>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
@@ -173,6 +211,8 @@ impl AdminRpcServer {
     ) -> Self {
         let server = Self {
             checkpoint_manager,
+            checkpoint_catalog: None,
+            catalog_configured: false,
             customer_catalog,
             fs,
             shutdown,
@@ -182,6 +222,30 @@ impl AdminRpcServer {
         // otherwise the leftovers sit there until the next RemoveDirectory.
         server.spawn_trash_sweep();
         server
+    }
+
+    pub(crate) fn new_with_catalog(
+        checkpoint_manager: Arc<CheckpointManager>,
+        checkpoint_catalog: Option<Arc<dyn CheckpointCatalogAuthority>>,
+        catalog_configured: bool,
+        customer_catalog: Option<CustomerCatalog>,
+        fs: Arc<ZeroFS>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let mut server = Self::new(checkpoint_manager, customer_catalog, fs, shutdown);
+        server.checkpoint_catalog = checkpoint_catalog;
+        server.catalog_configured = catalog_configured;
+        server
+    }
+
+    fn checkpoint_catalog(&self) -> Result<Option<&dyn CheckpointCatalogAuthority>, Status> {
+        match (&self.checkpoint_catalog, self.catalog_configured) {
+            (Some(catalog), _) => Ok(Some(catalog.as_ref())),
+            (None, true) => Err(Status::failed_precondition(
+                "checkpoint mutation requires a configured active branch mount",
+            )),
+            (None, false) => Ok(None),
+        }
     }
 
     fn customer_catalog(&self) -> Result<&CustomerCatalog, Status> {
@@ -343,15 +407,32 @@ impl AdminService for AdminRpcServer {
         request: Request<proto::CreateCheckpointRequest>,
     ) -> Result<Response<proto::CreateCheckpointResponse>, Status> {
         let name = request.into_inner().name;
+        let checkpoint_catalog = self.checkpoint_catalog()?;
 
         let info = self
             .checkpoint_manager
-            .create_checkpoint(&name)
+            .create_checkpoint_exact(&name)
             .await
             .map_err(|e| Status::internal(format!("Failed to create checkpoint: {}", e)))?;
+        if let Some(catalog) = checkpoint_catalog {
+            catalog
+                .publish(zerofs::catalog::CheckpointCreateRequest {
+                    checkpoint_id: info.info.id,
+                    branch_id: catalog.branch_id(),
+                    name: info.info.name.clone(),
+                    source: info.source.clone(),
+                    created_at: info.created_at,
+                })
+                .await
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "Failed to publish authoritative checkpoint: {error:#}"
+                    ))
+                })?;
+        }
 
         self.success_response(proto::CreateCheckpointResponse {
-            checkpoint: Some(info.into()),
+            checkpoint: Some(info.info.into()),
         })
     }
 
@@ -374,12 +455,30 @@ impl AdminService for AdminRpcServer {
         &self,
         request: Request<proto::DeleteCheckpointRequest>,
     ) -> Result<Response<proto::DeleteCheckpointResponse>, Status> {
-        let name = request.into_inner().name;
-
-        self.checkpoint_manager
-            .delete_checkpoint(&name)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to delete checkpoint: {}", e)))?;
+        let request = request.into_inner();
+        match self.checkpoint_catalog()? {
+            Some(catalog) => {
+                let checkpoint_id = uuid::Uuid::parse_str(&request.checkpoint_id)
+                    .map_err(|_| Status::invalid_argument("invalid checkpoint UUID"))?;
+                catalog
+                    .delete(checkpoint_id, request.name)
+                    .await
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "Failed to delete authoritative checkpoint: {error:#}"
+                        ))
+                    })?;
+                // Physical checkpoint metadata remains until no lease or
+                // incomplete operation can require this exact immutable root.
+                // Catalog deletion is the public namespace linearization point.
+            }
+            None => {
+                self.checkpoint_manager
+                    .delete_checkpoint(&request.name)
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to delete checkpoint: {}", e)))?;
+            }
+        }
 
         self.success_response(proto::DeleteCheckpointResponse {})
     }
@@ -828,6 +927,60 @@ mod tests {
     use slatedb::object_store::path::Path as DbPath;
     use std::time::Duration;
 
+    #[derive(Default)]
+    struct RecordingCheckpointCatalog {
+        branch_id: uuid::Uuid,
+        publications: std::sync::Mutex<Vec<zerofs::catalog::CheckpointCreateRequest>>,
+        deletions: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointCatalogAuthority for RecordingCheckpointCatalog {
+        fn branch_id(&self) -> uuid::Uuid {
+            self.branch_id
+        }
+
+        async fn publish(
+            &self,
+            request: zerofs::catalog::CheckpointCreateRequest,
+        ) -> anyhow::Result<zerofs::catalog::CheckpointRecord> {
+            self.publications.lock().unwrap().push(request.clone());
+            Ok(zerofs::catalog::CheckpointRecord {
+                id: request.checkpoint_id,
+                revision: 1,
+                branch_id: request.branch_id,
+                name: request.name,
+                root: request.source.durable_root(),
+                created_at: request.created_at,
+                updated_at: request.created_at,
+            })
+        }
+
+        async fn delete(
+            &self,
+            checkpoint_id: uuid::Uuid,
+            name: String,
+        ) -> anyhow::Result<zerofs::catalog::TombstoneRecord> {
+            self.deletions
+                .lock()
+                .unwrap()
+                .push((checkpoint_id, name.clone()));
+            let now = zerofs::catalog::catalog_timestamp(chrono::Utc::now());
+            Ok(zerofs::catalog::TombstoneRecord {
+                id: checkpoint_id,
+                kind: zerofs::catalog::TombstoneKind::Checkpoint,
+                name,
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                deleted_revision: Some(1),
+                deletion_operation_id: None,
+                deleted_generation: 1,
+                deleted_at: now,
+            })
+        }
+    }
+
     /// Build an in-memory ZeroFS plus the CheckpointManager the admin server
     /// needs. The slatedb handle is constructed here (instead of via
     /// ZeroFS::new_in_memory) because the CheckpointManager needs it too.
@@ -931,6 +1084,125 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("admin RPC client failed to connect");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_mutations_use_bound_catalog_and_exact_delete_uuid() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let authority = Arc::new(RecordingCheckpointCatalog {
+            branch_id: uuid::Uuid::new_v4(),
+            ..RecordingCheckpointCatalog::default()
+        });
+        let service = AdminRpcServer::new_with_catalog(
+            Arc::clone(&checkpoint_manager),
+            Some(authority.clone()),
+            true,
+            None,
+            fs,
+            CancellationToken::new(),
+        );
+
+        let created = service
+            .create_checkpoint(Request::new(proto::CreateCheckpointRequest {
+                name: "snapshot".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .checkpoint
+            .unwrap();
+        let checkpoint_id = uuid::Uuid::parse_str(&created.id).unwrap();
+        {
+            let publications = authority.publications.lock().unwrap();
+            assert_eq!(publications.len(), 1);
+            assert_eq!(publications[0].checkpoint_id, checkpoint_id);
+            assert_eq!(publications[0].branch_id, authority.branch_id);
+            assert_eq!(publications[0].name, "snapshot");
+        }
+
+        for _ in 0..2 {
+            service
+                .delete_checkpoint(Request::new(proto::DeleteCheckpointRequest {
+                    name: "snapshot".to_string(),
+                    checkpoint_id: checkpoint_id.to_string(),
+                }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            authority.deletions.lock().unwrap().as_slice(),
+            &[
+                (checkpoint_id, "snapshot".to_string()),
+                (checkpoint_id, "snapshot".to_string())
+            ]
+        );
+        assert_eq!(
+            checkpoint_manager
+                .get_checkpoint_info("snapshot")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            checkpoint_id,
+            "logical deletion must retain physical state until root users drain"
+        );
+
+        let error = service
+            .delete_checkpoint(Request::new(proto::DeleteCheckpointRequest {
+                name: "snapshot".to_string(),
+                checkpoint_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_without_active_branch_rejects_before_checkpoint_io() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let service = AdminRpcServer::new_with_catalog(
+            Arc::clone(&checkpoint_manager),
+            None,
+            true,
+            None,
+            fs,
+            CancellationToken::new(),
+        );
+
+        let error = service
+            .create_checkpoint(Request::new(proto::CreateCheckpointRequest {
+                name: "snapshot".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            checkpoint_manager
+                .list_checkpoints()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_client_carries_exact_delete_uuid_over_unix_socket() {
+        let (_fs, client, shutdown, _directory) = setup().await;
+        let checkpoint = client.create_checkpoint("snapshot").await.unwrap();
+
+        client
+            .delete_checkpoint(checkpoint.id, &checkpoint.name)
+            .await
+            .unwrap();
+
+        assert!(
+            client
+                .get_checkpoint_info("snapshot")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        shutdown.cancel();
     }
 
     async fn customer_catalog_fixture()

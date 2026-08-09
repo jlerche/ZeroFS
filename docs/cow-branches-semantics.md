@@ -224,6 +224,12 @@ Repeated deletion of the same checkpoint UUID returns the existing tombstone as
 success. Deletion by a reused name without the expected UUID is invalid. A lost
 success response is resolved by reading the exact UUID/tombstone.
 
+The admin deletion request therefore carries both the stable checkpoint UUID
+and its historical name. The CLI resolves the UUID before mutation and prints a
+`--id` retry value if the response is ambiguous. Logical catalog deletion is the
+namespace linearization point; physical SlateDB checkpoint metadata is retained
+until leases and incomplete operations no longer require that exact root.
+
 ## Branch deletion, descendants, and mounts
 
 Deleting a branch never recursively mutates descendants. At the deletion
@@ -477,11 +483,11 @@ than the generation preflight used here, and must fail closed.
 The authority boundary enforces this rule rather than relying on caller
 discipline. Production catalog mutations expose no generic branch/checkpoint
 root insertion or root-replacement operation: roots are published only by the
-dedicated authenticated lifecycle transitions. Checkpoint creation and branch
-head advancement remain unavailable through the production catalog until their
-dedicated transitions enforce the same source-hold/new-allocation rule. Generic
-root-bearing mutations exist only as unit-test fixtures, where branch
-replacement is additionally forbidden from changing the root.
+dedicated authenticated lifecycle transitions. Checkpoint creation verifies the
+complete permanent physical descriptor and unique public-name owner before
+publication; branch head advancement authenticates the closed newer-writer
+proof. Generic branch root-bearing mutations exist only as unit-test fixtures,
+where replacement is additionally forbidden from changing the root.
 
 Every legitimate segment writer also treats `segments/...` keys as immutable.
 Small seals use conditional create. Multipart seals upload to a unique

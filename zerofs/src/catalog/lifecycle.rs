@@ -374,6 +374,45 @@ impl BranchLifecycle {
         super::DeletionLifecycle::new_with_features(Arc::clone(&self.catalog), self.features)
     }
 
+    /// Logically delete one immutable checkpoint UUID without trusting a
+    /// reusable name to select the target. The live revision (or the revision
+    /// preserved by an exact retry tombstone) is derived from SlateDB authority.
+    pub async fn delete_checkpoint_by_identity(
+        &self,
+        expected_branch_id: Uuid,
+        checkpoint_id: Uuid,
+        name: String,
+    ) -> Result<super::TombstoneRecord, super::DeletionLifecycleError> {
+        let expected_revision =
+            if let Some(checkpoint) = self.catalog.checkpoint(checkpoint_id).await? {
+                if checkpoint.branch_id != expected_branch_id || checkpoint.name != name {
+                    return Err(CatalogError::NotFound(format!("{name} ({checkpoint_id})")).into());
+                }
+                checkpoint.revision
+            } else if let Some(tombstone) = self.catalog.tombstone(checkpoint_id).await? {
+                if tombstone.kind != super::TombstoneKind::Checkpoint
+                    || tombstone.parent_id != Some(expected_branch_id)
+                    || tombstone.name != name
+                {
+                    return Err(CatalogError::NotFound(format!("{name} ({checkpoint_id})")).into());
+                }
+                tombstone.deleted_revision.ok_or_else(|| {
+                    CatalogError::OperationConflict(format!(
+                        "checkpoint {checkpoint_id} tombstone predates exact retry metadata"
+                    ))
+                })?
+            } else {
+                return Err(CatalogError::NotFound(checkpoint_id.to_string()).into());
+            };
+        self.deletions()
+            .delete_checkpoint(super::CheckpointDeleteRequest {
+                checkpoint_id,
+                expected_revision,
+                name,
+            })
+            .await
+    }
+
     /// Run one policy-bounded metadata cleanup pass. Eligible tombstones become
     /// permanent root-free UUID reservations; uncertainty and live dependencies
     /// retain the full historical record.
@@ -1061,8 +1100,8 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchDeleteRequest, BranchDeleteResult, CatalogMutation, CheckpointDeleteRequest,
-        CheckpointRecord, DurableRoot, JsonCatalogProjection, LeaseAccessMode, LeaseAcquireRequest,
-        SlateDbCatalog, catalog_timestamp,
+        CheckpointRecord, DeletionLifecycleError, DurableRoot, JsonCatalogProjection,
+        LeaseAccessMode, LeaseAcquireRequest, SlateDbCatalog, catalog_timestamp,
     };
     use crate::fs::key_codec::KeyCodec;
     use slatedb::Db;
@@ -1334,6 +1373,132 @@ mod tests {
             }
         }
         assert!(catalog.snapshot().await.unwrap().checkpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_delete_is_branch_bound_and_never_targets_name_replacement() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from("checkpoint-identity-delete/catalog"),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        let branch_id = Uuid::new_v4();
+        let other_branch_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let replacement_id = Uuid::new_v4();
+        let now = catalog_timestamp(Utc::now());
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: branch_id,
+                revision: 1,
+                name: "main".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "checkpoint-identity-delete/live".to_string(),
+                    manifest_id: format!("checkpoint:{checkpoint_id}:1"),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: other_branch_id,
+                revision: 1,
+                name: "other".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "checkpoint-identity-delete/other".to_string(),
+                    manifest_id: "checkpoint:other:1".to_string(),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        let checkpoint = |id| CheckpointRecord {
+            id,
+            revision: 1,
+            branch_id,
+            name: "snapshot".to_string(),
+            root: DurableRoot {
+                identity: "checkpoint-identity-delete/live".to_string(),
+                manifest_id: format!("checkpoint:{id}:1"),
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(checkpoint(checkpoint_id)))
+            .await
+            .unwrap();
+        let lifecycle = BranchLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(
+                Arc::clone(&store),
+                Path::from("checkpoint-identity-delete/branches"),
+            ),
+        );
+
+        assert!(matches!(
+            lifecycle
+                .delete_checkpoint_by_identity(
+                    other_branch_id,
+                    checkpoint_id,
+                    "snapshot".to_string(),
+                )
+                .await,
+            Err(DeletionLifecycleError::Catalog(CatalogError::NotFound(_)))
+        ));
+        assert!(catalog.checkpoint(checkpoint_id).await.unwrap().is_some());
+
+        let tombstone = lifecycle
+            .delete_checkpoint_by_identity(branch_id, checkpoint_id, "snapshot".to_string())
+            .await
+            .unwrap();
+        assert_eq!(tombstone.id, checkpoint_id);
+        assert!(matches!(
+            lifecycle
+                .delete_checkpoint_by_identity(
+                    other_branch_id,
+                    checkpoint_id,
+                    "snapshot".to_string(),
+                )
+                .await,
+            Err(DeletionLifecycleError::Catalog(CatalogError::NotFound(_)))
+        ));
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(checkpoint(
+                replacement_id,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lifecycle
+                .delete_checkpoint_by_identity(branch_id, checkpoint_id, "snapshot".to_string())
+                .await
+                .unwrap(),
+            tombstone
+        );
+        assert_eq!(
+            catalog
+                .checkpoint(replacement_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            replacement_id
+        );
     }
 
     #[tokio::test]

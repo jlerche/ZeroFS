@@ -36,11 +36,81 @@ pub(crate) struct CatalogRuntime {
     projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CheckpointCatalogRuntime {
+    lifecycle: zerofs::catalog::BranchLifecycle,
+    volume_id: uuid::Uuid,
+    projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
+    branch_id: uuid::Uuid,
+}
+
+impl CheckpointCatalogRuntime {
+    pub(crate) fn branch_id(&self) -> uuid::Uuid {
+        self.branch_id
+    }
+
+    pub(crate) async fn publish(
+        &self,
+        request: zerofs::catalog::CheckpointCreateRequest,
+    ) -> Result<zerofs::catalog::CheckpointRecord> {
+        if request.branch_id != self.branch_id {
+            anyhow::bail!(
+                "checkpoint branch UUID {} does not match active branch {}",
+                request.branch_id,
+                self.branch_id
+            );
+        }
+        let record = self
+            .lifecycle
+            .publish_checkpoint(request)
+            .await
+            .context("Failed to publish authoritative checkpoint")?;
+        self.reconcile_projection("checkpoint publication").await;
+        Ok(record)
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        name: String,
+    ) -> Result<zerofs::catalog::TombstoneRecord> {
+        let tombstone = self
+            .lifecycle
+            .delete_checkpoint_by_identity(self.branch_id, checkpoint_id, name)
+            .await
+            .context("Failed to delete authoritative checkpoint")?;
+        self.reconcile_projection("checkpoint deletion").await;
+        Ok(tombstone)
+    }
+
+    async fn reconcile_projection(&self, operation: &str) {
+        if let Some(projection) = &self.projection
+            && let Err(error) = self
+                .lifecycle
+                .reconcile_projection(self.volume_id, projection.as_ref())
+                .await
+        {
+            tracing::warn!(
+                "Customer catalog projection reconciliation after {operation} failed; authoritative SlateDB remains current: {error}"
+            );
+        }
+    }
+}
+
 impl CatalogRuntime {
     pub(crate) fn customer_catalog(&self) -> Option<zerofs::catalog::CustomerCatalog> {
         self.projection.as_ref().map(|projection| {
             zerofs::catalog::CustomerCatalog::new(self.volume_id, Arc::clone(projection))
         })
+    }
+
+    pub(crate) fn checkpoint_catalog(&self, branch_id: uuid::Uuid) -> CheckpointCatalogRuntime {
+        CheckpointCatalogRuntime {
+            lifecycle: self.lifecycle.clone(),
+            volume_id: self.volume_id,
+            projection: self.projection.clone(),
+            branch_id,
+        }
     }
 
     pub(crate) async fn prepare_writer_mount(

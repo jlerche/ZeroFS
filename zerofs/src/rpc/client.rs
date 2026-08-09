@@ -117,9 +117,10 @@ impl RpcClient {
             .collect()
     }
 
-    pub async fn delete_checkpoint(&self, name: &str) -> Result<()> {
+    pub async fn delete_checkpoint(&self, checkpoint_id: Uuid, name: &str) -> Result<()> {
         let request = proto::DeleteCheckpointRequest {
             name: name.to_string(),
+            checkpoint_id: checkpoint_id.to_string(),
         };
 
         self.client

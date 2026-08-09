@@ -78,6 +78,9 @@ message ListCheckpointsResponse {
 
 message DeleteCheckpointRequest {
     string name = 1;
+    // Stable UUID returned by create/info. Required when a catalog is active
+    // so retry cannot retarget a replacement that reused the same name.
+    string checkpoint_id = 2;
 }
 
 message DeleteCheckpointResponse {}

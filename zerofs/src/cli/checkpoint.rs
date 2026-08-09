@@ -40,11 +40,35 @@ pub async fn list_checkpoints(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete_checkpoint(config_path: &Path, name: &str) -> Result<()> {
+pub async fn delete_checkpoint(
+    config_path: &Path,
+    name: &str,
+    checkpoint_id: Option<uuid::Uuid>,
+) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    client.delete_checkpoint(name).await?;
+    let checkpoint_id = match checkpoint_id {
+        Some(checkpoint_id) => checkpoint_id,
+        None => {
+            client
+                .get_checkpoint_info(name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Checkpoint '{name}' not found"))?
+                .id
+        }
+    };
+    client
+        .delete_checkpoint(checkpoint_id, name)
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "checkpoint UUID {checkpoint_id}; retry with --id {checkpoint_id}"
+            ))
+        })?;
 
-    println!("✓ Checkpoint '{}' deleted successfully!", name);
+    println!(
+        "✓ Checkpoint '{}' ({}) deleted successfully!",
+        name, checkpoint_id
+    );
     Ok(())
 }
 

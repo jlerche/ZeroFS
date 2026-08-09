@@ -25,7 +25,6 @@ pub struct CheckpointInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Consumed by the authoritative checkpoint RPC workflow landing next.
 pub struct ExactCheckpointInfo {
     pub info: CheckpointInfo,
     pub source: zerofs::catalog::ImmutableCheckpoint,
@@ -67,10 +66,6 @@ impl CheckpointManager {
     /// bring-up to the filesystem's flush coordinator.
     pub fn set_pre_flush(&self, hook: PreCheckpointFlush) {
         let _ = self.pre_flush.set(hook);
-    }
-
-    pub async fn create_checkpoint(&self, name: &str) -> Result<CheckpointInfo> {
-        Ok(self.create_checkpoint_exact(name).await?.info)
     }
 
     pub async fn create_checkpoint_exact(&self, name: &str) -> Result<ExactCheckpointInfo> {

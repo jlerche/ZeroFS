@@ -238,6 +238,8 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    checkpoint_catalog: Option<Arc<dyn crate::rpc::server::CheckpointCatalogAuthority>>,
+    catalog_configured: bool,
     customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
@@ -247,8 +249,10 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(
+    let service = crate::rpc::server::AdminRpcServer::new_with_catalog(
         checkpoint_manager,
+        checkpoint_catalog,
+        catalog_configured,
         customer_catalog,
         fs,
         shutdown.clone(),
@@ -1404,9 +1408,24 @@ pub async fn run_server(
     }
     #[cfg(feature = "webui")]
     let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
+    let checkpoint_catalog = catalog_runtime.as_ref().and_then(|runtime| {
+        settings
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.mount.as_ref())
+            .map(|mount| {
+                Arc::new(runtime.checkpoint_catalog(mount.expected_branch_id))
+                    as Arc<dyn crate::rpc::server::CheckpointCatalogAuthority>
+            })
+    });
+    let catalog_configured = settings.catalog.is_some();
+    #[cfg(feature = "webui")]
+    let checkpoint_catalog_for_webui = checkpoint_catalog.clone();
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        checkpoint_catalog,
+        catalog_configured,
         catalog_runtime
             .as_ref()
             .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
@@ -1474,8 +1493,10 @@ pub async fn run_server(
 
     #[cfg(feature = "webui")]
     let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
-        let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
+        let webui_rpc_service = crate::rpc::server::AdminRpcServer::new_with_catalog(
             checkpoint_manager_for_webui,
+            checkpoint_catalog_for_webui,
+            catalog_configured,
             catalog_runtime
                 .as_ref()
                 .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
