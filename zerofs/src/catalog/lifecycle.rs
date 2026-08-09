@@ -177,6 +177,16 @@ impl BranchLifecycle {
         super::DeletionLifecycle::new(Arc::clone(&self.catalog))
     }
 
+    /// Run one policy-bounded metadata cleanup pass. Eligible tombstones become
+    /// permanent root-free UUID reservations; uncertainty and live dependencies
+    /// retain the full historical record.
+    pub async fn cleanup_tombstones(
+        &self,
+        policy: super::TombstoneCleanupPolicy,
+    ) -> Result<super::TombstoneCleanupReport, BranchLifecycleError> {
+        Ok(self.catalog.cleanup_tombstones(policy).await?)
+    }
+
     /// Authorize a data-plane mount against one stable branch incarnation.
     ///
     /// Name resolution and lease acquisition serialize in the catalog. An
@@ -1540,6 +1550,20 @@ mod tests {
             tombstones.records.as_slice(),
             [AdministrativeInspectionRecord::Tombstone(record)] if record.id == child_id
         ));
+        let cleanup = lifecycle
+            .cleanup_tombstones(crate::catalog::TombstoneCleanupPolicy {
+                retain_after: now + chrono::Duration::minutes(1),
+                scan_limit: 1,
+                compact_limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleanup.examined, 1);
+        assert_eq!(cleanup.compacted, 1);
+        assert_eq!(
+            lifecycle.inspect_branch(child_id).await.unwrap(),
+            BranchInspection::Retired { id: child_id }
+        );
         catalog.close().await.unwrap();
     }
 

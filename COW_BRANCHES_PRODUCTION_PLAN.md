@@ -305,7 +305,7 @@
 - [ ] Provide a reviewed offline legacy-to-pool migration that preserves the exact volume key, reserves every imported epoch, rejects duplicate physical segment IDs across sources, and publishes authoritative completion; alternatively rewrite every colliding segment ID and `FrameLoc`.
 - [x] Document exact semantics for logical deletion, active mounts, tombstones, name reuse, and asynchronous reclamation.
 - [x] Provide administrative inspection for branch UUIDs, durable roots, leases, tombstones, and incomplete operations.
-- [ ] Provide bounded repair or cleanup operations for states that cannot recover automatically.
+- [x] Provide bounded repair or cleanup operations for states that cannot recover automatically.
 
 ### Epic 6.2: Shadow GC
 

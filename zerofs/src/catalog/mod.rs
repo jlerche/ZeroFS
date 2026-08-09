@@ -530,11 +530,10 @@ pub struct TombstoneRecord {
     pub deleted_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
-pub(crate) const MAX_TOMBSTONE_CLEANUP_SCAN: usize = 4_096;
+pub const MAX_TOMBSTONE_CLEANUP_SCAN: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TombstoneCleanupPolicy {
+pub struct TombstoneCleanupPolicy {
     /// Tombstones deleted at or before this caller-selected retention cutoff
     /// may be compacted if every authoritative dependency is also clear.
     pub retain_after: DateTime<Utc>,
@@ -543,7 +542,7 @@ pub(crate) struct TombstoneCleanupPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct TombstoneCleanupReport {
+pub struct TombstoneCleanupReport {
     pub examined: u64,
     pub compacted: u64,
     pub retained_by_age: u64,
