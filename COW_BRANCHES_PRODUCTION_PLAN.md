@@ -4,8 +4,8 @@
 
 - [ ] Deliver production-ready copy-on-write branches with safe deletion of checkpoints and branches that have descendants.
 - [ ] Deliver production garbage collection that eventually reclaims unreferenced shared data without risking deletion of reachable data.
-- [ ] Replace the current overgrown implementation with a smaller architecture whose safety follows from explicit storage invariants.
-- [ ] Keep the current branch as a research record and source of tests, edge cases, and documentation rather than using it as the production foundation.
+- [x] Replace the current overgrown implementation with a smaller architecture whose safety follows from explicit storage invariants.
+- [x] Keep the research branch as a record and source of tests, edge cases, and documentation rather than using it as the production foundation.
 
 ## Architectural decisions
 
@@ -310,6 +310,10 @@
 
 ### Epic 6.2: Shadow GC
 
+These are deployment evidence gates, not unit-test substitutes. Record the exact
+deployment/backend identity, GC run UUIDs, catalog generations, configuration,
+metric snapshots, and comparison artifacts for every qualifying run.
+
 - [ ] Run global GC in mark-only reporting mode.
 - [ ] Compare proposed decisions with the existing collector and an offline ideal-reachability calculation.
 - [ ] Investigate every disagreement before enabling quarantine.
@@ -317,12 +321,20 @@
 
 ### Epic 6.3: Quarantine rollout
 
+Keep the independent physical-deletion control disabled throughout this stage.
+Evidence must span at least three complete cycles and the configured grace
+period, with the exact run UUIDs and mutation/fault timeline retained for audit.
+
 - [ ] Enable durable quarantine without physical deletion.
 - [ ] Observe multiple complete GC cycles and catalog mutations.
 - [ ] Confirm quarantined objects remain absent from every valid root across the grace period.
 - [ ] Exercise recovery from forced collector and object-store failures.
 
 ### Epic 6.4: Physical deletion rollout
+
+These rows require operator-approved deployment, storage recovery, and incident
+evidence. In-process tests, local object stores, and an enabled test-only control
+cannot complete them.
 
 - [ ] Enable deletion behind a feature flag with conservative age and grace thresholds.
 - [ ] Start with bounded canary deployments and small delete batches.
@@ -357,17 +369,26 @@
 - [x] Metrics, alerts, administrative inspection, rollout controls, and a deletion kill switch are available.
 - [x] The research branch remains reference material and is not merged wholesale.
 
+### Remaining qualification boundary
+
+The two unchecked objectives remain gated by the representative-backend
+checkpoint-open benchmark and the deployment evidence in Epics 6.2 through
+6.4. Local/in-memory qualification may prove safety invariants, bounded work,
+and absence of in-process serialization, but it must not be used to check those
+backend or rollout rows. Production readiness is complete only when every
+unchecked row above has its external evidence attached and reviewed.
+
 ## Review findings that motivated this plan
 
-- [ ] The committed research branch added approximately 20,237 lines across three commits.
-- [ ] The reviewed dirty tree expanded the overall tracked diff to approximately 36,823 additions and 12,346 deletions, plus untracked files.
-- [ ] The three central branch files contained approximately 13,683 lines, of which roughly 5,800 were tests.
-- [ ] The implementation expanded into a bespoke distributed transaction protocol rather than relying on a small set of durable storage invariants.
-- [ ] The GC design allowed up to 49,152 external views and 262,144 work units per pass.
-- [ ] The registry placed branch topology, mounts, and checkpoint fences in one global CAS document of up to 16 MiB.
-- [ ] The dirty tree did not pass `cargo check --workspace --all-targets` because of a `FuseTasks` field error.
-- [ ] The feature accumulated broad unrelated changes that made correctness, security, and performance review impractical.
-- [ ] The useful output of the research branch is its catalogue of races, tests, product semantics, and failure cases—not its implementation trajectory.
+- The committed research branch added approximately 20,237 lines across three commits.
+- The reviewed dirty tree expanded the overall tracked diff to approximately 36,823 additions and 12,346 deletions, plus untracked files.
+- The three central branch files contained approximately 13,683 lines, of which roughly 5,800 were tests.
+- The implementation expanded into a bespoke distributed transaction protocol rather than relying on a small set of durable storage invariants.
+- The GC design allowed up to 49,152 external views and 262,144 work units per pass.
+- The registry placed branch topology, mounts, and checkpoint fences in one global CAS document of up to 16 MiB.
+- The dirty tree did not pass `cargo check --workspace --all-targets` because of a `FuseTasks` field error.
+- The feature accumulated broad unrelated changes that made correctness, security, and performance review impractical.
+- The useful output of the research branch is its catalogue of races, tests, product semantics, and failure cases—not its implementation trajectory.
 
 ## Implementation record
 
