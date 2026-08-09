@@ -24,6 +24,9 @@ pub struct FaultControls {
     partition_writes: AtomicBool,
     /// Fail the next N `get` calls with a transient error, then resume.
     fail_next_gets: AtomicUsize,
+    /// Delay the next N `get` calls before forwarding them, then resume.
+    delay_next_gets: AtomicUsize,
+    delay_get_millis: AtomicU64,
     /// Fail the next N `put` calls before applying them, then resume.
     fail_next_puts: AtomicUsize,
     /// Apply the next N `put` calls, then return a transient response error.
@@ -57,6 +60,12 @@ impl FaultControls {
     }
     pub fn fail_gets(&self, n: usize) {
         self.fail_next_gets.store(n, Ordering::SeqCst);
+    }
+    /// Delay the next `n` gets before forwarding them to the inner store.
+    pub fn delay_gets(&self, n: usize, delay: std::time::Duration) {
+        let millis = u64::try_from(delay.as_millis()).expect("GET delay exceeds u64 milliseconds");
+        self.delay_get_millis.store(millis, Ordering::SeqCst);
+        self.delay_next_gets.store(n, Ordering::SeqCst);
     }
     pub fn fail_puts(&self, n: usize) {
         self.fail_next_puts.store(n, Ordering::SeqCst);
@@ -265,6 +274,12 @@ impl ObjectStore for FaultStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.ctl.gets.fetch_add(1, Ordering::SeqCst);
+        if take_one(&self.ctl.delay_next_gets) {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.ctl.delay_get_millis.load(Ordering::SeqCst),
+            ))
+            .await;
+        }
         if take_one(&self.ctl.fail_next_gets) {
             return Err(Self::transient("get"));
         }
@@ -389,6 +404,20 @@ mod tests {
             5
         );
         assert_eq!(ctl.get_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn delays_a_bounded_number_of_gets() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("k");
+        store.put(&path, b"hello".to_vec().into()).await.unwrap();
+
+        ctl.delay_gets(1, std::time::Duration::from_millis(40));
+        let started = std::time::Instant::now();
+        store.get(&path).await.unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(35));
+        assert_eq!(ctl.delay_next_gets.load(Ordering::SeqCst), 0);
+        store.get(&path).await.unwrap();
     }
 
     #[tokio::test]

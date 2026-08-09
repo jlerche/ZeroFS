@@ -293,7 +293,7 @@
 - [ ] Benchmark physical checkpoint-open mark latency at the root envelope on a representative backend.
 - [x] Verify memory use is bounded by run/shard size rather than total storage size.
 - [x] Verify external work obeys a derived, observable merge-amplification bound across roots, references, and inventory.
-- [ ] Verify foreground branch and mount latency remains acceptable during GC.
+- [x] Verify in-process foreground branch creation and mount admission remain below a 500 ms budget while GC physical-root I/O is in flight.
 - [x] Verify catalog mutations do not contend on one global multi-megabyte CAS object.
 - [x] Add metrics for phase duration, scanned references, inventory size, quarantined bytes, reclaimed bytes, aborted runs, retained-on-error objects, and backlog.
 - [x] Add alerts for repeated aborted runs, stalled phases, old quarantines, root-open failures, and catalog corruption.
@@ -831,3 +831,8 @@
 - Mark enumeration now feeds a shared production `MarkBuildState`; both physical checkpoint readers and the ignored qualification probe use the same bounded buffering, spill, binary-carry merge, authoritative finalization, checksum verification, and artifact-I/O implementation. The test-only source changes only how decoded `Segid` references enter that state.
 - `gc_mark_generation_supported_logical_envelope` emits one unique same-shard reference for every supported logical root: 4,096 live branches times 257 branch/checkpoint roots, or 1,052,672 roots/references/unique segments. On the qualification host, the optimized run completed in 609 ms, produced 129 initial runs with a 10-pass maximum, read 168,020,581 artifact bytes, and wrote 168,020,581 bytes through 384 ordinary puts plus 129 multipart uploads/705 parts. Observed writes remain below the exact 168,479,333-byte record-plus-framing bound.
 - Combined with the exact-cardinality root-capture probe, this closes the in-process logical root and mark-artifact benchmark row. The synthetic source intentionally bypasses physical SlateDB checkpoint opens, provider pagination, and network service time. A separate unchecked row retains representative-backend physical-open qualification rather than folding those costs into an in-memory claim.
+
+### 2026-08-09: concurrent GC foreground-admission benchmark
+
+- The ignored release-mode `gc_mark_does_not_serialize_branch_create_or_mount_admission` probe drives the production SlateDB catalog, physical checkpoint reader, checkpoint-based branch clone/publication, and name-resolved writer-lease mount path. A reusable test-store control delays the mark phase's next physical-root GET by two seconds; the probe waits until that GET is in flight, then requires both foreground operations to complete while the GC task is still blocked.
+- On the qualification host, branch creation completed in 302 ms and mount admission in 100 ms, each below the explicit 500 ms in-process budget. This proves that mark-time checkpoint I/O does not hold a lifecycle- or catalog-wide lock across those customer operations. It does not model shared provider bandwidth, network queuing, or representative-backend service time; those remain part of the separate unchecked physical checkpoint-open/backend qualification row.

@@ -1444,8 +1444,9 @@ impl From<GcInventoryError> for RootCaptureLifecycleError {
 mod tests {
     use super::*;
     use crate::catalog::{
-        BranchRecord, BranchState, CatalogMutation, CatalogSnapshot, CheckpointRecord, DurableRoot,
-        GcRootPin, LeaseAccessMode, LeaseRecord, LeaseSubjectKind, SlateDbCatalog,
+        BranchCreateRequest, BranchLifecycle, BranchMountRequest, BranchRecord, BranchState,
+        CatalogMutation, CatalogSnapshot, CheckpointRecord, DurableRoot, GcRootPin,
+        LeaseAccessMode, LeaseAcquireRequest, LeaseRecord, LeaseSubjectKind, SlateDbCatalog,
     };
     use crate::fault_store::FaultStore;
     use crate::fs::key_codec::KeyCodec;
@@ -1764,6 +1765,157 @@ mod tests {
                 "inventory_large": render(&inventory_large),
             })
         );
+    }
+
+    /// Qualifies that a mark phase doing physical checkpoint I/O does not hold
+    /// a lifecycle/catalog-wide lock across customer branch creation or mount
+    /// admission. The delayed root GET makes overlap deterministic; the budget
+    /// intentionally covers only in-process admission on the in-memory host,
+    /// not provider bandwidth or representative-backend service time.
+    #[tokio::test]
+    #[ignore = "release-mode concurrent GC foreground-latency benchmark"]
+    async fn gc_mark_does_not_serialize_branch_create_or_mount_admission() {
+        const FOREGROUND_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+        const GC_ROOT_GET_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let (delayed, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        let root_store: Arc<dyn ObjectStore> = delayed;
+        let data_path = Path::from("gc-foreground/data");
+        let source_db = Db::builder(data_path.clone(), Arc::clone(&root_store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        source_db
+            .put(
+                &KeyCodec::new().extent_key(1, 0),
+                &FrameLoc {
+                    segid: Segid::new(7, 1),
+                    frame_index: 0,
+                    byte_offset: 0,
+                    byte_len: 1,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        source_db.flush().await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let source = ImmutableCheckpoint {
+            database_path: data_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&root_store),
+            Path::from("gc-foreground/branches"),
+        );
+        let source_branch_id = Uuid::new_v4();
+        let source_root = roots
+            .create_from_checkpoint(Uuid::new_v4(), source_branch_id, &source)
+            .await
+            .unwrap();
+        let catalog_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-foreground/catalog"), catalog_store)
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: source_branch_id,
+                revision: 1,
+                name: "source".to_string(),
+                state: BranchState::Ready,
+                root: Some(source_root),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(CheckpointRecord {
+                id: source.checkpoint_id,
+                revision: 1,
+                branch_id: source_branch_id,
+                name: "fork-point".to_string(),
+                root: source.durable_root(),
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+
+        let gc = RootCaptureLifecycle::new(catalog.clone(), roots.clone());
+        let run = gc.begin(Uuid::new_v4()).await.unwrap();
+        controls.reset_counts();
+        controls.delay_gets(1, GC_ROOT_GET_DELAY);
+        let mark = tokio::spawn(async move { gc.mark(run.id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while controls.get_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("GC mark did not enter physical root I/O");
+
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let destination_id = Uuid::new_v4();
+        let create_started = Instant::now();
+        let created = lifecycle
+            .create_from_checkpoint(BranchCreateRequest {
+                operation_id: Uuid::new_v4(),
+                destination_id,
+                destination_name: "foreground".to_string(),
+                source,
+                created_at: catalog_timestamp(Utc::now()),
+            })
+            .await
+            .unwrap();
+        let create_elapsed = create_started.elapsed();
+        assert!(create_elapsed < FOREGROUND_BUDGET);
+        assert!(!mark.is_finished(), "GC must still overlap branch creation");
+
+        let mount_started = Instant::now();
+        let grant = lifecycle
+            .mount_branch_by_name(BranchMountRequest {
+                branch_name: created.name,
+                lease: LeaseAcquireRequest {
+                    lease_id: Uuid::new_v4(),
+                    renewal_token: Uuid::new_v4(),
+                    subject_id: destination_id,
+                    access_mode: LeaseAccessMode::Write,
+                    duration: Duration::minutes(2),
+                },
+            })
+            .await
+            .unwrap();
+        let mount_elapsed = mount_started.elapsed();
+        assert!(mount_elapsed < FOREGROUND_BUDGET);
+        assert_eq!(grant.lease.lease.subject_id, destination_id);
+        assert!(!mark.is_finished(), "GC must still overlap mount admission");
+
+        let marked = mark.await.unwrap().unwrap();
+        assert_eq!(marked.phase, GcRunPhase::Marking);
+        println!(
+            "{}",
+            serde_json::json!({
+                "foreground_budget_ms": FOREGROUND_BUDGET.as_millis(),
+                "injected_gc_root_get_delay_ms": GC_ROOT_GET_DELAY.as_millis(),
+                "branch_create_ms": create_elapsed.as_millis(),
+                "mount_admission_ms": mount_elapsed.as_millis(),
+                "gc_root_store_gets": controls.get_count(),
+            })
+        );
+        catalog.close().await.unwrap();
     }
 
     fn assert_gc_write_bounds(probe: &GcPipelineProbe) {
