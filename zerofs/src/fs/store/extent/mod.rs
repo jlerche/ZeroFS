@@ -22,7 +22,8 @@ mod write;
 pub use reclaim::{ChainOutcome, PassOutcome, PassStatus};
 #[allow(unused_imports)] // The standalone binary does not compile the catalog consumer.
 pub(crate) use reclaim::{
-    PersistedPrivateGcArtifact, PrivateGcCandidateOutcome, QUIESCENT_AFTER_DEFAULT,
+    DecodedPrivateGcArtifact, PersistedPrivateGcArtifact, PreparedPrivateGcBatch,
+    PrivateGcCandidateOutcome, QUIESCENT_AFTER_DEFAULT,
 };
 
 use crate::db::{Db, ExtentRefGuard, Transaction};
@@ -81,6 +82,7 @@ pub(crate) struct PublisherDrainReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrivatePublisherIdentity {
     pub(crate) publisher_id: Uuid,
+    pub(crate) data_writer_epoch: u64,
     pub(crate) branch_id: Uuid,
     pub(crate) database_identity: String,
 }
@@ -282,6 +284,7 @@ impl ExtentStore {
             || database_identity.is_empty()
             || database_identity.len() > MAX_PRIVATE_DATABASE_IDENTITY_BYTES
             || database_identity.chars().any(char::is_control)
+            || self.db.database_identity() != Some(database_identity.as_str())
         {
             return Err(FsError::InvalidArgument);
         }
@@ -299,6 +302,7 @@ impl ExtentStore {
         let (branch_id, database_identity) = self.private_owner.get()?.clone();
         Some(PrivatePublisherIdentity {
             publisher_id: self.publisher_id(),
+            data_writer_epoch: self.db.writer_epoch().filter(|epoch| *epoch != 0)?,
             branch_id,
             database_identity,
         })
@@ -307,6 +311,14 @@ impl ExtentStore {
     #[allow(dead_code)] // The standalone binary omits the catalog coordinator.
     pub(crate) fn check_private_gc_serving_authority(&self) -> Result<(), FsError> {
         self.db.check_serving_authority()
+    }
+
+    /// Segment epoch currently used for new allocations. Callers that need a
+    /// stable value must hold the private-GC publication barrier.
+    #[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+    pub(crate) fn private_writer_segment_epoch(&self) -> Option<u64> {
+        self.private_owner.get()?;
+        Some(self.segment_store().epoch())
     }
 
     /// Rotate allocation to a previously reserved epoch while holding the

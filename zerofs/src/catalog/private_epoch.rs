@@ -4,8 +4,8 @@ use super::{
 };
 use crate::fs::store::ExtentStore;
 use crate::fs::store::extent::{
-    PersistedPrivateGcArtifact, PrivateGcCandidateOutcome, PrivatePublisherIdentity,
-    PublisherDrainReceipt,
+    DecodedPrivateGcArtifact, PersistedPrivateGcArtifact, PrivateGcCandidateOutcome,
+    PrivatePublisherIdentity, PublisherDrainReceipt,
 };
 use crate::segment_store::{SegmentPoolAuthority, SegmentStore, SegmentStoreError};
 use chrono::{DateTime, Utc};
@@ -90,6 +90,7 @@ impl PrivateEpochLifecycle {
         })?;
         if extent_store.private_publisher_identity().as_ref() != Some(publisher)
             || publisher.publisher_id != artifact.publisher_id()
+            || publisher.data_writer_epoch != artifact.data_writer_epoch()
             || publisher.branch_id != artifact.branch_id()
             || publisher.database_identity != artifact.database_identity()
         {
@@ -107,6 +108,7 @@ impl PrivateEpochLifecycle {
         let batch = decoded.batch();
         if decoded.guard_id() != artifact.guard_id()
             || batch.publisher_id != artifact.publisher_id()
+            || batch.data_writer_epoch != artifact.data_writer_epoch()
             || batch.branch_id != artifact.branch_id()
             || batch.database_identity != artifact.database_identity()
             || batch.epoch != artifact.epoch()
@@ -118,6 +120,57 @@ impl PrivateEpochLifecycle {
             )
             .into());
         }
+
+        self.run_decoded_gc_guard(extent_store, decoded).await
+    }
+
+    /// Resume a durable guard only from a strictly newer SlateDB writer
+    /// incarnation for the same exact branch database. The newer manifest
+    /// epoch is the metadata fence: the old process can no longer publish a
+    /// FrameLoc even if a delayed immutable object PUT eventually completes.
+    #[allow(dead_code)] // Production scheduling remains disabled pending review.
+    pub(crate) async fn run_recovered_gc_guard(
+        &self,
+        extent_store: &ExtentStore,
+        guard_id: Uuid,
+    ) -> Result<LocalGcProgressRecord, PrivateEpochLifecycleError> {
+        let publisher = self.publisher.as_ref().ok_or_else(|| {
+            CatalogError::OperationConflict(
+                "private GC recovery publisher is not bound".to_string(),
+            )
+        })?;
+        if extent_store.private_publisher_identity().as_ref() != Some(publisher) {
+            return Err(CatalogError::OperationConflict(
+                "private GC recovery publisher identity".to_string(),
+            )
+            .into());
+        }
+        let decoded = extent_store
+            .load_private_gc_artifact(guard_id)
+            .await
+            .map_err(|_| {
+                SegmentStoreError::ObjectStore("private GC artifact decode".to_string())
+            })?;
+        let batch = decoded.batch();
+        if publisher.branch_id != batch.branch_id
+            || publisher.database_identity != batch.database_identity
+            || publisher.data_writer_epoch <= batch.data_writer_epoch
+        {
+            return Err(CatalogError::OperationConflict(format!(
+                "private GC guard {guard_id} former writer is not durably fenced"
+            ))
+            .into());
+        }
+        self.run_decoded_gc_guard(extent_store, decoded).await
+    }
+
+    async fn run_decoded_gc_guard(
+        &self,
+        extent_store: &ExtentStore,
+        decoded: DecodedPrivateGcArtifact,
+    ) -> Result<LocalGcProgressRecord, PrivateEpochLifecycleError> {
+        let guard_id = decoded.guard_id();
+        let batch = decoded.batch();
 
         loop {
             extent_store
@@ -132,22 +185,19 @@ impl PrivateEpochLifecycle {
                     CatalogError::OperationConflict("private GC serving authority".to_string())
                 })?;
             let snapshot = self.catalog.snapshot().await?;
-            if let Some(progress) = snapshot.local_gc_progress.get(&artifact.guard_id())
+            if let Some(progress) = snapshot.local_gc_progress.get(&guard_id)
                 && progress.completed_at.is_some()
             {
-                validate_progress_artifact(progress, artifact)?;
+                validate_progress_artifact(progress, guard_id, batch)?;
                 return Ok(progress.clone());
             }
-            let guard = snapshot
-                .local_gc_guards
-                .get(&artifact.guard_id())
-                .ok_or_else(|| {
-                    CatalogError::OperationConflict(format!(
-                        "private GC guard {} is not active",
-                        artifact.guard_id()
-                    ))
-                })?;
-            validate_guard_artifact(guard, artifact)?;
+            let guard = snapshot.local_gc_guards.get(&guard_id).ok_or_else(|| {
+                CatalogError::OperationConflict(format!(
+                    "private GC guard {} is not active",
+                    guard_id
+                ))
+            })?;
+            validate_guard_artifact(guard, guard_id, batch)?;
             let proof = SegmentStore::authenticate_branch_epoch(
                 Arc::clone(&self.segment_pool),
                 &self.authority,
@@ -170,9 +220,38 @@ impl PrivateEpochLifecycle {
                 ))
                 .into());
             }
+            let writer_epoch = extent_store.private_writer_segment_epoch().ok_or_else(|| {
+                CatalogError::OperationConflict("private GC writer epoch is not bound".to_string())
+            })?;
+            if writer_epoch == guard.epoch {
+                return Err(CatalogError::OperationConflict(format!(
+                    "private GC writer epoch {writer_epoch} is the guarded sealed epoch"
+                ))
+                .into());
+            }
+            let writer_proof = SegmentStore::authenticate_branch_epoch(
+                Arc::clone(&self.segment_pool),
+                &self.authority,
+                writer_epoch,
+            )
+            .await?;
+            let writer = snapshot.private_epochs.get(&writer_epoch).ok_or_else(|| {
+                CatalogError::NotFound(format!("private writer epoch {writer_epoch}"))
+            })?;
+            if !record_matches_proof(writer, &writer_proof)
+                || writer.state != PrivateEpochState::Open
+                || writer.branch_id != guard.branch_id
+                || writer.database_identity != batch.database_identity
+                || writer.pool_id != epoch.pool_id
+            {
+                return Err(CatalogError::OperationConflict(format!(
+                    "private GC writer epoch {writer_epoch} is not an authenticated open successor"
+                ))
+                .into());
+            }
             let current = match snapshot.local_gc_progress.get(&guard.id) {
                 Some(progress) => {
-                    validate_progress_artifact(progress, artifact)?;
+                    validate_progress_artifact(progress, guard_id, batch)?;
                     progress.clone()
                 }
                 None => {
@@ -262,6 +341,7 @@ impl PrivateEpochLifecycle {
     ) -> Result<super::LocalGcGuardRecord, PrivateEpochLifecycleError> {
         if self.publisher.as_ref().is_none_or(|publisher| {
             publisher.publisher_id != artifact.publisher_id()
+                || publisher.data_writer_epoch != artifact.data_writer_epoch()
                 || publisher.branch_id != artifact.branch_id()
                 || publisher.database_identity != artifact.database_identity()
         }) || request.id != artifact.guard_id()
@@ -509,13 +589,14 @@ fn record_matches_proof(
 
 fn validate_guard_artifact(
     guard: &LocalGcGuardRecord,
-    artifact: &PersistedPrivateGcArtifact,
+    guard_id: Uuid,
+    batch: &crate::fs::store::extent::PreparedPrivateGcBatch,
 ) -> Result<(), CatalogError> {
-    if guard.id != artifact.guard_id()
-        || guard.branch_id != artifact.branch_id()
-        || guard.epoch != artifact.epoch()
-        || guard.candidate_count != artifact.candidate_count()
-        || guard.candidate_digest != artifact.candidate_digest()
+    if guard.id != guard_id
+        || guard.branch_id != batch.branch_id
+        || guard.epoch != batch.epoch
+        || guard.candidate_count != batch.candidates.len() as u32
+        || guard.candidate_digest != batch.candidate_digest
     {
         return Err(CatalogError::OperationConflict(format!(
             "private GC guard {} artifact identity",
@@ -527,13 +608,14 @@ fn validate_guard_artifact(
 
 fn validate_progress_artifact(
     progress: &LocalGcProgressRecord,
-    artifact: &PersistedPrivateGcArtifact,
+    guard_id: Uuid,
+    batch: &crate::fs::store::extent::PreparedPrivateGcBatch,
 ) -> Result<(), CatalogError> {
-    if progress.id != artifact.guard_id()
-        || progress.branch_id != artifact.branch_id()
-        || progress.epoch != artifact.epoch()
-        || progress.candidate_count != artifact.candidate_count()
-        || progress.candidate_digest != artifact.candidate_digest()
+    if progress.id != guard_id
+        || progress.branch_id != batch.branch_id
+        || progress.epoch != batch.epoch
+        || progress.candidate_count != batch.candidates.len() as u32
+        || progress.candidate_digest != batch.candidate_digest
     {
         return Err(CatalogError::OperationConflict(format!(
             "private GC progress {} artifact identity",
@@ -893,12 +975,16 @@ mod tests {
 
         let metadata_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let raw = Arc::new(
-            slatedb::DbBuilder::new(Path::from("private-seal/data"), metadata_store)
+            slatedb::DbBuilder::new(Path::from("private-seal/data"), Arc::clone(&metadata_store))
                 .build()
                 .await
                 .unwrap(),
         );
-        let db = Arc::new(Db::new(raw, None));
+        let db = Arc::new(Db::new_with_database_identity(
+            raw,
+            None,
+            database_identity.clone(),
+        ));
         let extent = ExtentStore::new(
             Arc::clone(&db),
             Arc::new(KeyCodec::new()),
@@ -940,6 +1026,40 @@ mod tests {
             .unwrap();
         extent.apply_tail_update(1, replacement_tail);
         extent.seal_open().await.unwrap();
+        let mut second_first_txn = db.new_transaction().unwrap();
+        let second_first_tail = extent
+            .write(
+                &mut second_first_txn,
+                2,
+                0,
+                &Bytes::from_static(b"second-first"),
+                0,
+            )
+            .await
+            .unwrap();
+        extent
+            .commit_test_transaction(second_first_txn)
+            .await
+            .unwrap();
+        extent.apply_tail_update(2, second_first_tail);
+        extent.seal_open().await.unwrap();
+        let mut second_replacement_txn = db.new_transaction().unwrap();
+        let second_replacement_tail = extent
+            .write(
+                &mut second_replacement_txn,
+                2,
+                0,
+                &Bytes::from_static(b"second-replacement"),
+                12,
+            )
+            .await
+            .unwrap();
+        extent
+            .commit_test_transaction(second_replacement_txn)
+            .await
+            .unwrap();
+        extent.apply_tail_update(2, second_replacement_tail);
+        extent.seal_open().await.unwrap();
         let request = PrivateEpochSealRequest {
             branch_id: branch.id,
             epoch: old_epoch,
@@ -967,6 +1087,10 @@ mod tests {
             Arc::new(KeyedLockManager::new()),
             1024 * 1024,
         );
+        assert!(matches!(
+            dummy.bind_private_owner(branch.id, database_identity.clone()),
+            Err(crate::fs::errors::FsError::InvalidArgument)
+        ));
         let wrong_receipt = dummy.rotate_writer_epoch(next_epoch).await.unwrap();
         assert!(matches!(
             lifecycle
@@ -1000,10 +1124,7 @@ mod tests {
                 .state,
             PrivateEpochState::Open
         );
-        let batch = extent
-            .prepare_private_gc_batch(old_epoch, crate::fs::MAX_LOCAL_GC_CANDIDATES)
-            .await
-            .unwrap();
+        let batch = extent.prepare_private_gc_batch(old_epoch, 1).await.unwrap();
         assert_eq!(batch.candidates.len(), 1);
         let guard_id = Uuid::new_v4();
         let artifact = extent
@@ -1023,7 +1144,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        let cross_db = Arc::new(Db::new(cross_raw, None));
+        let cross_db = Arc::new(Db::new_with_database_identity(
+            cross_raw,
+            None,
+            database_identity.clone(),
+        ));
         let cross_extent = ExtentStore::new(
             Arc::clone(&cross_db),
             Arc::new(KeyCodec::new()),
@@ -1146,6 +1271,117 @@ mod tests {
                 .unwrap(),
             completed_progress
         );
+
+        let recovery_batch = extent.prepare_private_gc_batch(old_epoch, 1).await.unwrap();
+        assert_eq!(recovery_batch.candidates.len(), 1);
+        assert_ne!(
+            recovery_batch.candidates[0].segid,
+            batch.candidates[0].segid
+        );
+        let recovery_guard_id = Uuid::new_v4();
+        let recovery_artifact = extent
+            .persist_private_gc_batch(recovery_guard_id, &recovery_batch)
+            .await
+            .unwrap();
+        let recovery_request = PrivateGcGuardRequest {
+            id: recovery_guard_id,
+            branch_id: branch.id,
+            epoch: old_epoch,
+            expected_epoch_revision: sealed.revision,
+            created_at: now + chrono::Duration::microseconds(5),
+        };
+        lifecycle
+            .acquire_gc_guard(recovery_request, &recovery_artifact)
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .run_recovered_gc_guard(&extent, recovery_guard_id)
+                .await,
+            Err(PrivateEpochLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
+        db.close().await.unwrap();
+        let recovered_raw = Arc::new(
+            slatedb::DbBuilder::new(Path::from("private-seal/data"), Arc::clone(&metadata_store))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let recovered_db = Arc::new(Db::new_with_database_identity(
+            recovered_raw,
+            None,
+            database_identity.clone(),
+        ));
+        let sealed_writer_extent = ExtentStore::new(
+            Arc::clone(&recovered_db),
+            Arc::new(KeyCodec::new()),
+            Arc::new(SegmentStore::new(
+                Arc::clone(&pool),
+                FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+                old_epoch,
+                None,
+            )),
+            Arc::new(KeyedLockManager::new()),
+            1024 * 1024,
+        );
+        sealed_writer_extent
+            .bind_private_owner(branch.id, database_identity.clone())
+            .unwrap();
+        let sealed_writer_lifecycle =
+            PrivateEpochLifecycle::new(catalog.clone(), Arc::clone(&pool), authority.clone())
+                .with_publisher(&sealed_writer_extent);
+        assert!(matches!(
+            sealed_writer_lifecycle
+                .run_recovered_gc_guard(&sealed_writer_extent, recovery_guard_id)
+                .await,
+            Err(PrivateEpochLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
+        assert!(
+            pool.get(&Path::from(recovery_batch.candidates[0].segid.object_key()))
+                .await
+                .is_ok(),
+            "a recovered allocator using the guarded epoch must retain the candidate"
+        );
+        let recovered_extent = ExtentStore::new(
+            Arc::clone(&recovered_db),
+            Arc::new(KeyCodec::new()),
+            Arc::new(SegmentStore::new(
+                Arc::clone(&pool),
+                FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+                next_epoch,
+                None,
+            )),
+            Arc::new(KeyedLockManager::new()),
+            1024 * 1024,
+        );
+        recovered_extent
+            .bind_private_owner(branch.id, database_identity.clone())
+            .unwrap();
+        let recovered_lifecycle =
+            PrivateEpochLifecycle::new(catalog.clone(), Arc::clone(&pool), authority.clone())
+                .with_publisher(&recovered_extent);
+        assert!(
+            recovered_extent
+                .private_publisher_identity()
+                .unwrap()
+                .data_writer_epoch
+                > recovery_artifact.data_writer_epoch()
+        );
+        let recovered_progress = recovered_lifecycle
+            .run_recovered_gc_guard(&recovered_extent, recovery_guard_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered_progress.deleted_objects, 1);
+        assert!(recovered_progress.completed_at.is_some());
+        assert!(
+            pool.get(&Path::from(recovery_batch.candidates[0].segid.object_key()))
+                .await
+                .is_err()
+        );
         let delete_at = catalog_timestamp(now + chrono::Duration::microseconds(6));
         catalog
             .apply(CatalogMutation::StartBranchDelete {
@@ -1173,7 +1409,7 @@ mod tests {
         assert_eq!(exposed.sealed_at, sealed.sealed_at);
         cross_db.close().await.unwrap();
         dummy_db.close().await.unwrap();
-        db.close().await.unwrap();
+        recovered_db.close().await.unwrap();
         catalog.close().await.unwrap();
     }
 }

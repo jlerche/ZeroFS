@@ -483,8 +483,9 @@ The prepared descriptors can be published under an immutable
 `private-gc-artifacts/<guard UUID>.bin` key. Before preparation, the live extent
 store is permanently bound to one exact branch UUID and database identity. The
 canonical bounded encoding binds that owner capability together with the guard
-UUID, exact live publisher identity, epoch, candidate digest, and every object
-descriptor. Conditional create plus byte-for-byte reconciliation makes an exact
+UUID, exact live publisher identity, monotonic SlateDB data-writer epoch, sealed
+segment epoch, candidate digest, and every object descriptor. Conditional
+create plus byte-for-byte reconciliation makes an exact
 lost-response retry safe and rejects UUID reuse with different bytes. Only an
 opaque receipt from that successful publication can enter guard acquisition.
 The lifecycle requires the receipt's publisher, branch UUID, and database
@@ -501,8 +502,7 @@ the recomputed candidate digest, and the exact original canonical bytes. Wrong
 guard UUIDs, truncation, trailing bytes, malformed timestamps, duplicate or
 reordered candidates, and noncanonical encodings fail closed. This read-only
 primitive grants no deletion authority. Physical deletion remains disabled
-pending guard-bound recovery validation, former-writer fencing/quiescence, and
-the barrier-through-delete worker.
+from normal scheduling pending full production mount/collector wiring.
 
 The live-process worker is narrower than crash recovery. It accepts only the
 opaque artifact capability issued to the same process-unique publisher that is
@@ -513,9 +513,28 @@ both current and durable forward maps. It then streams and matches the strong
 object identity, deletes, confirms absence, and publishes the next durable
 cursor while retaining that same barrier. An already absent object advances as
 such; any ambiguity retains it. Completion atomically retires the guard, and an
-exact replay returns the completed audit. No restart may use this live-only
-capability: after process loss the non-expiring guard stays in place until a
-separate durable former-writer and object-request quiescence proof is available.
+exact replay returns the completed audit.
+
+Restart recovery uses artifact format v2's data-writer epoch. Private ownership
+can be bound only to a `Db` constructed by the authenticated mount boundary
+with the same immutable database identity; an ownerless or merely relabeled
+database is ineligible. A recovered worker must open that exact database at a
+strictly greater nonzero SlateDB manifest writer epoch, which durably fences all
+metadata publication by the artifact's former writer. It then uses the same
+guard/marker/epoch/forward-map/identity/barrier worker as the live path. The
+worker also proves under that barrier that its current segment allocator uses a
+different storage-authenticated authoritative `open` epoch for the same branch,
+database, and pool; the guarded sealed epoch can never be reused for allocation.
+The confirmed dead counter is removed before progress publication so an absent
+object cannot monopolize later bounded batches.
+
+A delayed former object PUT does not defeat this fence: all segment PUTs are
+immutable conditional creates and cannot publish a `FrameLoc`; the newer
+SlateDB writer epoch rejects the only operation that could restore reachability.
+Such a PUT can at worst recreate the identical bytes as an unreferenced orphan,
+which remains eligible for the global two-observation collector. If the exact
+database identity or strictly newer writer epoch cannot be proven, recovery
+retains the guard and every candidate.
 
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
@@ -553,11 +572,11 @@ window even if a future publisher violates the sealed-epoch optimization.
 Releasing or losing either authority stops deletion.
 
 A crash leaves the durable batch guard in place. Recovery may resume the exact
-operation only after fencing the former database writer and proving all of its
-local publisher and object-store requests quiescent; it then reconciles each
+operation only after fencing the former database writer and proving that any
+remaining request cannot restore metadata reachability; it then reconciles each
 candidate by exact identity or confirmed absence. The guard cannot be expired,
 stolen, administratively cleared, or converted to `exposed` merely because it
-is old. If quiescence or ownership cannot be proven, root publication remains
+is old. If fencing or ownership cannot be proven, root publication remains
 excluded and the objects are retained for repair. Global two-observation GC
 remains the sole collector for all other segments. This deliberately rejects
 the research design's structural "owner UUID" rule as a deletion proof:

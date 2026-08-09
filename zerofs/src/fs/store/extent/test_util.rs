@@ -37,7 +37,11 @@ pub(super) async fn make_with_compression(
             .await
             .unwrap(),
     );
-    let db = Arc::new(Db::new(slatedb, None));
+    let db = Arc::new(Db::new_with_database_identity(
+        slatedb,
+        None,
+        "test-database".to_string(),
+    ));
     let store = make_store(object_store.clone(), db.clone(), compression, 7);
     (store, db, object_store)
 }

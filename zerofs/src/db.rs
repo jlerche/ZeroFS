@@ -334,6 +334,9 @@ impl Default for Transaction {
 /// simply passes through operations without additional encryption/decryption.
 pub struct Db {
     inner: SlateDbHandle,
+    /// Immutable branch database path/identity supplied by the authenticated
+    /// mount boundary. Ownerless general-purpose opens cannot run private GC.
+    database_identity: Option<String>,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// HA leader lease. `Some` only under replication; reads/writes are refused
     /// while invalid so a deposed node never serves stale data. `None` (ungated)
@@ -383,6 +386,7 @@ impl Db {
         let status = Some(db.subscribe());
         Self {
             inner: SlateDbHandle::ReadWrite(db),
+            database_identity: None,
             metrics_recorder,
             lease: None,
             status,
@@ -391,9 +395,21 @@ impl Db {
         }
     }
 
+    #[allow(dead_code)] // Used once authenticated branch mounting replaces the ownerless path.
+    pub(crate) fn new_with_database_identity(
+        db: Arc<slatedb::Db>,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        database_identity: String,
+    ) -> Self {
+        let mut wrapped = Self::new(db, metrics_recorder);
+        wrapped.database_identity = Some(database_identity);
+        wrapped
+    }
+
     pub fn new_read_only(db_reader: ArcSwap<DbReader>) -> Self {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
+            database_identity: None,
             metrics_recorder: None,
             lease: None,
             status: None,
@@ -854,6 +870,17 @@ impl Db {
             SlateDbHandle::ReadWrite(db) => Some(db.subscribe()),
             SlateDbHandle::ReadOnly(_) => None,
         }
+    }
+
+    /// Monotonic SlateDB writer incarnation durably advanced on every writable
+    /// open. A later incarnation fences all metadata writes from an earlier one.
+    pub(crate) fn writer_epoch(&self) -> Option<u64> {
+        self.subscribe_status()
+            .map(|status| status.borrow().current_manifest.writer_epoch())
+    }
+
+    pub(crate) fn database_identity(&self) -> Option<&str> {
+        self.database_identity.as_deref()
     }
 
     /// Keep the metadata block cache warm for the life of the process.

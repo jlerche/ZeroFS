@@ -67,8 +67,8 @@ const MAX_BATCHES_PER_PASS: usize = 32;
 /// (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 
-const PRIVATE_GC_ARTIFACT_MAGIC: &[u8; 8] = b"ZFPGCA01";
-const PRIVATE_GC_ARTIFACT_FIXED_BYTES: usize = 8 + 16 + 16 + 16 + 4 + 8 + 4 + 64;
+const PRIVATE_GC_ARTIFACT_MAGIC: &[u8; 8] = b"ZFPGCA02";
+const PRIVATE_GC_ARTIFACT_FIXED_BYTES: usize = 8 + 16 + 16 + 8 + 16 + 4 + 8 + 4 + 64;
 const PRIVATE_GC_CANDIDATE_MAX_BYTES: usize = 8 + 8 + 8 + 1 + 8 + 8 + 4 + 32;
 const PRIVATE_GC_DATABASE_IDENTITY_MAX_BYTES: usize = 4 * 1024;
 const PRIVATE_GC_ARTIFACT_MAX_BYTES: usize = PRIVATE_GC_ARTIFACT_FIXED_BYTES
@@ -107,6 +107,7 @@ pub(crate) struct PrivateGcCandidate {
 #[allow(dead_code)] // Consumed once the private-epoch catalog coordinator is wired.
 pub(crate) struct PreparedPrivateGcBatch {
     pub(crate) publisher_id: uuid::Uuid,
+    pub(crate) data_writer_epoch: u64,
     pub(crate) branch_id: uuid::Uuid,
     pub(crate) database_identity: String,
     pub(crate) epoch: u64,
@@ -119,6 +120,7 @@ pub(crate) struct PreparedPrivateGcBatch {
 pub(crate) struct PersistedPrivateGcArtifact {
     guard_id: uuid::Uuid,
     publisher_id: uuid::Uuid,
+    data_writer_epoch: u64,
     branch_id: uuid::Uuid,
     database_identity: String,
     epoch: u64,
@@ -135,6 +137,10 @@ impl PersistedPrivateGcArtifact {
 
     pub(crate) fn publisher_id(&self) -> uuid::Uuid {
         self.publisher_id
+    }
+
+    pub(crate) fn data_writer_epoch(&self) -> u64 {
+        self.data_writer_epoch
     }
 
     pub(crate) fn branch_id(&self) -> uuid::Uuid {
@@ -183,13 +189,49 @@ pub(crate) struct PrivateGcBarrier {
 
 #[allow(dead_code)] // The standalone binary omits the catalog coordinator.
 impl PrivateGcBarrier {
+    async fn drop_dead_counter(&self, candidate: &PrivateGcCandidate) -> Result<(), FsError> {
+        let key = self
+            .store
+            .key_codec
+            .segcount_key(candidate.segid.epoch, candidate.segid.counter);
+        let Some(value) = self
+            .store
+            .db
+            .get_bytes(&key)
+            .await
+            .map_err(|_| FsError::IoError)?
+        else {
+            return Ok(());
+        };
+        let (live, total) = KeyCodec::decode_segcount(&value).ok_or(FsError::IoError)?;
+        if live != 0 || total != candidate.appended_bytes {
+            return Err(FsError::IoError);
+        }
+        let appended_delta =
+            i64::try_from(candidate.appended_bytes).map_err(|_| FsError::IoError)?;
+        let mut txn = self.store.db.new_transaction()?;
+        txn.delete_bytes(&key);
+        self.store.commit_via_coordinator(txn).await?;
+        // The authoritative progress update follows this method. Make the
+        // local tombstone durable first so a restart cannot resurrect this
+        // low-sorted counter after the catalog has advanced past it.
+        self.store.db.flush().await.map_err(|_| FsError::IoError)?;
+        self.store
+            .segment_gc_stats
+            .apply_footprint_delta(-1, -appended_delta, 0);
+        Ok(())
+    }
+
     pub(crate) async fn delete_candidate(
         &self,
         candidate: &PrivateGcCandidate,
     ) -> Result<PrivateGcCandidateOutcome, FsError> {
         match self.store.verify_segment_reclaimable(candidate.segid).await {
             SegmentDeadVerdict::Keep => Err(FsError::IoError),
-            SegmentDeadVerdict::ObjectAbsent => Ok(PrivateGcCandidateOutcome::AlreadyAbsent),
+            SegmentDeadVerdict::ObjectAbsent => {
+                self.drop_dead_counter(candidate).await?;
+                Ok(PrivateGcCandidateOutcome::AlreadyAbsent)
+            }
             SegmentDeadVerdict::Reclaim => {
                 let Some(expected_identity) = candidate.object_identity.as_ref() else {
                     return Err(FsError::IoError);
@@ -214,9 +256,12 @@ impl PrivateGcBarrier {
                     .object_identity(candidate.segid)
                     .await
                 {
-                    Err(SegmentStoreError::NotFound) => Ok(PrivateGcCandidateOutcome::Deleted {
-                        bytes: expected_identity.size,
-                    }),
+                    Err(SegmentStoreError::NotFound) => {
+                        self.drop_dead_counter(candidate).await?;
+                        Ok(PrivateGcCandidateOutcome::Deleted {
+                            bytes: expected_identity.size,
+                        })
+                    }
                     Ok(_) | Err(_) => Err(FsError::IoError),
                 }
             }
@@ -266,6 +311,7 @@ fn encode_private_gc_artifact(guard_id: uuid::Uuid, batch: &PreparedPrivateGcBat
     encoded.extend_from_slice(PRIVATE_GC_ARTIFACT_MAGIC);
     encoded.extend_from_slice(guard_id.as_bytes());
     encoded.extend_from_slice(batch.publisher_id.as_bytes());
+    encoded.extend_from_slice(&batch.data_writer_epoch.to_be_bytes());
     encoded.extend_from_slice(batch.branch_id.as_bytes());
     encoded.extend_from_slice(&(batch.database_identity.len() as u32).to_be_bytes());
     encoded.extend_from_slice(batch.database_identity.as_bytes());
@@ -346,11 +392,13 @@ fn decode_private_gc_artifact(
     }
     let guard_id = reader.uuid()?;
     let publisher_id = reader.uuid()?;
+    let data_writer_epoch = reader.u64()?;
     let branch_id = reader.uuid()?;
     let database_len = reader.u32()? as usize;
     if guard_id != expected_guard_id
         || guard_id.is_nil()
         || publisher_id.is_nil()
+        || data_writer_epoch == 0
         || branch_id.is_nil()
         || database_len == 0
         || database_len > PRIVATE_GC_DATABASE_IDENTITY_MAX_BYTES
@@ -420,6 +468,7 @@ fn decode_private_gc_artifact(
     }
     let batch = PreparedPrivateGcBatch {
         publisher_id,
+        data_writer_epoch,
         branch_id,
         database_identity,
         epoch,
@@ -510,6 +559,7 @@ impl ExtentStore {
         if guard_id.is_nil()
             || self.private_publisher_identity().is_none_or(|identity| {
                 batch.publisher_id != identity.publisher_id
+                    || batch.data_writer_epoch != identity.data_writer_epoch
                     || batch.branch_id != identity.branch_id
                     || batch.database_identity != identity.database_identity
             })
@@ -527,6 +577,7 @@ impl ExtentStore {
         Ok(PersistedPrivateGcArtifact {
             guard_id,
             publisher_id: batch.publisher_id,
+            data_writer_epoch: batch.data_writer_epoch,
             branch_id: batch.branch_id,
             database_identity: batch.database_identity.clone(),
             epoch: batch.epoch,
@@ -628,6 +679,7 @@ impl ExtentStore {
         let candidate_digest = private_candidate_digest(&candidates);
         Ok(PreparedPrivateGcBatch {
             publisher_id: self.publisher_id(),
+            data_writer_epoch: publisher.data_writer_epoch,
             branch_id: publisher.branch_id,
             database_identity: publisher.database_identity,
             epoch,
@@ -1639,7 +1691,11 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let db = Arc::new(Db::new(slatedb, None));
+        let db = Arc::new(Db::new_with_database_identity(
+            slatedb,
+            None,
+            "test-database".to_string(),
+        ));
         let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
 
         // Extent 0 -> segment S, durable.
