@@ -1,8 +1,10 @@
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, Catalog, CatalogError,
-    CatalogMutation, ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp,
+    CatalogMutation, CatalogSnapshot, ImmutableCheckpoint, RetiredCatalogKind, RootStoreError,
+    SlateDbRootStore, TombstoneKind, TombstoneRecord, catalog_timestamp, validate_name,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -23,6 +25,45 @@ pub struct BranchCreateFromCheckpointNameRequest {
     pub source_branch_id: Uuid,
     pub source_checkpoint_name: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalResourceStatus {
+    Live,
+    Tombstoned,
+    Retired,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalResource {
+    pub id: Uuid,
+    pub status: HistoricalResourceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchLineageInspection {
+    pub parent: Option<HistoricalResource>,
+    pub origin_checkpoint: Option<HistoricalResource>,
+}
+
+/// Authoritative branch inspection. Durable roots come from SlateDB and are
+/// intentionally absent from the PostgreSQL/JSON customer projections.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BranchInspection {
+    Live {
+        record: BranchRecord,
+        lineage: BranchLineageInspection,
+    },
+    Tombstoned {
+        record: TombstoneRecord,
+        lineage: BranchLineageInspection,
+    },
+    Retired {
+        id: Uuid,
+    },
 }
 
 #[derive(Clone)]
@@ -51,6 +92,42 @@ impl BranchLifecycle {
 
     pub fn deletions(&self) -> super::DeletionLifecycle {
         super::DeletionLifecycle::new(Arc::clone(&self.catalog))
+    }
+
+    /// List every live branch from one lock-consistent authoritative snapshot.
+    /// Results are deterministic by name and stable UUID.
+    pub async fn list_branches(&self) -> Result<Vec<BranchInspection>, BranchLifecycleError> {
+        let snapshot = self.catalog.snapshot().await?;
+        let mut branches = snapshot.branches.values().collect::<Vec<_>>();
+        branches.sort_by(|left, right| (&left.name, left.id).cmp(&(&right.name, right.id)));
+        Ok(branches
+            .into_iter()
+            .map(|branch| inspect_live_branch(&snapshot, branch))
+            .collect())
+    }
+
+    /// Inspect one exact branch incarnation by its never-reused UUID. Deleted
+    /// incarnations remain distinguishable from a later branch reusing the name.
+    pub async fn inspect_branch(&self, id: Uuid) -> Result<BranchInspection, BranchLifecycleError> {
+        let snapshot = self.catalog.snapshot().await?;
+        inspect_branch_id(&snapshot, id)
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()).into())
+    }
+
+    /// Resolve a currently live branch name, then inspect that exact UUID in
+    /// the same authoritative snapshot. Historical names are never aliases.
+    pub async fn inspect_branch_by_name(
+        &self,
+        name: &str,
+    ) -> Result<BranchInspection, BranchLifecycleError> {
+        validate_name(name)?;
+        let snapshot = self.catalog.snapshot().await?;
+        let branch = snapshot
+            .branches
+            .values()
+            .find(|branch| branch.name == name)
+            .ok_or_else(|| CatalogError::NotFound(name.to_string()))?;
+        Ok(inspect_live_branch(&snapshot, branch))
     }
 
     pub fn root_captures(&self) -> super::RootCaptureLifecycle {
@@ -295,6 +372,94 @@ impl BranchLifecycle {
             )));
         }
         Ok(branch)
+    }
+}
+
+fn inspect_branch_id(snapshot: &CatalogSnapshot, id: Uuid) -> Option<BranchInspection> {
+    if let Some(branch) = snapshot.branches.get(&id) {
+        return Some(inspect_live_branch(snapshot, branch));
+    }
+    if let Some(tombstone) = snapshot
+        .tombstones
+        .get(&id)
+        .filter(|record| record.kind == TombstoneKind::Branch)
+    {
+        return Some(BranchInspection::Tombstoned {
+            lineage: inspect_lineage(
+                snapshot,
+                tombstone.parent_id,
+                tombstone.origin_checkpoint_id,
+            ),
+            record: tombstone.clone(),
+        });
+    }
+    snapshot
+        .retired_catalog_ids
+        .get(&id)
+        .filter(|record| record.kind == RetiredCatalogKind::Branch)
+        .map(|_| BranchInspection::Retired { id })
+}
+
+fn inspect_live_branch(snapshot: &CatalogSnapshot, branch: &BranchRecord) -> BranchInspection {
+    BranchInspection::Live {
+        lineage: inspect_lineage(snapshot, branch.parent_id, branch.origin_checkpoint_id),
+        record: branch.clone(),
+    }
+}
+
+fn inspect_lineage(
+    snapshot: &CatalogSnapshot,
+    parent_id: Option<Uuid>,
+    origin_checkpoint_id: Option<Uuid>,
+) -> BranchLineageInspection {
+    BranchLineageInspection {
+        parent: parent_id.map(|id| HistoricalResource {
+            id,
+            status: historical_status(
+                snapshot,
+                id,
+                TombstoneKind::Branch,
+                RetiredCatalogKind::Branch,
+            ),
+        }),
+        origin_checkpoint: origin_checkpoint_id.map(|id| HistoricalResource {
+            id,
+            status: historical_status(
+                snapshot,
+                id,
+                TombstoneKind::Checkpoint,
+                RetiredCatalogKind::Checkpoint,
+            ),
+        }),
+    }
+}
+
+fn historical_status(
+    snapshot: &CatalogSnapshot,
+    id: Uuid,
+    tombstone_kind: TombstoneKind,
+    retired_kind: RetiredCatalogKind,
+) -> HistoricalResourceStatus {
+    let live = match tombstone_kind {
+        TombstoneKind::Branch => snapshot.branches.contains_key(&id),
+        TombstoneKind::Checkpoint => snapshot.checkpoints.contains_key(&id),
+    };
+    if live {
+        HistoricalResourceStatus::Live
+    } else if snapshot
+        .tombstones
+        .get(&id)
+        .is_some_and(|record| record.kind == tombstone_kind)
+    {
+        HistoricalResourceStatus::Tombstoned
+    } else if snapshot
+        .retired_catalog_ids
+        .get(&id)
+        .is_some_and(|record| record.kind == retired_kind)
+    {
+        HistoricalResourceStatus::Retired
+    } else {
+        HistoricalResourceStatus::Missing
     }
 }
 
@@ -1001,5 +1166,208 @@ mod tests {
         assert_eq!(snapshot.tombstones.len(), LINEAGE_DEPTH * 2);
         roots.verify(branch.root.as_ref().unwrap()).await.unwrap();
         catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_listing_is_deterministic_and_inspection_reports_authoritative_lineage() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("branch-inspection/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        let parent_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let parent = BranchRecord {
+            id: parent_id,
+            revision: 1,
+            name: "z-parent".to_string(),
+            state: BranchState::Ready,
+            root: Some(DurableRoot {
+                identity: "branch-inspection/parent".to_string(),
+                manifest_id: format!("{}@1", Uuid::new_v4()),
+            }),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let checkpoint = CheckpointRecord {
+            id: checkpoint_id,
+            revision: 1,
+            branch_id: parent_id,
+            name: "source".to_string(),
+            root: parent.root.clone().unwrap(),
+            created_at: now,
+            updated_at: now,
+        };
+        let child = BranchRecord {
+            id: child_id,
+            revision: 1,
+            name: "a-child".to_string(),
+            state: BranchState::Ready,
+            root: Some(DurableRoot {
+                identity: "branch-inspection/child".to_string(),
+                manifest_id: format!("{}@1", Uuid::new_v4()),
+            }),
+            parent_id: Some(parent_id),
+            origin_checkpoint_id: Some(checkpoint_id),
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(checkpoint))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateBranch(child.clone()))
+            .await
+            .unwrap();
+        let lifecycle = BranchLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, Path::from("branch-inspection/branches")),
+        );
+
+        let listed = lifecycle.list_branches().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(matches!(
+            &listed[0],
+            BranchInspection::Live { record, .. } if record.id == child_id
+        ));
+        let expected = BranchInspection::Live {
+            record: child,
+            lineage: BranchLineageInspection {
+                parent: Some(HistoricalResource {
+                    id: parent_id,
+                    status: HistoricalResourceStatus::Live,
+                }),
+                origin_checkpoint: Some(HistoricalResource {
+                    id: checkpoint_id,
+                    status: HistoricalResourceStatus::Live,
+                }),
+            },
+        };
+        assert_eq!(lifecycle.inspect_branch(child_id).await.unwrap(), expected);
+        assert_eq!(
+            lifecycle.inspect_branch_by_name("a-child").await.unwrap(),
+            expected
+        );
+
+        assert!(matches!(
+            lifecycle
+                .deletions()
+                .delete_branch(BranchDeleteRequest {
+                    operation_id: Uuid::new_v4(),
+                    branch_id: child_id,
+                    expected_revision: 1,
+                    name: "a-child".to_string(),
+                })
+                .await
+                .unwrap(),
+            BranchDeleteResult::Deleted(_)
+        ));
+        let replacement_id = Uuid::new_v4();
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: replacement_id,
+                revision: 1,
+                name: "a-child".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "branch-inspection/replacement".to_string(),
+                    manifest_id: format!("{}@1", Uuid::new_v4()),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle.inspect_branch(child_id).await.unwrap(),
+            BranchInspection::Tombstoned { record, .. } if record.id == child_id
+        ));
+        assert!(matches!(
+            lifecycle.inspect_branch_by_name("a-child").await.unwrap(),
+            BranchInspection::Live { record, .. } if record.id == replacement_id
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[test]
+    fn inspection_distinguishes_tombstoned_retired_and_missing_history() {
+        let now = catalog_timestamp(Utc::now());
+        let parent_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut snapshot = CatalogSnapshot::default();
+        snapshot.branches.insert(
+            child_id,
+            BranchRecord {
+                id: child_id,
+                revision: 1,
+                name: "child".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "inspection-history/child".to_string(),
+                    manifest_id: format!("{}@1", Uuid::new_v4()),
+                }),
+                parent_id: Some(parent_id),
+                origin_checkpoint_id: Some(checkpoint_id),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        snapshot.tombstones.insert(
+            parent_id,
+            TombstoneRecord {
+                id: parent_id,
+                kind: TombstoneKind::Branch,
+                name: "parent".to_string(),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                deleted_revision: Some(1),
+                deletion_operation_id: Some(Uuid::new_v4()),
+                deleted_generation: 1,
+                deleted_at: now,
+            },
+        );
+        snapshot.retired_catalog_ids.insert(
+            checkpoint_id,
+            super::super::RetiredCatalogId {
+                id: checkpoint_id,
+                kind: RetiredCatalogKind::Checkpoint,
+            },
+        );
+        let BranchInspection::Live { lineage, .. } =
+            inspect_branch_id(&snapshot, child_id).unwrap()
+        else {
+            panic!("live child must inspect as live");
+        };
+        assert_eq!(
+            lineage.parent.unwrap().status,
+            HistoricalResourceStatus::Tombstoned
+        );
+        assert_eq!(
+            lineage.origin_checkpoint.unwrap().status,
+            HistoricalResourceStatus::Retired
+        );
+
+        snapshot.tombstones.remove(&parent_id);
+        assert_eq!(
+            match inspect_branch_id(&snapshot, child_id).unwrap() {
+                BranchInspection::Live { lineage, .. } => lineage.parent.unwrap().status,
+                _ => panic!("live child must inspect as live"),
+            },
+            HistoricalResourceStatus::Missing
+        );
     }
 }

@@ -39,8 +39,8 @@ pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
 };
 pub use lifecycle::{
-    BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchLifecycle,
-    BranchLifecycleError,
+    BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchInspection, BranchLifecycle,
+    BranchLifecycleError, BranchLineageInspection, HistoricalResource, HistoricalResourceStatus,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{

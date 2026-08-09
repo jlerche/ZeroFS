@@ -162,9 +162,9 @@
   - [x] Use stable UUIDs for branches and operations.
   - [x] Make exact retries idempotent.
   - [x] Reject conflicting retries with clear diagnostics.
-- [ ] Implement branch listing and inspection.
-  - [ ] Report UUID, state, current root, origin, and historical parent.
-  - [ ] Distinguish live parents/checkpoints from tombstoned historical origins.
+- [x] Implement branch listing and inspection.
+  - [x] Report UUID, state, current root, origin, and historical parent.
+  - [x] Distinguish live parents/checkpoints from tombstoned historical origins.
 - [ ] Implement branch mounting by stable identity resolved from a name.
   - [ ] Acquire a lease before exposing the data plane.
   - [ ] Verify the branch is `Ready` and the exact root is readable.
@@ -652,3 +652,9 @@
 ### 2026-08-08: baseline gate reconfirmation
 
 - The production branch passes `cargo fmt --all -- --check`, the complete default test suite, `cargo check --all-targets`, and `cargo clippy --all-targets -- -D warnings`. The PostgreSQL projection integration remains explicitly environment-gated on a disposable `ZEROFS_TEST_POSTGRES_URL`, and the real-process failover cases retain their existing shared-runner ignored status.
+
+### 2026-08-08: authoritative branch listing and inspection
+
+- `BranchLifecycle` now lists live branches deterministically by name and stable UUID and inspects either a current name or an exact never-reused UUID. Exact-ID inspection preserves the distinction between a live record, a full tombstone, a compact permanent retirement marker, and an unknown resource; resolving a reused name returns only the current live incarnation.
+- Live inspection reports the authoritative branch record, including lifecycle state and current durable root, plus independently classified historical parent and origin-checkpoint references. Each historical reference is explicitly `live`, `tombstoned`, `retired`, or `missing`, so deleted ancestry remains explanatory metadata and cannot be mistaken for a storage-liveness dependency.
+- The inspection is built from one lock-consistent SlateDB snapshot. Durable roots remain SlateDB-only authority and are never copied into the identical PostgreSQL/JSON customer projections; customer metadata can be composed with this authoritative view at a later API boundary. Focused tests prove deterministic ordering, name/UUID lookup parity, and live/tombstoned/retired/missing lineage classification.
