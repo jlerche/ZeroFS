@@ -969,6 +969,18 @@ qualification at the supported branch/root envelope is a separate release gate;
 exceeding an operator's time budget delays reclamation and must never authorize
 partial deletion.
 
+Root-pin extraction collects candidates once and performs one canonical
+sort/deduplication; it never probes an ever-growing vector for each root. The
+reproducible ignored release probe
+`gc_root_capture_supported_envelope` constructs the exact 4,096-branch,
+256-checkpoint-per-branch ceiling. On the 2026-08-09 qualification host it
+validated 1,052,672 unique roots in 377 ms, collected/canonicalized them in
+169 ms, and hashed them in 158 ms. Their canonical JSON is 117,710,537 bytes.
+These figures qualify in-process root extraction only. Mark-generation object
+I/O, its linearity on a representative backend, and concurrent foreground
+latency remain separate open release gates; the probe deliberately does not
+turn synthetic memory-store timings into those claims.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

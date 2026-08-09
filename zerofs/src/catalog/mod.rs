@@ -2013,13 +2013,10 @@ impl CatalogSnapshot {
     pub fn gc_root_pins(&self) -> Vec<GcRootPin> {
         let mut pins = Vec::new();
         let mut push = |kind, root: &DurableRoot| {
-            let pin = GcRootPin {
+            pins.push(GcRootPin {
                 kind,
                 root: root.clone(),
-            };
-            if !pins.contains(&pin) {
-                pins.push(pin);
-            }
+            });
         };
         for branch in self.branches.values() {
             if let Some(root) = &branch.root {
@@ -2916,6 +2913,123 @@ fn validate_timestamp(value: DateTime<Utc>, field: &str) -> Result<(), CatalogEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gc_scale_snapshot(branch_count: usize, checkpoints_per_branch: usize) -> CatalogSnapshot {
+        let now = catalog_timestamp(Utc::now());
+        let mut snapshot = CatalogSnapshot::default();
+        for branch_index in 0..branch_count {
+            let branch_id = Uuid::from_u128(branch_index as u128 + 1);
+            snapshot.branches.insert(
+                branch_id,
+                BranchRecord {
+                    id: branch_id,
+                    revision: 1,
+                    name: format!("scale-branch-{branch_index}"),
+                    state: BranchState::Ready,
+                    root: Some(DurableRoot {
+                        identity: format!("scale/branches/{branch_index}"),
+                        manifest_id: format!("branch-manifest-{branch_index}"),
+                    }),
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            for checkpoint_index in 0..checkpoints_per_branch {
+                let ordinal = branch_index
+                    .checked_mul(checkpoints_per_branch)
+                    .and_then(|value| value.checked_add(checkpoint_index))
+                    .expect("scale fixture ordinal fits usize");
+                let checkpoint_id = Uuid::from_u128((1u128 << 64) | (ordinal as u128 + 1));
+                snapshot.checkpoints.insert(
+                    checkpoint_id,
+                    CheckpointRecord {
+                        id: checkpoint_id,
+                        revision: 1,
+                        branch_id,
+                        name: format!("checkpoint-{checkpoint_index}"),
+                        root: DurableRoot {
+                            identity: format!("scale/checkpoints/{ordinal}"),
+                            manifest_id: format!("checkpoint-manifest-{ordinal}"),
+                        },
+                        created_at: now,
+                        updated_at: now,
+                    },
+                );
+            }
+        }
+        snapshot
+    }
+
+    #[test]
+    fn gc_root_pin_collection_sorts_and_deduplicates_after_linear_collection() {
+        let mut snapshot = gc_scale_snapshot(64, 32);
+        let shared = snapshot
+            .branches
+            .values()
+            .next()
+            .and_then(|branch| branch.root.clone())
+            .unwrap();
+        for checkpoint in snapshot.checkpoints.values_mut().take(64) {
+            checkpoint.root = shared.clone();
+        }
+        let pins = snapshot.gc_root_pins();
+        assert_eq!(pins.len(), 64 + 64 * 32 - 64 + 1);
+        assert!(pins.windows(2).all(|pair| {
+            (
+                gc_root_kind_order(pair[0].kind),
+                &pair[0].root.identity,
+                &pair[0].root.manifest_id,
+            ) < (
+                gc_root_kind_order(pair[1].kind),
+                &pair[1].root.identity,
+                &pair[1].root.manifest_id,
+            )
+        }));
+    }
+
+    /// Manual release-mode qualification of the complete declared catalog
+    /// envelope. Run with:
+    /// `cargo test --release gc_root_capture_supported_envelope -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "release-mode supported-envelope benchmark"]
+    fn gc_root_capture_supported_envelope() {
+        let fixture_started = std::time::Instant::now();
+        let snapshot = gc_scale_snapshot(MAX_LIVE_BRANCHES, MAX_CHECKPOINTS_PER_BRANCH);
+        let fixture_ms = fixture_started.elapsed().as_millis();
+
+        let validation_started = std::time::Instant::now();
+        snapshot.validate().unwrap();
+        let validation_ms = validation_started.elapsed().as_millis();
+
+        let capture_started = std::time::Instant::now();
+        let pins = snapshot.gc_root_pins();
+        let capture_ms = capture_started.elapsed().as_millis();
+        let expected_roots = MAX_LIVE_BRANCHES
+            .checked_mul(MAX_CHECKPOINTS_PER_BRANCH + 1)
+            .unwrap();
+        assert_eq!(pins.len(), expected_roots);
+
+        let digest_started = std::time::Instant::now();
+        let digest = gc_root_digest(&pins).unwrap();
+        let digest_ms = digest_started.elapsed().as_millis();
+        let encoded_bytes = serde_json::to_vec(&pins).unwrap().len();
+        println!(
+            "{}",
+            serde_json::json!({
+                "branches": MAX_LIVE_BRANCHES,
+                "checkpoints_per_branch": MAX_CHECKPOINTS_PER_BRANCH,
+                "roots": pins.len(),
+                "encoded_root_bytes": encoded_bytes,
+                "fixture_ms": fixture_ms,
+                "snapshot_validation_ms": validation_ms,
+                "root_collection_ms": capture_ms,
+                "root_digest_ms": digest_ms,
+                "root_digest": digest,
+            })
+        );
+    }
 
     #[test]
     fn bounded_cleanup_metrics_export_kind_and_backlog_signal() {
