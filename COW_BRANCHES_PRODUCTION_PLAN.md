@@ -275,7 +275,7 @@
 ### Epic 5.2: Validate GC safety
 
 - [x] Build a model test that computes ideal reachability and compares it with collector decisions.
-- [ ] Test catalog changes during root capture, marking, inventory, quarantine, and deletion.
+- [x] Test catalog changes during root capture, marking, inventory, quarantine, and deletion.
 - [x] Test branches and checkpoints created immediately before and after the inventory cutoff.
 - [x] Test deletion of parents and source checkpoints with surviving descendants.
 - [x] Test active, expired, renewed, and corrupted leases.
@@ -642,3 +642,9 @@
 - One collector run now closes its authoritative SlateDB catalog, drops the lifecycle object, reopens the same local catalog path, and resumes after each durable phase: `Captured`, `Marking`, `Quarantined`, `Revalidating`, `Validated`, `Deleting`, and `Completed`. Artifacts and the segment pool remain in the same object store while every coordinator instance is reconstructed.
 - The normally transient `Revalidating` and initial `Deleting` states are published through their exact catalog transitions before shutdown. After reopen, the public revalidation and bounded-deletion entry points consume those records, verify their immutable artifacts, and advance without rebuilding or skipping authority.
 - Exact retry is asserted for the already-published capture, marks, quarantine, validation, and completion records. The deleting restart physically removes the sole stably unreachable candidate, durably completes its cursor and audit, and a final completed-state reopen performs no additional deletion.
+
+### 2026-08-08: catalog-mutation GC phase matrix
+
+- Root-capture publication is generation-fenced and leaves no partial run when the catalog changes after its snapshot. The cutoff fixture publishes a valid branch and checkpoint after capture, then runs the immutable mark and inventory work; quarantine publication rejects the stale generation, remains in `Marking`, and retains every pool object. A fresh capture includes all pre- and post-cutoff roots.
+- A complementary fixture publishes a storage-authenticated ready branch after quarantine. Revalidation captures the newer catalog generation, authenticates that branch root, includes it in the canonical second-observation pins, and leaves the first-observation candidate untouched until validation completes.
+- The same branch is revised again after validation. Deletion preflight observes the generation mismatch, records a `GenerationChanged` blocker, publishes no deletion cursor, leaves the run in `Validated`, and proves the candidate remains physically present. Together these tests exercise mutations around root capture, mark generation, inventory, quarantine, and the physical-delete boundary.

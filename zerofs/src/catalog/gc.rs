@@ -1679,6 +1679,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_quarantine_roots_enter_revalidation_and_post_validation_changes_stop_delete() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segment_pool = Path::from("gc-catalog-phase-pool");
+        let candidate = Segid::new(42, 0);
+        let candidate_path = Path::from(format!("{segment_pool}/{}", candidate.object_key()));
+        store
+            .put(
+                &candidate_path,
+                bytes::Bytes::from_static(b"candidate").into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let branch_root = Path::from("gc-catalog-phase-branches");
+        let root_store = SlateDbRootStore::new(Arc::clone(&store), branch_root.clone())
+            .with_segment_pool_root(segment_pool.clone());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-catalog-phase-catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let lifecycle = RootCaptureLifecycle::new(catalog.clone(), root_store.clone());
+        let run_id = Uuid::new_v4();
+        lifecycle.begin(run_id).await.unwrap();
+        lifecycle.mark(run_id).await.unwrap();
+        let quarantined = lifecycle.quarantine(run_id).await.unwrap();
+        assert_eq!(quarantined.catalog_generation, 0);
+        assert_eq!(
+            quarantined
+                .inventory_stats
+                .as_ref()
+                .unwrap()
+                .candidate_objects,
+            1
+        );
+
+        let source_path = Path::from("gc-catalog-phase-source");
+        let source_db = Db::builder(source_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        source_db
+            .put(KeyCodec::new().system_counter_key(), b"value")
+            .await
+            .unwrap();
+        source_db.flush().await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let branch_id = Uuid::new_v4();
+        let published_root = root_store
+            .create_from_checkpoint(
+                Uuid::new_v4(),
+                branch_id,
+                &ImmutableCheckpoint {
+                    database_path: source_path,
+                    checkpoint_id: checkpoint.id,
+                    manifest_id: checkpoint.manifest_id,
+                },
+            )
+            .await
+            .unwrap();
+        let published_at = catalog_timestamp(Utc::now());
+        let branch = BranchRecord {
+            id: branch_id,
+            revision: 1,
+            name: "post-quarantine".to_string(),
+            state: BranchState::Ready,
+            root: Some(published_root.clone()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: published_at,
+            updated_at: published_at,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+
+        let grace = Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64);
+        let not_before = quarantined.quarantine_at.unwrap() + grace;
+        let validated = lifecycle
+            .revalidate_at(run_id, grace, not_before)
+            .await
+            .unwrap();
+        assert_eq!(validated.phase, GcRunPhase::Validated);
+        let observation = validated.revalidation.as_ref().unwrap();
+        assert_eq!(observation.catalog_generation, 1);
+        assert!(observation.roots.contains(&GcRootPin {
+            kind: GcRootKind::Branch,
+            root: published_root,
+        }));
+        assert!(store.head(&candidate_path).await.is_ok());
+
+        let changed_at = validated.updated_at + Duration::microseconds(1);
+        let mut changed_branch = branch;
+        changed_branch.revision = 2;
+        changed_branch.updated_at = changed_at;
+        catalog
+            .apply(CatalogMutation::ReplaceBranch {
+                expected_revision: 1,
+                record: changed_branch,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .delete_batch(
+                    run_id,
+                    GcDeletionPolicy {
+                        enabled: true,
+                        batch_size: 1,
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::RevisionConflict {
+                    expected: 1,
+                    actual: 2
+                }
+            ))
+        ));
+        let retained = catalog.gc_run(run_id).await.unwrap().unwrap();
+        assert_eq!(retained.phase, GcRunPhase::Validated);
+        assert!(retained.deletion.is_none());
+        assert!(store.head(&candidate_path).await.is_ok());
+        assert!(
+            catalog
+                .gc_blockers(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker.kind == GcBlockerKind::GenerationChanged)
+        );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn collector_matches_ideal_two_observation_model_and_cutoff() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let data_path = Path::from("gc-revalidation-data");
