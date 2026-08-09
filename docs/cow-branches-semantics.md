@@ -589,6 +589,17 @@ and JSON do not receive reservation records. Both preserve the same customer
 metadata and historical fields while reconciliation changes the compacted
 resource from `deleted` to `absent`.
 
+Global collector artifacts live only below `__zerofs_gc/<run UUID>/`. A
+disabled-by-default cleanup call may drain that prefix only for an exact
+schema-valid `Completed` run and only after a caller-selected retention period.
+It never removes the compact catalog run/audit record. Each pass lists and
+confirm-deletes at most 4096 objects; final mark, inventory, quarantine, and
+revalidation shards and intermediate run/merge files are treated uniformly.
+Objects newer than the retention cutoff remain. Confirmed absence reconciles
+an ambiguous delete, and relisting the shrinking prefix is the crash-resumable
+cursor, so a completed empty retry is a no-op. The prefix is disjoint from the
+segment pool, branch databases, and authoritative catalog.
+
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
 active writer, and authoritative guard attachment proves the requested term was

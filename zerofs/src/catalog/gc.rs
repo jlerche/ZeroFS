@@ -4,10 +4,11 @@ use super::{
     Catalog, CatalogError, GcBlockerKind, GcDeletionProgress, GcDeletionPublication,
     GcQuarantinePublication, GcRevalidationCapture, GcRevalidationPublication,
     GcRevalidationRecord, GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint, RootStoreError,
-    SlateDbRootStore, catalog_timestamp, gc_root_digest,
+    SlateDbRootStore, catalog_timestamp, gc_root_digest, validate_timestamp,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
+use object_store::ObjectStoreExt;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -15,6 +16,8 @@ const ROOT_VERIFY_CONCURRENCY: usize = 16;
 /// Five-minute maximum lease + 30-second skew + one-minute propagation bound.
 pub(crate) const MIN_REVALIDATION_GRACE_SECONDS: u64 = 390;
 pub(crate) const MAX_DELETE_BATCH_SIZE: u32 = 4_096;
+pub(crate) const MAX_ARTIFACT_CLEANUP_OBJECTS: usize = 4_096;
+const GC_ARTIFACT_PREFIX: &str = "__zerofs_gc";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcDeletionPolicy {
@@ -29,6 +32,23 @@ impl Default for GcDeletionPolicy {
             batch_size: 256,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcArtifactCleanupPolicy {
+    pub enabled: bool,
+    pub retention_seconds: u64,
+    pub max_objects: usize,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GcArtifactCleanupReport {
+    pub examined: u64,
+    pub deleted: u64,
+    pub already_absent: u64,
+    pub retained_too_young: u64,
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
@@ -657,6 +677,107 @@ impl RootCaptureLifecycle {
             .map_err(Into::into)
     }
 
+    /// Delete a bounded batch from one completed run's isolated artifact
+    /// namespace after its retention period. Relisting the shrinking prefix is
+    /// the durable cursor: crashes and ambiguous already-absent deletes resume
+    /// without catalog-side per-object state.
+    pub async fn cleanup_artifacts(
+        &self,
+        run_id: Uuid,
+        policy: GcArtifactCleanupPolicy,
+    ) -> Result<GcArtifactCleanupReport, RootCaptureLifecycleError> {
+        validate_timestamp(policy.observed_at, "GC artifact cleanup observation")?;
+        if !policy.enabled {
+            return Err(CatalogError::Invalid(
+                "GC artifact cleanup is disabled by policy".to_string(),
+            )
+            .into());
+        }
+        if policy.max_objects == 0 || policy.max_objects > MAX_ARTIFACT_CLEANUP_OBJECTS {
+            return Err(CatalogError::Invalid(format!(
+                "GC artifact cleanup batch must be between 1 and {MAX_ARTIFACT_CLEANUP_OBJECTS}"
+            ))
+            .into());
+        }
+        let retention = i64::try_from(policy.retention_seconds)
+            .map_err(|_| CatalogError::Invalid("GC artifact retention is too large".to_string()))?;
+        let retention_duration = Duration::try_seconds(retention).ok_or_else(|| {
+            CatalogError::Invalid("GC artifact retention is too large".to_string())
+        })?;
+        let run = self
+            .catalog
+            .gc_run(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        run.validate()?;
+        let completed_at = run
+            .deletion
+            .as_ref()
+            .and_then(|progress| progress.completed_at)
+            .filter(|_| run.phase == GcRunPhase::Completed)
+            .ok_or_else(|| {
+                CatalogError::OperationConflict(format!(
+                    "GC run {run_id} has not completed deletion"
+                ))
+            })?;
+        let retain_until = completed_at
+            .checked_add_signed(retention_duration)
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC artifact retention deadline overflows".to_string())
+            })?;
+        if policy.observed_at < retain_until {
+            return Err(CatalogError::OperationConflict(format!(
+                "GC run {run_id} artifacts are retained until {retain_until}"
+            ))
+            .into());
+        }
+        let object_cutoff = policy
+            .observed_at
+            .checked_sub_signed(retention_duration)
+            .ok_or_else(|| {
+                CatalogError::Invalid("GC artifact retention cutoff underflows".to_string())
+            })?;
+        let store = self.roots.object_store();
+        let prefix = object_store::path::Path::from(format!("{GC_ARTIFACT_PREFIX}/{run_id}"));
+        let mut listing = store.list(Some(&prefix));
+        let mut report = GcArtifactCleanupReport::default();
+
+        while report.examined < policy.max_objects as u64 {
+            let Some(next) = listing.next().await else {
+                report.has_more = report.retained_too_young != 0;
+                return Ok(report);
+            };
+            let meta =
+                next.map_err(|error| RootCaptureLifecycleError::Artifact(error.to_string()))?;
+            report.examined += 1;
+            if meta.last_modified > object_cutoff {
+                report.retained_too_young += 1;
+                continue;
+            }
+            let delete_result = store.delete(&meta.location).await;
+            match store.head(&meta.location).await {
+                Err(object_store::Error::NotFound { .. }) => match delete_result {
+                    Ok(_) => report.deleted += 1,
+                    Err(_) => report.already_absent += 1,
+                },
+                Ok(_) => {
+                    return Err(RootCaptureLifecycleError::Artifact(format!(
+                        "artifact {} remains after delete",
+                        meta.location
+                    )));
+                }
+                Err(error) => {
+                    return Err(RootCaptureLifecycleError::Artifact(format!(
+                        "artifact {} absence confirmation failed: {error}",
+                        meta.location
+                    )));
+                }
+            }
+        }
+        report.has_more = true;
+        Ok(report)
+    }
+
     async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
         if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
             let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
@@ -714,6 +835,8 @@ pub enum RootCaptureLifecycleError {
     Mark(String),
     #[error("GC inventory failed: {0}")]
     Inventory(String),
+    #[error("GC artifact cleanup failed: {0}")]
+    Artifact(String),
     #[error(
         "GC revalidation grace has not elapsed: not before {not_before}, observed {observed_at}"
     )]
@@ -876,6 +999,36 @@ mod tests {
         assert!(run.roots.is_empty());
         assert_eq!(catalog.snapshot().await.unwrap().generation, 0);
         assert_eq!(lifecycle.begin(id).await.unwrap(), run);
+        assert!(matches!(
+            lifecycle
+                .cleanup_artifacts(
+                    id,
+                    GcArtifactCleanupPolicy {
+                        enabled: true,
+                        retention_seconds: (i64::MAX / 1_000 + 1) as u64,
+                        max_objects: 1,
+                        observed_at: run.updated_at,
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
+        assert!(matches!(
+            lifecycle
+                .cleanup_artifacts(
+                    id,
+                    GcArtifactCleanupPolicy {
+                        enabled: true,
+                        retention_seconds: 0,
+                        max_objects: 1,
+                        observed_at: run.updated_at,
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
         let bad_id = Uuid::new_v4();
         let mut mismatched = run;
         mismatched.id = bad_id;
@@ -1271,6 +1424,87 @@ mod tests {
         assert_eq!(
             lifecycle.delete_batch(run.id, policy).await.unwrap(),
             completed
+        );
+        let artifact_prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}", run.id));
+        assert!(store.list(Some(&artifact_prefix)).next().await.is_some());
+        let other_run_artifact =
+            Path::from(format!("{GC_ARTIFACT_PREFIX}/{}/keep.bin", Uuid::new_v4()));
+        store
+            .put(
+                &other_run_artifact,
+                bytes::Bytes::from_static(b"other-run").into(),
+            )
+            .await
+            .unwrap();
+        let completed_at = deletion.completed_at.unwrap();
+        assert!(matches!(
+            lifecycle
+                .cleanup_artifacts(
+                    run.id,
+                    GcArtifactCleanupPolicy {
+                        enabled: false,
+                        retention_seconds: 1,
+                        max_objects: 128,
+                        observed_at: completed_at + Duration::seconds(1),
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
+        assert!(matches!(
+            lifecycle
+                .cleanup_artifacts(
+                    run.id,
+                    GcArtifactCleanupPolicy {
+                        enabled: true,
+                        retention_seconds: 1,
+                        max_objects: 128,
+                        observed_at: completed_at,
+                    },
+                )
+                .await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
+        let cleanup_policy = GcArtifactCleanupPolicy {
+            enabled: true,
+            retention_seconds: 1,
+            max_objects: 128,
+            observed_at: completed_at + Duration::seconds(1),
+        };
+        let mut cleanup_complete = false;
+        for _ in 0..32 {
+            let report = lifecycle
+                .cleanup_artifacts(run.id, cleanup_policy)
+                .await
+                .unwrap();
+            assert!(report.examined <= cleanup_policy.max_objects as u64);
+            assert!(report.deleted + report.already_absent <= report.examined);
+            if !report.has_more {
+                cleanup_complete = true;
+                break;
+            }
+        }
+        assert!(cleanup_complete, "bounded artifact cleanup must converge");
+        assert!(store.list(Some(&artifact_prefix)).next().await.is_none());
+        assert!(store.head(&other_run_artifact).await.is_ok());
+        assert!(
+            store
+                .head(&Path::from(format!(
+                    "{segment_pool}/{}",
+                    became_reachable.object_key()
+                )))
+                .await
+                .is_ok(),
+            "artifact cleanup must not cross into the segment pool"
+        );
+        assert_eq!(
+            lifecycle
+                .cleanup_artifacts(run.id, cleanup_policy)
+                .await
+                .unwrap(),
+            GcArtifactCleanupReport::default()
         );
         catalog.close().await.unwrap();
     }

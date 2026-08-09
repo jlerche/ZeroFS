@@ -257,7 +257,7 @@
 ### Epic 4.6: Clean up metadata
 
 - [x] Remove old tombstones only after no active lease or GC run can observe their catalog generation.
-- [ ] Remove completed GC run artifacts after a retention period.
+- [x] Remove completed GC run artifacts after a retention period.
 - [ ] Remove obsolete mark runs and quarantine records idempotently.
 - [ ] Bound cleanup work per pass and expose backlog metrics.
 
@@ -578,3 +578,10 @@
 - Eligibility uses the schema-v15 exact blocker records under the catalog mutation lock. Any lease attributed to the exact branch, incomplete child creation, root-retaining global GC run, missing checkpoint parent, immature retention cutoff, or inconsistent delete operation retains the full tombstone. A published branch-delete operation is validated, compacted to its own permanent UUID reservation, and removed atomically with its branch tombstone.
 - Each pass validates `1 <= compact <= scan <= 4096`, resumes after a durable SlateDB UUID cursor, examines no more than the scan ceiling, and advances the catalog generation once if it compacts one or more records. Its report separates age/root/dependency retention and exposes a bounded eligible-backlog lower bound; production scheduling and exported backlog gauges remain later Epic 4.6/5.3 work.
 - PostgreSQL and JSON remain identical customer projections. Reconciliation changes a compacted historical resource from `deleted` to `absent` while preserving its customer metadata and prior customer-facing fields; the compact marker itself is never projected. Focused tests prove lease and global-GC retention, bounded cursor progress, branch-delete audit compaction, permanent UUID rejection, snapshot consistency, and JSON projection behavior; the PostgreSQL integration asserts the same transition when its test database is configured.
+
+### 2026-08-08: retained completed-run artifact cleanup
+
+- A disabled-by-default cleanup entry point accepts one exact schema-valid `Completed` global GC run, an observation timestamp, a retention period, and a `1..=4096` object ceiling. It rejects active/incomplete runs and observations before `completed_at + retention`; catalog run records and their bounded deletion audit remain intact.
+- Cleanup is confined to the canonical `__zerofs_gc/<run UUID>/` prefix, disjoint from the segment pool, catalog, and branch namespaces. It removes final mark/inventory/quarantine/revalidation shards and intermediate run/merge files together, but retains any object whose own storage timestamp has not crossed the same retention cutoff.
+- Each pass lists and confirm-deletes at most the configured ceiling. A confirmed absent object reconciles an ambiguous or lost delete response, the shrinking prefix is the crash-resumable cursor, an empty retry is an exact no-op, and the report exposes examined/deleted/already-absent/too-young counts plus conservative remaining work.
+- Executable proof runs the complete two-observation collector through physical deletion, rejects disabled and premature cleanup, drains its artifact namespace over bounded passes, verifies the segment-pool boundary, and proves an empty exact retry. Phase-aware cleanup of abandoned/obsolete artifacts without a completed run and exported backlog scheduling remain open in the following Epic 4.6 items.
