@@ -552,6 +552,27 @@ pub(crate) struct TombstoneCleanupReport {
     pub cursor_wrapped: bool,
 }
 
+/// Publish one bounded metadata-cleanup pass. The backlog gauge is deliberately
+/// a conservative, kind-specific signal: tombstones report an observed eligible
+/// lower bound, while artifact cleanup reports `0` or `1` for no-more/more work.
+pub(crate) fn record_cleanup_metrics(
+    kind: &'static str,
+    examined: u64,
+    removed: u64,
+    already_absent: u64,
+    retained: u64,
+    backlog_signal: u64,
+) {
+    metrics::counter!("zerofs_catalog_cleanup_passes_total", "kind" => kind).increment(1);
+    metrics::counter!("zerofs_catalog_cleanup_examined_total", "kind" => kind).increment(examined);
+    metrics::counter!("zerofs_catalog_cleanup_removed_total", "kind" => kind).increment(removed);
+    metrics::counter!("zerofs_catalog_cleanup_already_absent_total", "kind" => kind)
+        .increment(already_absent);
+    metrics::counter!("zerofs_catalog_cleanup_retained_total", "kind" => kind).increment(retained);
+    metrics::gauge!("zerofs_catalog_cleanup_backlog_signal", "kind" => kind)
+        .set(backlog_signal as f64);
+}
+
 /// Authoritative local-GC eligibility state for one authenticated pool epoch.
 /// Merely having this record never authorizes deletion; storage authentication,
 /// sealing, exclusion guards, and local liveness proof are separate gates.
@@ -2610,6 +2631,24 @@ fn validate_timestamp(value: DateTime<Utc>, field: &str) -> Result<(), CatalogEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_cleanup_metrics_export_kind_and_backlog_signal() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_cleanup_metrics("tombstones", 7, 2, 1, 4, 3);
+        });
+        let rendered = handle.render();
+        assert!(rendered.contains("zerofs_catalog_cleanup_passes_total{kind=\"tombstones\"} 1"));
+        assert!(rendered.contains("zerofs_catalog_cleanup_examined_total{kind=\"tombstones\"} 7"));
+        assert!(rendered.contains("zerofs_catalog_cleanup_removed_total{kind=\"tombstones\"} 2"));
+        assert!(
+            rendered.contains("zerofs_catalog_cleanup_already_absent_total{kind=\"tombstones\"} 1")
+        );
+        assert!(rendered.contains("zerofs_catalog_cleanup_retained_total{kind=\"tombstones\"} 4"));
+        assert!(rendered.contains("zerofs_catalog_cleanup_backlog_signal{kind=\"tombstones\"} 3"));
+    }
 
     #[test]
     fn rejects_unbounded_roots_and_nil_lineage() {

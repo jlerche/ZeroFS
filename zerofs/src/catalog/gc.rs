@@ -725,13 +725,22 @@ impl RootCaptureLifecycle {
                 observation.id
             )));
         }
-        cleanup_artifact_prefixes(
+        let report = cleanup_artifact_prefixes(
             self.roots.object_store(),
             &prefixes,
             object_cutoff,
             policy.max_objects,
         )
-        .await
+        .await?;
+        super::record_cleanup_metrics(
+            "completed_gc_artifacts",
+            report.examined,
+            report.deleted,
+            report.already_absent,
+            report.retained_too_young,
+            u64::from(report.has_more),
+        );
+        Ok(report)
     }
 
     /// Delete bounded, phase-obsolete build artifacts while retaining every
@@ -809,13 +818,22 @@ impl RootCaptureLifecycle {
             }
         }
 
-        cleanup_artifact_prefixes(
+        let report = cleanup_artifact_prefixes(
             self.roots.object_store(),
             &prefixes,
             object_cutoff,
             policy.max_objects,
         )
-        .await
+        .await?;
+        super::record_cleanup_metrics(
+            "obsolete_gc_artifacts",
+            report.examined,
+            report.deleted,
+            report.already_absent,
+            report.retained_too_young,
+            u64::from(report.has_more),
+        );
+        Ok(report)
     }
 
     async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {

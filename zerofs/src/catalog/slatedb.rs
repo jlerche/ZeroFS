@@ -2822,6 +2822,14 @@ impl Catalog for SlateDbCatalog {
         self.db
             .write_with_options(batch, &durable_write_options())
             .await?;
+        super::record_cleanup_metrics(
+            "tombstones",
+            report.examined,
+            report.compacted,
+            0,
+            report.retained_by_age + report.retained_by_roots + report.retained_by_dependency,
+            report.eligible_backlog_lower_bound,
+        );
         Ok(report)
     }
 

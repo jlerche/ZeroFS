@@ -259,7 +259,7 @@
 - [x] Remove old tombstones only after no active lease or GC run can observe their catalog generation.
 - [x] Remove completed GC run artifacts after a retention period.
 - [x] Remove obsolete mark runs and quarantine records idempotently.
-- [ ] Bound cleanup work per pass and expose backlog metrics.
+- [x] Bound cleanup work per pass and expose backlog metrics.
 
 ## Phase 5: Verification and fault testing
 
@@ -592,3 +592,10 @@
 - Published first marks survive through quarantine and revalidation; published quarantine shards survive until the second observation is validated. Validated and deleting runs may then discard those first-observation records, while the second observation's final marks and parent-owned revalidation candidates remain authoritative through deletion. Build runs, online merges, merge rounds, and superseded inventory files are removed as soon as their publishing phase makes them retry-independent.
 - Prefix selection is derived exclusively from the exact catalog run and observation UUID. Confirmed absence reconciles ambiguous delete responses, relisting is crash-resumable and idempotent, and reaching the object ceiling reports conservative remaining work even when the last selected prefix supplied the entire batch.
 - The complete lifecycle test cleans after mark publication, quarantine publication, and second-observation validation, verifies each exact retry still succeeds, completes physical deletion from the retained candidate shards, and finally proves completed cleanup drains both the parent run namespace and the sibling observation-mark namespace.
+
+### 2026-08-08: bounded cleanup metrics
+
+- Every tombstone and GC-artifact cleanup invocation is one explicitly bounded pass: tombstones cap both scanned and compacted records at `4096`, while completed and phase-obsolete artifact cleanup share one `4096`-object ceiling across all selected exact prefixes. Reaching the artifact ceiling remains a conservative continuation signal even when the final prefix supplied the entire batch.
+- Successful durable passes publish Prometheus counters for passes, examined objects, removed objects, already-absent reconciliations, and retained objects, labeled by `tombstones`, `completed_gc_artifacts`, or `obsolete_gc_artifacts`. A labeled backlog gauge exports the tombstone pass's observed eligible lower bound or the artifact pass's conservative zero/one continuation signal.
+- Metric recording is observational only and occurs after the authoritative catalog batch or confirmed object-store deletes succeed. SlateDB remains the local and production cleanup authority; PostgreSQL and JSON remain identical customer projections and carry neither cleanup cursors nor operational metric state.
+- A recorder-backed test checks the exact exported names, kind label, counter values, and backlog gauge. This completes Epic 4.6; cadence tuning, alert thresholds, and fleet-level capacity validation remain Epic 5.3 and rollout work.
