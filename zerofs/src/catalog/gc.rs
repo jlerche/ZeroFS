@@ -12,6 +12,7 @@ use futures::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
@@ -39,6 +40,30 @@ impl Default for GcDeletionPolicy {
     }
 }
 
+/// Process-local, rapidly revocable authority for physical global-GC deletes.
+///
+/// Per-call policy remains necessary, but can never override this default-off
+/// kill switch. Clones share one atomic state so an operator control can stop
+/// the next bounded batch without disrupting capture, marking, or reporting.
+#[derive(Clone, Debug, Default)]
+pub struct GcDeletionControl {
+    enabled: Arc<AtomicBool>,
+}
+
+impl GcDeletionControl {
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcArtifactCleanupPolicy {
     pub enabled: bool,
@@ -60,6 +85,7 @@ pub struct GcArtifactCleanupReport {
 pub struct RootCaptureLifecycle {
     catalog: Arc<dyn Catalog>,
     roots: SlateDbRootStore,
+    deletion_control: GcDeletionControl,
 }
 
 impl std::fmt::Debug for RootCaptureLifecycle {
@@ -72,7 +98,16 @@ impl std::fmt::Debug for RootCaptureLifecycle {
 
 impl RootCaptureLifecycle {
     pub(crate) fn new(catalog: Arc<dyn Catalog>, roots: SlateDbRootStore) -> Self {
-        Self { catalog, roots }
+        Self {
+            catalog,
+            roots,
+            deletion_control: GcDeletionControl::default(),
+        }
+    }
+
+    pub fn with_deletion_control(mut self, deletion_control: GcDeletionControl) -> Self {
+        self.deletion_control = deletion_control;
+        self
     }
 
     async fn gc_run_for_phase(&self, run_id: Uuid) -> Result<Option<GcRunRecord>, CatalogError> {
@@ -641,6 +676,12 @@ impl RootCaptureLifecycle {
         record_gc_quarantine_state(&run);
         if run.phase == GcRunPhase::Completed {
             return Ok(run);
+        }
+        if !self.deletion_control.is_enabled() {
+            return Err(CatalogError::Invalid(
+                "physical GC deletion is disabled by the rapid kill switch".to_string(),
+            )
+            .into());
         }
         let observation = run.revalidation.clone().ok_or_else(|| {
             CatalogError::OperationConflict(format!("{run_id}: revalidation is incomplete"))
@@ -1667,6 +1708,7 @@ mod tests {
             enabled: true,
             batch_size: 1,
         };
+        lifecycle.deletion_control.enable();
         let completed = lifecycle.delete_batch(run_id, policy).await.unwrap();
         assert_eq!(completed.phase, GcRunPhase::Completed);
         assert_eq!(completed.deletion.as_ref().unwrap().deleted_objects, 1);
@@ -2086,6 +2128,7 @@ mod tests {
             })
             .await
             .unwrap();
+        lifecycle.deletion_control.enable();
         assert!(matches!(
             lifecycle
                 .delete_batch(
@@ -2240,11 +2283,13 @@ mod tests {
                 .unwrap(),
         );
         catalog.begin_gc_run(0, run.clone()).await.unwrap();
+        let deletion_control = GcDeletionControl::default();
         let lifecycle = RootCaptureLifecycle::new(
             catalog.clone(),
             SlateDbRootStore::new(Arc::clone(&store), Path::from("gc-revalidation-branches"))
                 .with_segment_pool_root(segment_pool.clone()),
-        );
+        )
+        .with_deletion_control(deletion_control.clone());
         let marked = lifecycle.mark(run.id).await.unwrap();
         let obsolete_policy = GcArtifactCleanupPolicy {
             enabled: true,
@@ -2528,6 +2573,12 @@ mod tests {
             enabled: true,
             batch_size: 1,
         };
+        assert!(matches!(
+            lifecycle.delete_batch(run.id, policy).await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(ref message)))
+                if message.contains("rapid kill switch")
+        ));
+        deletion_control.enable();
         let partial = lifecycle.delete_batch(run.id, policy).await.unwrap();
         assert_eq!(partial.phase, GcRunPhase::Deleting);
         assert_eq!(partial.revision, 7);
@@ -2549,6 +2600,14 @@ mod tests {
             partial,
             "an exact retry must reconcile a lost progress response"
         );
+        deletion_control.disable();
+        assert!(matches!(
+            lifecycle.delete_batch(run.id, policy).await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(ref message)))
+                if message.contains("rapid kill switch")
+        ));
+        assert_eq!(catalog.gc_run(run.id).await.unwrap().unwrap(), partial);
+        deletion_control.enable();
         let completed = lifecycle.delete_batch(run.id, policy).await.unwrap();
         assert_eq!(completed.phase, GcRunPhase::Completed);
         assert_eq!(completed.revision, 8);

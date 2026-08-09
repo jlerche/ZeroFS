@@ -739,6 +739,13 @@ duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
    aggregate counts. A crash before cursor publication replays an already
    absent object safely.
 
+Physical deletion has two independent gates. Each call must opt in through its
+bounded deletion policy, and its lifecycle must share an explicitly enabled
+`GcDeletionControl`. The control is default-off and rapidly revocable: disabling
+it stops the next batch, leaves the durable cursor unchanged, and does not stop
+capture, marking, reporting, quarantine, or revalidation. Re-enabling resumes
+from the same authoritative SlateDB progress record.
+
 The run record contains only run UUID, generation, cutoff, segment-pool
 identity, both immutable observation root-list identities/digests, mark and
 candidate shard locations/checksums, bounded work statistics, phase, quarantine

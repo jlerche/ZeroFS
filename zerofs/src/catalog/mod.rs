@@ -33,7 +33,9 @@ pub use deletion::{
     BranchDeleteRequest, BranchDeleteResult, CheckpointDeleteRequest, DeletionLifecycle,
     DeletionLifecycleError,
 };
-pub use gc::{GcDeletionPolicy, RootCaptureLifecycle, RootCaptureLifecycleError};
+pub use gc::{
+    GcDeletionControl, GcDeletionPolicy, RootCaptureLifecycle, RootCaptureLifecycleError,
+};
 pub use json::JsonCatalogProjection;
 pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,

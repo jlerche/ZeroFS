@@ -327,7 +327,7 @@
 - [ ] Start with bounded canary deployments and small delete batches.
 - [ ] Verify restore, audit, and incident-response procedures before broader rollout.
 - [ ] Gradually increase throughput only after safety and foreground-latency targets hold.
-- [ ] Keep a rapid kill switch that disables physical deletion while allowing marking and reporting to continue.
+- [x] Keep a rapid kill switch that disables physical deletion while allowing marking and reporting to continue.
 
 ## Phase 7: Completion criteria
 
@@ -678,3 +678,9 @@
 - Artifact descriptors and the durable typed root list are bounded run metadata, while segment references and physical inventory bodies remain external sorted streams. Memory therefore scales with the current buffers, merge levels, and captured root set—not the total number of segment objects or references in storage. Establishing a supported maximum root count and measuring latency/RSS at that envelope remain the adjacent production-limit and benchmark items.
 - Authoritative SlateDB stores branches, checkpoints, leases, tombstones, operations, and indexes under independent keys. A mutation holds the catalog writer lock for one bounded atomic batch and advances a small generation key, but unrelated updates compare only exact record revisions; no mutation reads, serializes, or compare-and-swaps a catalog-wide JSON document. JSON and PostgreSQL consume reconstructible snapshots only after authoritative commits and cannot introduce storage-authority contention.
 - The online binary-carry merge deliberately trades bounded memory for repeated external merge I/O, so the separate “external work scales linearly” item remains open pending measured request/byte amplification at the supported envelope.
+
+### 2026-08-08: rapid global-deletion kill switch
+
+- `GcDeletionControl` is a cloneable process-local atomic capability that starts disabled. The per-batch `enabled` policy remains necessary but cannot override this independent control, so merely entering the durable `Deleting` phase never authorizes a later batch.
+- Every noncompleted physical batch checks the control before mutating durable run progress. Disabling it between batches returns a specific fail-closed policy error, leaves the authoritative SlateDB cursor and candidate object unchanged, and does not affect capture, marking, inventory, quarantine, revalidation, or read-only replay of an already completed result.
+- The complete two-observation test now proves default-off rejection, explicit enablement for one bounded batch, immediate revocation with unchanged durable progress, re-enable/resume, and eventual exact completion. The persisted-phase restart test must explicitly re-enable after reconstructing the lifecycle, proving the kill switch is not accidentally persisted as deletion authority. PostgreSQL and JSON remain identical customer projections and contain no control state.
