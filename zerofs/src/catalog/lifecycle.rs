@@ -1,7 +1,8 @@
 use super::{
     BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, Catalog, CatalogError,
-    CatalogMutation, CatalogSnapshot, ImmutableCheckpoint, RetiredCatalogKind, RootStoreError,
-    SlateDbRootStore, TombstoneKind, TombstoneRecord, catalog_timestamp, validate_name,
+    CatalogMutation, CatalogSnapshot, ImmutableCheckpoint, LeaseAcquireRequest, LeaseGrant,
+    RetiredCatalogKind, RootStoreError, SlateDbRootStore, TombstoneKind, TombstoneRecord,
+    catalog_timestamp, validate_name,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,21 @@ pub struct BranchCreateFromCheckpointNameRequest {
     pub source_branch_id: Uuid,
     pub source_checkpoint_name: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMountRequest {
+    pub branch_name: String,
+    /// The subject UUID identifies the exact branch incarnation; the remaining
+    /// fields make retries idempotent without resolving a reused name again.
+    pub lease: LeaseAcquireRequest,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchMountGrant {
+    pub branch_name: String,
+    /// The data-plane capability carries the exact UUID and authenticated root.
+    pub lease: LeaseGrant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +108,28 @@ impl BranchLifecycle {
 
     pub fn deletions(&self) -> super::DeletionLifecycle {
         super::DeletionLifecycle::new(Arc::clone(&self.catalog))
+    }
+
+    /// Authorize a data-plane mount against one stable branch incarnation.
+    ///
+    /// Name resolution and lease acquisition serialize in the catalog. An
+    /// exact retry remains bound to the original UUID/root even after deletion
+    /// and name reuse. The root is verified once more immediately before the
+    /// capability crosses this lifecycle boundary.
+    pub async fn mount_branch_by_name(
+        &self,
+        request: BranchMountRequest,
+    ) -> Result<BranchMountGrant, BranchLifecycleError> {
+        validate_name(&request.branch_name)?;
+        let grant = self
+            .leases()
+            .acquire_branch_by_name(&request.branch_name, request.lease)
+            .await?;
+        self.roots.verify(&grant.lease.root).await?;
+        Ok(BranchMountGrant {
+            branch_name: request.branch_name,
+            lease: grant,
+        })
     }
 
     /// List every live branch from one lock-consistent authoritative snapshot.
@@ -473,6 +511,8 @@ pub enum BranchLifecycleError {
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     RootStore(#[from] RootStoreError),
+    #[error(transparent)]
+    Lease(#[from] super::LeaseLifecycleError),
     #[error("source checkpoint {0} root does not match its exact SlateDB checkpoint identity")]
     SourceRootConflict(Uuid),
     #[error("branch lifecycle invariant failed: {0}")]
@@ -1297,6 +1337,117 @@ mod tests {
         assert!(matches!(
             lifecycle.inspect_branch_by_name("a-child").await.unwrap(),
             BranchInspection::Live { record, .. } if record.id == replacement_id
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mount_grant_stays_on_exact_uuid_and_root_across_name_reuse() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("branch-mount/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"value").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let source = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let roots = SlateDbRootStore::new(Arc::clone(&store), Path::from("branch-mount/branches"));
+        let branch_id = Uuid::new_v4();
+        let root = roots
+            .create_from_checkpoint(Uuid::new_v4(), branch_id, &source)
+            .await
+            .unwrap();
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("branch-mount/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        let branch = BranchRecord {
+            id: branch_id,
+            revision: 1,
+            name: "mounted".to_string(),
+            state: BranchState::Ready,
+            root: Some(root.clone()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let request = BranchMountRequest {
+            branch_name: branch.name.clone(),
+            lease: LeaseAcquireRequest {
+                lease_id: Uuid::new_v4(),
+                renewal_token: Uuid::new_v4(),
+                subject_id: branch_id,
+                access_mode: LeaseAccessMode::Write,
+                duration: chrono::Duration::minutes(2),
+            },
+        };
+        let original = lifecycle
+            .mount_branch_by_name(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(original.lease.lease.subject_id, branch_id);
+        assert_eq!(original.lease.lease.root, root);
+
+        assert!(matches!(
+            lifecycle
+                .deletions()
+                .delete_branch(BranchDeleteRequest {
+                    operation_id: Uuid::new_v4(),
+                    branch_id,
+                    expected_revision: branch.revision,
+                    name: branch.name.clone(),
+                })
+                .await
+                .unwrap(),
+            BranchDeleteResult::Draining(_)
+        ));
+        let replacement_id = Uuid::new_v4();
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: replacement_id,
+                revision: 1,
+                name: branch.name.clone(),
+                state: BranchState::Ready,
+                root: Some(root.clone()),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lifecycle
+                .mount_branch_by_name(request.clone())
+                .await
+                .expect("an exact mount retry must retain its original UUID and root"),
+            original
+        );
+        let mut retarget = request;
+        retarget.lease.lease_id = Uuid::new_v4();
+        retarget.lease.renewal_token = Uuid::new_v4();
+        assert!(matches!(
+            lifecycle.mount_branch_by_name(retarget).await,
+            Err(BranchLifecycleError::Lease(
+                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::NotFound(_))
+            ))
         ));
         catalog.close().await.unwrap();
     }

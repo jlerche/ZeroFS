@@ -166,8 +166,9 @@
   - [x] Report UUID, state, current root, origin, and historical parent.
   - [x] Distinguish live parents/checkpoints from tombstoned historical origins.
 - [ ] Implement branch mounting by stable identity resolved from a name.
-  - [ ] Acquire a lease before exposing the data plane.
-  - [ ] Verify the branch is `Ready` and the exact root is readable.
+  - [x] Acquire a lease before exposing the data plane.
+  - [x] Verify the branch is `Ready` and the exact root is readable.
+  - [ ] Wire the stable mount grant into the server data-plane opener and its lease release/renewal path.
 
 ### Epic 3.2: Delete checkpoints independently
 

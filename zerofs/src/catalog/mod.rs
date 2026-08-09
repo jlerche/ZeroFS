@@ -40,7 +40,8 @@ pub use lease::{
 };
 pub use lifecycle::{
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchInspection, BranchLifecycle,
-    BranchLifecycleError, BranchLineageInspection, HistoricalResource, HistoricalResourceStatus,
+    BranchLifecycleError, BranchLineageInspection, BranchMountGrant, BranchMountRequest,
+    HistoricalResource, HistoricalResourceStatus,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
