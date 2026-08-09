@@ -342,9 +342,10 @@ stable branch UUID, duration, mode, and renewal token, recovery may point-read
 the retained capability even after expiry, but this neither renews nor
 resurrects it. A later process must still open a newer SlateDB writer
 incarnation, reconcile and close it, publish that durable head through the same
-transition, and only then acquire a fresh serving lease. The server-owned
-recovery opener that enforces this ordering remains required before writable
-mounts can be released.
+transition, and only then acquire a fresh serving lease. The configured server
+mount enforces this ordering before listeners start. It also confirms renewal
+before serving, renews while serving, stops renewal before orderly data-database
+close, and publishes the immutable head before closing catalog authority.
 
 ## Customer projection and administrative inspection
 

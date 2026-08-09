@@ -812,6 +812,7 @@ pub struct InitResult {
     /// Retains the authoritative catalog lifecycle for the serving process;
     /// lifecycle APIs and stable mount wiring consume it incrementally.
     pub(crate) catalog_runtime: Option<crate::cli::init::CatalogRuntime>,
+    pub(crate) branch_mount: Option<crate::cli::init::ConfiguredBranchMount>,
 }
 
 async fn close_catalog_runtime(
@@ -821,6 +822,310 @@ async fn close_catalog_runtime(
         runtime.close().await?;
     }
     Ok(())
+}
+
+struct BranchWriterLeaseSupervisor {
+    grant: Arc<tokio::sync::Mutex<zerofs::catalog::LeaseGrant>>,
+    stop: CancellationToken,
+    lost: CancellationToken,
+    task: JoinHandle<()>,
+    duration: chrono::Duration,
+    reconciler: Option<BranchWriterReconciler>,
+}
+
+const BRANCH_RENEWAL_RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
+const BRANCH_INITIAL_RENEWAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+type BranchWriterRenewer = Arc<
+    dyn Fn(
+            zerofs::catalog::LeaseGrant,
+            chrono::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            zerofs::catalog::LeaseGrant,
+                            BranchWriterRenewalFailure,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+struct BranchWriterRenewalFailure {
+    latest: zerofs::catalog::LeaseGrant,
+    error: anyhow::Error,
+}
+
+fn branch_writer_renewal_safety_margin(lease_duration_seconds: u64) -> Duration {
+    Duration::from_millis((lease_duration_seconds.saturating_mul(100)).clamp(100, 30_000))
+}
+
+fn branch_writer_time_to_safety_deadline(
+    grant: &zerofs::catalog::LeaseGrant,
+    safety_margin: Duration,
+) -> Result<Duration> {
+    let renew_by = grant.lease.expires_at
+        - chrono::Duration::from_std(safety_margin)
+            .expect("bounded renewal safety margin fits chrono");
+    (renew_by - chrono::Utc::now())
+        .to_std()
+        .ok()
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("configured branch writer reached its renewal deadline"))
+}
+
+async fn confirm_branch_writer_before_serving<F>(
+    current: &zerofs::catalog::LeaseGrant,
+    safety_margin: Duration,
+    attempt: F,
+) -> Result<zerofs::catalog::LeaseGrant>
+where
+    F: std::future::Future<Output = Result<zerofs::catalog::LeaseGrant>>,
+{
+    let timeout = branch_writer_time_to_safety_deadline(current, safety_margin)?
+        .min(BRANCH_INITIAL_RENEWAL_TIMEOUT);
+    tokio::time::timeout(timeout, attempt)
+        .await
+        .context("Initial configured branch writer renewal timed out")?
+}
+
+async fn recover_branch_writer_bounded<F>(
+    timeout: Duration,
+    recovery: F,
+) -> Result<zerofs::catalog::LeaseGrant>
+where
+    F: std::future::Future<Output = Result<zerofs::catalog::LeaseGrant>>,
+{
+    tokio::time::timeout(timeout, recovery)
+        .await
+        .context("Exact configured branch writer reconciliation timed out")?
+}
+
+type BranchWriterReconciler = Arc<
+    dyn Fn(
+            zerofs::catalog::LeaseGrant,
+            chrono::Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<zerofs::catalog::LeaseGrant>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+impl BranchWriterLeaseSupervisor {
+    async fn start(
+        runtime: crate::cli::init::CatalogRuntime,
+        config: crate::config::ServerBranchMountConfig,
+        mount: zerofs::catalog::ServerWriterMountPreparation,
+    ) -> Result<Self> {
+        let lease_duration_seconds = config.lease_duration_seconds;
+        let duration = chrono::Duration::seconds(lease_duration_seconds as i64);
+        // Confirm and extend authority synchronously before any listener can
+        // acknowledge a request. This also catches a lease that expired during
+        // database and filesystem assembly.
+        let initial = confirm_branch_writer_before_serving(
+            &mount.grant,
+            branch_writer_renewal_safety_margin(lease_duration_seconds),
+            runtime.renew_writer_mount(&mount.grant, duration),
+        )
+        .await?;
+        let reconcile_runtime = runtime.clone();
+        let reconciler: BranchWriterReconciler = Arc::new(move |current, duration| {
+            let runtime = reconcile_runtime.clone();
+            Box::pin(async move { runtime.recover_writer_mount(&current, duration).await })
+        });
+        let renewer: BranchWriterRenewer = Arc::new(move |current, duration| {
+            let runtime = runtime.clone();
+            Box::pin(async move {
+                match runtime.renew_writer_mount(&current, duration).await {
+                    Ok(renewed) => Ok(renewed),
+                    Err(error) => {
+                        // Renewal may have committed before its response was
+                        // lost. Recover the deterministic exact capability so
+                        // shutdown publishes with the latest known revision.
+                        let latest = match runtime.recover_writer_mount(&current, duration).await {
+                            Ok(recovered) => recovered,
+                            Err(reconcile_error) => {
+                                tracing::warn!(
+                                    "configured branch renewal failure could not reconcile the exact latest grant: {reconcile_error:#}"
+                                );
+                                current.clone()
+                            }
+                        };
+                        Err(BranchWriterRenewalFailure { latest, error })
+                    }
+                }
+            })
+        });
+        let mut supervisor =
+            Self::spawn_after_confirmation(initial, lease_duration_seconds, renewer);
+        supervisor.reconciler = Some(reconciler);
+        Ok(supervisor)
+    }
+
+    fn spawn_after_confirmation(
+        initial: zerofs::catalog::LeaseGrant,
+        lease_duration_seconds: u64,
+        renewer: BranchWriterRenewer,
+    ) -> Self {
+        let grant = Arc::new(tokio::sync::Mutex::new(initial));
+        let stop = CancellationToken::new();
+        let lost = CancellationToken::new();
+        let task_grant = Arc::clone(&grant);
+        let task_stop = stop.clone();
+        let task_lost = lost.clone();
+        let duration = chrono::Duration::seconds(lease_duration_seconds as i64);
+        let interval =
+            Duration::from_millis((lease_duration_seconds.saturating_mul(1_000) / 3).max(100));
+        let safety_margin = branch_writer_renewal_safety_margin(lease_duration_seconds);
+        let worker_stop = task_stop.clone();
+        let worker_lost = task_lost.clone();
+        let worker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = worker_stop.cancelled() => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let current = task_grant.lock().await.clone();
+                let remaining = match branch_writer_time_to_safety_deadline(&current, safety_margin)
+                {
+                    Ok(remaining) => remaining,
+                    Err(_) => {
+                        tracing::error!(
+                            "configured branch writer lease reached its renewal safety deadline; stopping serving"
+                        );
+                        worker_lost.cancel();
+                        return;
+                    }
+                };
+                let outcome = tokio::select! {
+                    biased;
+                    _ = worker_stop.cancelled() => return,
+                    outcome = tokio::time::timeout(remaining, renewer(current, duration)) => outcome,
+                };
+                match outcome {
+                    Ok(Ok(renewed)) => *task_grant.lock().await = renewed,
+                    Ok(Err(failure)) => {
+                        *task_grant.lock().await = failure.latest;
+                        tracing::error!(
+                            "configured branch writer lease renewal failed; stopping serving: {:#}",
+                            failure.error
+                        );
+                        worker_lost.cancel();
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "configured branch writer lease renewal did not finish before the safety deadline; stopping serving"
+                        );
+                        worker_lost.cancel();
+                        return;
+                    }
+                }
+            }
+        });
+        // A panic or any unexpected worker exit revokes serving. A clean stop
+        // cancels the stop token before waiting for this monitor.
+        let task = tokio::spawn(async move {
+            match worker.await {
+                Ok(()) if task_stop.is_cancelled() => {}
+                Ok(()) => task_lost.cancel(),
+                Err(error) => {
+                    tracing::error!(
+                        "configured branch writer renewal task exited unexpectedly; stopping serving: {error}"
+                    );
+                    task_lost.cancel();
+                }
+            }
+        });
+        Self {
+            grant,
+            stop,
+            lost,
+            task,
+            duration,
+            reconciler: None,
+        }
+    }
+
+    fn loss_token(&self) -> CancellationToken {
+        self.lost.clone()
+    }
+
+    async fn stop(self) -> zerofs::catalog::LeaseGrant {
+        self.stop.cancel();
+        let _ = self.task.await;
+        let current = self.grant.lock().await.clone();
+        let Some(reconciler) = self.reconciler else {
+            return current;
+        };
+        match recover_branch_writer_bounded(
+            BRANCH_RENEWAL_RECONCILE_TIMEOUT,
+            reconciler(current.clone(), self.duration),
+        )
+        .await
+        {
+            Ok(recovered)
+                if recovered.lease.id == current.lease.id
+                    && recovered.renewal_token == current.renewal_token =>
+            {
+                recovered
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "exact branch writer reconciliation returned a different capability; retaining the prior grant"
+                );
+                current
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "exact branch writer reconciliation before publication failed: {error:#}"
+                );
+                current
+            }
+        }
+    }
+}
+
+async fn close_unserved_filesystem(
+    fs: &ZeroFS,
+    db_mode: DatabaseMode,
+    catalog_runtime: Option<&crate::cli::init::CatalogRuntime>,
+    branch_writer: Option<BranchWriterLeaseSupervisor>,
+    branch_grant: Option<zerofs::catalog::LeaseGrant>,
+) -> Result<()> {
+    let branch_grant = match (branch_writer, branch_grant) {
+        (Some(writer), None) => Some(writer.stop().await),
+        (None, grant) => grant,
+        (Some(_), Some(_)) => anyhow::bail!("duplicate branch writer close authority"),
+    };
+    let data_close = if db_mode.is_read_only() {
+        fs.db.close().await
+    } else {
+        fs.flush_coordinator
+            .close()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    if let Err(error) = data_close {
+        let _ = close_catalog_runtime(catalog_runtime).await;
+        return Err(error).context("Failed to close initialized but unserved database");
+    }
+    let publication_result = match (catalog_runtime, branch_grant.as_ref()) {
+        (Some(runtime), Some(grant)) => runtime.publish_writer_head(grant).await,
+        _ => Ok(()),
+    };
+    let catalog_close_result = close_catalog_runtime(catalog_runtime).await;
+    if let Err(publication_error) = publication_result {
+        if let Err(catalog_error) = catalog_close_result {
+            tracing::warn!(
+                "authoritative catalog close also failed after writer-head publication error: {catalog_error:#}"
+            );
+        }
+        return Err(publication_error);
+    }
+    catalog_close_result
 }
 
 const STARTUP_BANNER: &str = r#"
@@ -897,6 +1202,17 @@ pub async fn run_server(
         Some(shared_maintenance_runtime().clone())
     };
 
+    let any_server = settings.servers.nfs.is_some()
+        || settings.servers.ninep.is_some()
+        || settings.servers.nbd.is_some()
+        || settings.servers.rpc.is_some()
+        || (cfg!(feature = "webui") && settings.servers.webui.is_some());
+    if !any_server {
+        anyhow::bail!(
+            "No servers configured. At least one server (NFS, 9P, NBD, RPC, or enabled WebUI) must be enabled."
+        );
+    }
+
     // Register fallible process-signal state before opening either SlateDB
     // database so an unsupported/broken signal backend cannot strand a writer.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -907,10 +1223,66 @@ pub async fn run_server(
     let fs = init_result.fs;
     let authority = init_result.authority;
     let catalog_runtime = init_result.catalog_runtime;
+    let mut branch_writer = match (catalog_runtime.as_ref(), init_result.branch_mount) {
+        (Some(runtime), Some(mount)) => {
+            let fallback_grant = mount.preparation.grant.clone();
+            match BranchWriterLeaseSupervisor::start(
+                runtime.clone(),
+                mount.config.clone(),
+                mount.preparation,
+            )
+            .await
+            {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    let duration =
+                        chrono::Duration::seconds(mount.config.lease_duration_seconds as i64);
+                    let current_grant = match recover_branch_writer_bounded(
+                        BRANCH_RENEWAL_RECONCILE_TIMEOUT,
+                        runtime.recover_writer_mount(&fallback_grant, duration),
+                    )
+                    .await
+                    {
+                        Ok(recovered) => recovered,
+                        Err(reconcile_error) => {
+                            tracing::warn!(
+                                "initial branch renewal failure could not reconcile the exact grant before close: {reconcile_error:#}"
+                            );
+                            fallback_grant
+                        }
+                    };
+                    close_unserved_filesystem(
+                        &fs,
+                        db_mode,
+                        Some(runtime),
+                        None,
+                        Some(current_grant),
+                    )
+                    .await?;
+                    return Err(error).context(
+                        "Configured branch writer authority could not be confirmed before serving",
+                    );
+                }
+            }
+        }
+        (None, None) | (Some(_), None) => None,
+        (None, Some(_)) => anyhow::bail!("configured branch mount lost its catalog runtime"),
+    };
     let leadership_deposed = authority
         .as_ref()
         .map_or_else(CancellationToken::new, |authority| authority.loss_token());
     let shutdown = leadership_deposed.child_token();
+    let branch_lease_lost = branch_writer
+        .as_ref()
+        .map_or_else(CancellationToken::new, |writer| writer.loss_token());
+    if branch_writer.is_some() {
+        let loss = branch_lease_lost.clone();
+        let serving_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loss.cancelled().await;
+            serving_shutdown.cancel();
+        });
+    }
 
     // Do not start listeners after authority was revoked during initialization.
     if leadership_deposed.is_cancelled() {
@@ -921,7 +1293,14 @@ pub async fn run_server(
         && settings.servers.nbd.is_some()
         && let Err(error) = ensure_nbd_directory(&fs).await
     {
-        close_catalog_runtime(catalog_runtime.as_ref()).await?;
+        close_unserved_filesystem(
+            &fs,
+            db_mode,
+            catalog_runtime.as_ref(),
+            branch_writer.take(),
+            None,
+        )
+        .await?;
         return Err(error);
     }
 
@@ -1112,12 +1491,21 @@ pub async fn run_server(
     server_handles.extend(webui_handles);
 
     if server_handles.is_empty() {
-        close_catalog_runtime(catalog_runtime.as_ref()).await?;
+        shutdown.cancel();
+        close_unserved_filesystem(
+            &fs,
+            db_mode,
+            catalog_runtime.as_ref(),
+            branch_writer.take(),
+            None,
+        )
+        .await?;
         return Err(anyhow::anyhow!(
             "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
         ));
     }
 
+    let mut branch_lease_failed = false;
     let deposed = tokio::select! {
         biased;
         _ = leadership_deposed.cancelled() => {
@@ -1126,6 +1514,13 @@ pub async fn run_server(
                  the stale database"
             );
             true
+        }
+        _ = branch_lease_lost.cancelled(), if branch_writer.is_some() => {
+            branch_lease_failed = true;
+            tracing::error!(
+                "configured branch writer authority was lost; initiating graceful close"
+            );
+            false
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, initiating graceful shutdown...");
@@ -1206,6 +1601,10 @@ pub async fn run_server(
     if leadership_deposed.is_cancelled() {
         return Err(leadership_lost_error());
     }
+    let branch_grant = match branch_writer.take() {
+        Some(writer) => Some(writer.stop().await),
+        None => None,
+    };
     info!("Performing final flush and closing database...");
     if db_mode.is_read_only() {
         if let Err(e) = fs.db.close().await {
@@ -1236,6 +1635,10 @@ pub async fn run_server(
         return Err(leadership_lost_error());
     }
 
+    let publication_result = match (catalog_runtime.as_ref(), branch_grant.as_ref()) {
+        (Some(runtime), Some(grant)) => runtime.publish_writer_head(grant).await,
+        _ => Ok(()),
+    };
     let catalog_close_result = close_catalog_runtime(catalog_runtime.as_ref()).await;
 
     // Retain authority monitors until both data and catalog databases close.
@@ -1246,7 +1649,19 @@ pub async fn run_server(
         // The catalog is already closed above.
         return Err(leadership_lost_error());
     }
+    if let Err(publication_error) = publication_result {
+        if let Err(catalog_error) = catalog_close_result {
+            tracing::warn!(
+                "authoritative catalog close also failed after writer-head publication error: {catalog_error:#}"
+            );
+        }
+        return Err(publication_error);
+    }
     catalog_close_result?;
+
+    if branch_lease_failed {
+        anyhow::bail!("configured branch writer lease renewal failed while serving");
+    }
 
     info!("Shutdown complete");
     Ok(())
@@ -1255,6 +1670,181 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+    use zerofs::catalog::{
+        DurableRoot, LeaseAccessMode, LeaseGrant, LeaseRecord, LeaseSubjectKind,
+    };
+
+    fn test_branch_writer_grant(expires_after: chrono::Duration) -> LeaseGrant {
+        let now = chrono::Utc::now();
+        LeaseGrant {
+            lease: LeaseRecord {
+                id: Uuid::new_v4(),
+                revision: 2,
+                subject_kind: LeaseSubjectKind::Branch,
+                subject_id: Uuid::new_v4(),
+                root: DurableRoot {
+                    identity: "branch".to_string(),
+                    manifest_id: "root".to_string(),
+                },
+                access_mode: LeaseAccessMode::Write,
+                token_hash: "test".to_string(),
+                issued_at: now,
+                updated_at: now,
+                expires_at: now + expires_after,
+            },
+            renewal_token: Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_branch_writer_confirmation_times_out_then_recovers_applied_revision() {
+        let initial = test_branch_writer_grant(chrono::Duration::milliseconds(250));
+        let applied = Arc::new(tokio::sync::Mutex::new(initial.clone()));
+        let attempt_applied = Arc::clone(&applied);
+        let attempt = async move {
+            attempt_applied.lock().await.lease.revision = 9;
+            std::future::pending::<Result<LeaseGrant>>().await
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            confirm_branch_writer_before_serving(&initial, Duration::from_millis(100), attempt),
+        )
+        .await
+        .expect("initial renewal confirmation must be bounded")
+        .expect_err("stalled initial renewal must not be treated as confirmed");
+
+        let recovered = recover_branch_writer_bounded(Duration::from_millis(100), async {
+            Ok(applied.lock().await.clone())
+        })
+        .await
+        .expect("exact recovery should retain an applied renewal revision");
+        assert_eq!(recovered.lease.id, initial.lease.id);
+        assert_eq!(recovered.renewal_token, initial.renewal_token);
+        assert_eq!(recovered.lease.revision, 9);
+    }
+
+    #[tokio::test]
+    async fn initial_branch_writer_recovery_is_bounded() {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            recover_branch_writer_bounded(
+                Duration::from_millis(50),
+                std::future::pending::<Result<LeaseGrant>>(),
+            ),
+        )
+        .await
+        .expect("outer test timeout must not fire")
+        .expect_err("stalled exact recovery must time out");
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_renews_and_returns_latest_grant() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let initial = test_branch_writer_grant(chrono::Duration::seconds(1));
+        let renewals = Arc::new(AtomicU64::new(0));
+        let renewer: BranchWriterRenewer = Arc::new(move |mut grant, duration| {
+            let renewals = Arc::clone(&renewals);
+            Box::pin(async move {
+                renewals.fetch_add(1, Ordering::SeqCst);
+                grant.lease.revision += 1;
+                grant.lease.updated_at = chrono::Utc::now();
+                grant.lease.expires_at = grant.lease.updated_at + duration;
+                Ok(grant)
+            })
+        });
+        let supervisor = BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 1, renewer);
+        let lost = supervisor.loss_token();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let latest = supervisor.stop().await;
+        assert!(latest.lease.revision >= 3);
+        assert!(latest.lease.expires_at > chrono::Utc::now());
+        assert!(!lost.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_retains_reconciled_grant_on_renewal_failure() {
+        let initial = test_branch_writer_grant(chrono::Duration::seconds(1));
+        let renewer: BranchWriterRenewer = Arc::new(move |mut grant, _| {
+            Box::pin(async move {
+                grant.lease.revision = 9;
+                Err(BranchWriterRenewalFailure {
+                    latest: grant,
+                    error: anyhow::anyhow!("lost renewal response"),
+                })
+            })
+        });
+        let supervisor = BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 0, renewer);
+        let lost = supervisor.loss_token();
+        tokio::time::timeout(Duration::from_millis(500), lost.cancelled())
+            .await
+            .expect("renewal failure must revoke serving");
+        assert_eq!(supervisor.stop().await.lease.revision, 9);
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_bounds_stalled_renewal_and_shutdown() {
+        let initial = test_branch_writer_grant(chrono::Duration::milliseconds(250));
+        let renewer: BranchWriterRenewer = Arc::new(move |_, _| {
+            Box::pin(std::future::pending::<
+                std::result::Result<LeaseGrant, BranchWriterRenewalFailure>,
+            >())
+        });
+        let mut supervisor =
+            BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 0, renewer);
+        supervisor.reconciler = Some(Arc::new(move |mut grant, _| {
+            Box::pin(async move {
+                grant.lease.revision = 9;
+                Ok(grant)
+            })
+        }));
+        let lost = supervisor.loss_token();
+        tokio::time::timeout(Duration::from_millis(500), lost.cancelled())
+            .await
+            .expect("stalled renewal must revoke serving before confirmed expiry");
+        let latest = tokio::time::timeout(Duration::from_millis(500), supervisor.stop())
+            .await
+            .expect("stalled renewal must not hang shutdown");
+        assert_eq!(latest.lease.revision, 9);
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_reconciles_clean_stop_cancellation() {
+        let initial = test_branch_writer_grant(chrono::Duration::seconds(1));
+        let renewer: BranchWriterRenewer = Arc::new(move |_, _| {
+            Box::pin(std::future::pending::<
+                std::result::Result<LeaseGrant, BranchWriterRenewalFailure>,
+            >())
+        });
+        let mut supervisor =
+            BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 0, renewer);
+        supervisor.reconciler = Some(Arc::new(move |mut grant, _| {
+            Box::pin(async move {
+                grant.lease.revision = 7;
+                Ok(grant)
+            })
+        }));
+        assert_eq!(supervisor.stop().await.lease.revision, 7);
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_revokes_serving_when_worker_panics() {
+        let initial = test_branch_writer_grant(chrono::Duration::seconds(1));
+        let renewer: BranchWriterRenewer = Arc::new(move |_, _| {
+            Box::pin(async move {
+                panic!("injected renewal panic");
+            })
+        });
+        let supervisor = BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 0, renewer);
+        let lost = supervisor.loss_token();
+        tokio::time::timeout(Duration::from_millis(500), lost.cancelled())
+            .await
+            .expect("renewal worker panic must revoke serving");
+        tokio::time::timeout(Duration::from_millis(500), supervisor.stop())
+            .await
+            .expect("panicked renewal worker must not hang shutdown");
+    }
 
     #[test]
     fn barrier_controlled_flush_thresholds_are_valid() {

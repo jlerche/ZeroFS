@@ -29,16 +29,86 @@ use std::sync::Arc;
 use tokio::sync::{Notify, watch};
 use tracing::info;
 
+#[derive(Clone)]
 pub(crate) struct CatalogRuntime {
-    #[allow(dead_code)] // Consumed by lifecycle APIs and mount wiring as they land.
     lifecycle: zerofs::catalog::BranchLifecycle,
-    #[allow(dead_code)]
     volume_id: uuid::Uuid,
-    #[allow(dead_code)]
     projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
 }
 
 impl CatalogRuntime {
+    pub(crate) async fn prepare_writer_mount(
+        &self,
+        config: &crate::config::ServerBranchMountConfig,
+    ) -> Result<zerofs::catalog::ServerWriterMountPreparation> {
+        self.lifecycle
+            .prepare_server_writer_mount(server_writer_mount_request(config))
+            .await
+            .context("Failed to prepare configured branch writer mount")
+    }
+
+    pub(crate) async fn renew_writer_mount(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+        duration: chrono::Duration,
+    ) -> Result<zerofs::catalog::LeaseGrant> {
+        let lease = self
+            .lifecycle
+            .leases()
+            .renew(zerofs::catalog::LeaseRenewRequest {
+                lease_id: grant.lease.id,
+                expected_revision: grant.lease.revision,
+                renewal_token: grant.renewal_token,
+                duration,
+            })
+            .await
+            .context("Failed to renew configured branch writer lease")?;
+        Ok(zerofs::catalog::LeaseGrant {
+            lease,
+            renewal_token: grant.renewal_token,
+        })
+    }
+
+    pub(crate) async fn recover_writer_mount(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+        duration: chrono::Duration,
+    ) -> Result<zerofs::catalog::LeaseGrant> {
+        self.lifecycle
+            .leases()
+            .recover_writer(zerofs::catalog::LeaseAcquireRequest {
+                lease_id: grant.lease.id,
+                renewal_token: grant.renewal_token,
+                subject_id: grant.lease.subject_id,
+                access_mode: zerofs::catalog::LeaseAccessMode::Write,
+                duration,
+            })
+            .await
+            .context("Failed to reconcile exact configured branch writer lease")
+    }
+
+    pub(crate) async fn publish_writer_head(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+    ) -> Result<()> {
+        self.lifecycle
+            .publish_writer_head(grant)
+            .await
+            .context("Failed to publish configured branch writer head")?;
+        if let Some(projection) = &self.projection {
+            if let Err(error) = self
+                .lifecycle
+                .reconcile_projection(self.volume_id, projection.as_ref())
+                .await
+            {
+                tracing::warn!(
+                    "Customer catalog projection reconciliation after head publication failed; authoritative SlateDB remains current: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn close(&self) -> Result<()> {
         self.lifecycle
             .close()
@@ -47,9 +117,27 @@ impl CatalogRuntime {
     }
 }
 
+fn server_writer_mount_request(
+    config: &crate::config::ServerBranchMountConfig,
+) -> zerofs::catalog::ServerWriterMountRequest {
+    zerofs::catalog::ServerWriterMountRequest {
+        branch_name: config.branch_name.clone(),
+        branch_id: config.expected_branch_id,
+        server_id: config.server_id,
+        renewal_secret: config.renewal_secret,
+        duration: chrono::Duration::seconds(config.lease_duration_seconds as i64),
+    }
+}
+
+pub(crate) struct ConfiguredBranchMount {
+    pub(crate) config: crate::config::ServerBranchMountConfig,
+    pub(crate) preparation: zerofs::catalog::ServerWriterMountPreparation,
+}
+
 async fn open_catalog_runtime(
     config: Option<&crate::config::BranchCatalogConfig>,
     object_store: Arc<dyn object_store::ObjectStore>,
+    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     database_path: &str,
     segment_pool_path: Option<&str>,
     db_mode: DatabaseMode,
@@ -84,7 +172,12 @@ async fn open_catalog_runtime(
     }
     let lifecycle = config
         .authority
-        .open_branch_lifecycle(object_store, branch_database_root, Path::from(pool))
+        .open_branch_lifecycle_with_wal(
+            object_store,
+            wal_object_store,
+            branch_database_root,
+            Path::from(pool),
+        )
         .await
         .context("Failed to open authoritative SlateDB branch catalog")?;
     let projection = match config.projection.open().await {
@@ -140,6 +233,8 @@ struct StartupContext {
     recovering_handoff: bool,
     /// Opening capability retained across writer-open retries.
     opening: Option<crate::replication::leader_record::OpeningToken>,
+    catalog_runtime: Option<CatalogRuntime>,
+    branch_mount: Option<ConfiguredBranchMount>,
 }
 
 /// Receiver handles carried through role election and takeover reconciliation.
@@ -260,7 +355,16 @@ impl StartupContext {
             settings.storage.storage_class.as_deref(),
         );
 
-        let actual_db_path = path_from_url.to_string();
+        // Trace the authoritative catalog and data database through the same
+        // bottom-of-stack wrapper.
+        let object_tracer = ObjectTracer::new();
+        let object_store = Arc::new(TracingObjectStore::new(
+            object_store,
+            object_tracer.clone(),
+            "data",
+        )) as Arc<dyn object_store::ObjectStore>;
+
+        let configured_db_path = path_from_url.to_string();
         let segment_pool_path = settings
             .storage
             .segment_pool_path
@@ -269,6 +373,43 @@ impl StartupContext {
             .transpose()
             .context("Invalid storage.segment_pool_path")?
             .map(|path| path.to_string());
+        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
+            if let Some(wal_config) = &settings.wal {
+                info!("Using separate WAL object store: {}", wal_config.url);
+                let wal = parse_wal_object_store(wal_config)
+                    .context("Failed to connect to WAL object store")?;
+                Some(
+                    Arc::new(TracingObjectStore::new(wal, object_tracer.clone(), "wal"))
+                        as Arc<dyn object_store::ObjectStore>,
+                )
+            } else {
+                None
+            };
+        let catalog_runtime = open_catalog_runtime(
+            settings.catalog.as_ref(),
+            Arc::clone(&object_store),
+            wal_object_store.clone(),
+            &configured_db_path,
+            segment_pool_path.as_deref(),
+            db_mode,
+        )
+        .await?;
+        let branch_mount_config = settings
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.mount.clone())
+            .filter(|_| !db_mode.is_read_only());
+        let branch_mount = match (&catalog_runtime, branch_mount_config) {
+            (Some(runtime), Some(config)) => Some(ConfiguredBranchMount {
+                preparation: runtime.prepare_writer_mount(&config).await?,
+                config,
+            }),
+            (None, Some(_)) => anyhow::bail!("configured branch mount requires catalog runtime"),
+            _ => None,
+        };
+        let actual_db_path = branch_mount.as_ref().map_or(configured_db_path, |mount| {
+            mount.preparation.grant.lease.root.identity.clone()
+        });
         if let Some(pool) = &segment_pool_path {
             let database = Path::from(actual_db_path.clone());
             let pool_path = Path::from(pool.clone());
@@ -365,17 +506,6 @@ impl StartupContext {
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
-        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-            if let Some(wal_config) = &settings.wal {
-                info!("Using separate WAL object store: {}", wal_config.url);
-                Some(
-                    parse_wal_object_store(wal_config)
-                        .context("Failed to connect to WAL object store")?,
-                )
-            } else {
-                None
-            };
-
         let replication_params = settings
             .replication
             .as_ref()
@@ -385,21 +515,6 @@ impl StartupContext {
         // Shared by request handling and takeover reconciliation.
         let dedup = Arc::new(crate::dedup::DedupCache::new());
         dedup.start_expiry_reaper();
-
-        // Trace at the bottom of the stack so otrace sees the requests that
-        // actually leave the process. Everything above (length-check, prefetch,
-        // compactor) reads through these wrappers; cache hits make no backend
-        // request and so produce no event.
-        let object_tracer = ObjectTracer::new();
-        let object_store = Arc::new(TracingObjectStore::new(
-            object_store,
-            object_tracer.clone(),
-            "data",
-        )) as Arc<dyn object_store::ObjectStore>;
-        let wal_object_store = wal_object_store.map(|s| {
-            Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
-                as Arc<dyn object_store::ObjectStore>
-        });
 
         Ok(Self {
             retrying_object_store: Arc::new(
@@ -426,6 +541,8 @@ impl StartupContext {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
+            catalog_runtime,
+            branch_mount,
         })
     }
 
@@ -983,6 +1100,18 @@ impl DbOpen {
 }
 
 impl ReconciledDb {
+    async fn close_for_branch_recovery(self) -> Result<()> {
+        match self.open.slatedb {
+            SlateDbHandle::ReadWrite(db) => db
+                .close()
+                .await
+                .context("Failed to close recovery writer before branch head publication"),
+            SlateDbHandle::ReadOnly(_) => {
+                anyhow::bail!("branch writer recovery requires a writable data database")
+            }
+        }
+    }
+
     async fn into_filesystem(
         self,
         mut startup: StartupContext,
@@ -1025,7 +1154,7 @@ impl ReconciledDb {
             wal_object_store,
             object_tracer,
             actual_db_path,
-            segment_pool_path,
+            segment_pool_path: _,
             segment_pool_authority,
             block_transformer: _,
             segment_codec,
@@ -1038,6 +1167,8 @@ impl ReconciledDb {
             took_over_from_standby: _,
             recovering_handoff: _,
             opening: _,
+            catalog_runtime,
+            branch_mount,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -1250,17 +1381,6 @@ impl ReconciledDb {
             );
         }
 
-        // This is the final fallible serving-assembly step. Catalog use is
-        // rejected with HA replication until it can share one writer domain.
-        let catalog_runtime = open_catalog_runtime(
-            settings.catalog.as_ref(),
-            Arc::clone(&object_store),
-            &actual_db_path,
-            segment_pool_path.as_deref(),
-            db_mode,
-        )
-        .await?;
-
         Ok(InitResult {
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
@@ -1272,6 +1392,7 @@ impl ReconciledDb {
             db_handle,
             authority,
             catalog_runtime,
+            branch_mount,
         })
     }
 }
@@ -1298,6 +1419,46 @@ pub async fn initialize_filesystem(
             };
             match db.reconcile_tail(&mut startup).await? {
                 ReconcileOutcome::Reconciled(db) => {
+                    if startup.branch_mount.as_ref().is_some_and(|mount| {
+                        mount.preparation.disposition
+                            == zerofs::catalog::ServerWriterMountDisposition::RecoveryRequired
+                    }) {
+                        db.close_for_branch_recovery().await?;
+                        let runtime = startup.catalog_runtime.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("branch recovery lost catalog runtime")
+                        })?;
+                        let expired = startup
+                            .branch_mount
+                            .as_ref()
+                            .expect("recovery disposition checked above")
+                            .preparation
+                            .grant
+                            .clone();
+                        runtime.publish_writer_head(&expired).await?;
+                        let config = &startup
+                            .branch_mount
+                            .as_ref()
+                            .expect("recovery disposition checked above")
+                            .config;
+                        let fresh = runtime.prepare_writer_mount(config).await?;
+                        if fresh.disposition != zerofs::catalog::ServerWriterMountDisposition::Fresh
+                        {
+                            anyhow::bail!(
+                                "branch recovery did not advance to a fresh writer capability"
+                            );
+                        }
+                        if fresh.grant.lease.root.identity != startup.actual_db_path {
+                            anyhow::bail!(
+                                "branch recovery unexpectedly changed the physical database identity"
+                            );
+                        }
+                        startup
+                            .branch_mount
+                            .as_mut()
+                            .expect("recovery disposition checked above")
+                            .preparation = fresh;
+                        continue;
+                    }
                     return (*db).into_filesystem(startup, settings).await;
                 }
                 ReconcileOutcome::RetryRole => continue 'role_election,
@@ -1377,6 +1538,7 @@ mod role_decision_tests {
         let runtime = open_catalog_runtime(
             Some(&config),
             Arc::clone(&store),
+            None,
             "runtime/live",
             Some("runtime/segments"),
             DatabaseMode::ReadWrite,
@@ -1408,6 +1570,7 @@ mod role_decision_tests {
         let fallback = open_catalog_runtime(
             Some(&unavailable_projection),
             store,
+            None,
             "runtime/live",
             Some("runtime/segments"),
             DatabaseMode::ReadWrite,
@@ -1436,6 +1599,7 @@ mod role_decision_tests {
         let error = open_catalog_runtime(
             Some(&overlapping),
             Arc::new(InMemory::new()),
+            None,
             "runtime/live",
             Some("runtime/segments"),
             DatabaseMode::ReadWrite,
@@ -1448,6 +1612,7 @@ mod role_decision_tests {
         let read_only = open_catalog_runtime(
             Some(&overlapping),
             Arc::new(InMemory::new()),
+            None,
             "runtime/live",
             Some("runtime/segments"),
             DatabaseMode::ReadOnly,
@@ -1564,6 +1729,8 @@ mod role_decision_tests {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
+            catalog_runtime: None,
+            branch_mount: None,
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;

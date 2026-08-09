@@ -112,6 +112,22 @@ impl CatalogConfig {
         branch_database_root: slatedb::object_store::path::Path,
         segment_pool_path: slatedb::object_store::path::Path,
     ) -> Result<BranchLifecycle, BranchLifecycleError> {
+        self.open_branch_lifecycle_with_wal(
+            object_store,
+            None,
+            branch_database_root,
+            segment_pool_path,
+        )
+        .await
+    }
+
+    pub async fn open_branch_lifecycle_with_wal(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        wal_object_store: Option<Arc<dyn ObjectStore>>,
+        branch_database_root: slatedb::object_store::path::Path,
+        segment_pool_path: slatedb::object_store::path::Path,
+    ) -> Result<BranchLifecycle, BranchLifecycleError> {
         let catalog_path = slatedb::object_store::path::Path::from(self.slatedb_path.as_str());
         root_store::ensure_database_namespaces_disjoint(
             "catalog",
@@ -133,10 +149,14 @@ impl CatalogConfig {
         )?;
         let catalog: Arc<dyn Catalog> =
             Arc::new(SlateDbCatalog::open(catalog_path, Arc::clone(&object_store)).await?);
+        let mut roots = SlateDbRootStore::new(object_store, branch_database_root)
+            .with_segment_pool_root(segment_pool_path);
+        if let Some(wal_object_store) = wal_object_store {
+            roots = roots.with_wal_object_store(wal_object_store);
+        }
         Ok(BranchLifecycle::new_with_features(
             catalog,
-            SlateDbRootStore::new(object_store, branch_database_root)
-                .with_segment_pool_root(segment_pool_path),
+            roots,
             self.features,
         ))
     }
