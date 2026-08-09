@@ -1372,6 +1372,7 @@ mod role_decision_tests {
                 path: projection_path.clone(),
             },
             branch_database_root: "runtime/branches".to_string(),
+            mount: None,
         };
         let runtime = open_catalog_runtime(
             Some(&config),
@@ -1402,6 +1403,7 @@ mod role_decision_tests {
                 path: directory.path().to_path_buf(),
             },
             branch_database_root: "runtime/fallback-branches".to_string(),
+            mount: None,
         };
         let fallback = open_catalog_runtime(
             Some(&unavailable_projection),
@@ -1429,6 +1431,7 @@ mod role_decision_tests {
                 path: directory.path().join("overlap.json"),
             },
             branch_database_root: "runtime/other-branches".to_string(),
+            mount: None,
         };
         let error = open_catalog_runtime(
             Some(&overlapping),

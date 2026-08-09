@@ -384,6 +384,26 @@ pub struct BranchCatalogConfig {
     /// are created.
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub branch_database_root: String,
+    /// Optional single-node branch writer served by this process. Stable
+    /// server identity plus secret derive revision-scoped lease credentials,
+    /// allowing exact crash recovery without reusing a published lease UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<ServerBranchMountConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ServerBranchMountConfig {
+    pub branch_name: String,
+    pub expected_branch_id: uuid::Uuid,
+    pub server_id: uuid::Uuid,
+    pub renewal_secret: uuid::Uuid,
+    #[serde(default = "default_branch_mount_lease_seconds")]
+    pub lease_duration_seconds: u64,
+}
+
+const fn default_branch_mount_lease_seconds() -> u64 {
+    300
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1019,6 +1039,30 @@ impl Settings {
             if catalog.branch_database_root.trim().is_empty() {
                 anyhow::bail!("[catalog] branch_database_root must not be empty");
             }
+            if let Some(mount) = &catalog.mount {
+                if mount.branch_name.trim().is_empty() {
+                    anyhow::bail!("[catalog.mount] branch_name must not be empty");
+                }
+                if mount.expected_branch_id.is_nil()
+                    || mount.server_id.is_nil()
+                    || mount.renewal_secret.is_nil()
+                    || mount.expected_branch_id == mount.server_id
+                    || mount.expected_branch_id == mount.renewal_secret
+                    || mount.server_id == mount.renewal_secret
+                {
+                    anyhow::bail!(
+                        "[catalog.mount] branch, server, and renewal identities must be distinct and non-nil"
+                    );
+                }
+                if !(1..=300).contains(&mount.lease_duration_seconds) {
+                    anyhow::bail!("[catalog.mount] lease_duration_seconds must be within 1..=300");
+                }
+                if !catalog.authority.features.mount {
+                    anyhow::bail!(
+                        "[catalog.mount] requires catalog.authority.features.mount = true"
+                    );
+                }
+            }
             if self.storage.segment_pool_path.is_none() {
                 anyhow::bail!(
                     "[catalog] requires storage.segment_pool_path so every branch shares one physical inventory"
@@ -1191,6 +1235,12 @@ impl Settings {
         toml_string.push_str("# slatedb_path = \".zerofs/catalog\"\n");
         toml_string.push_str("# [catalog.authority.features]\n");
         toml_string.push_str("# create = false\n# mount = false\n# checkpoint_delete = false\n# branch_delete = false\n");
+        toml_string.push_str("# [catalog.mount]\n");
+        toml_string.push_str("# branch_name = \"main\"\n");
+        toml_string.push_str("# expected_branch_id = \"00000000-0000-4000-8000-000000000002\"\n");
+        toml_string.push_str("# server_id = \"00000000-0000-4000-8000-000000000003\"\n");
+        toml_string.push_str("# renewal_secret = \"00000000-0000-4000-8000-000000000004\"\n");
+        toml_string.push_str("# lease_duration_seconds = 300\n");
         toml_string.push_str("# [catalog.projection]\n");
         toml_string
             .push_str("# backend = \"json\"\n# path = \".zerofs/catalog-projection.json\"\n");
@@ -2171,6 +2221,13 @@ slatedb_path = "volume/catalog"
 
 [catalog.authority.features]
 mount = true
+
+[catalog.mount]
+branch_name = "customer-main"
+expected_branch_id = "22222222-2222-4222-8222-222222222222"
+server_id = "33333333-3333-4333-8333-333333333333"
+renewal_secret = "44444444-4444-4444-8444-444444444444"
+lease_duration_seconds = 120
 "#;
         let catalog = write_and_load(content).unwrap().catalog.unwrap();
         assert_eq!(
@@ -2180,6 +2237,9 @@ mount = true
         assert_eq!(catalog.authority.slatedb_path, "volume/catalog");
         assert!(catalog.authority.features.mount);
         assert!(!catalog.authority.features.create);
+        let mount = catalog.mount.unwrap();
+        assert_eq!(mount.branch_name, "customer-main");
+        assert_eq!(mount.lease_duration_seconds, 120);
         assert!(matches!(
             catalog.projection,
             zerofs::catalog::CatalogProjectionConfig::Json { .. }

@@ -7,6 +7,7 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -42,6 +43,28 @@ pub struct BranchMountGrant {
     pub branch_name: String,
     /// The data-plane capability carries the exact UUID and authenticated root.
     pub lease: LeaseGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerWriterMountRequest {
+    pub branch_name: String,
+    pub branch_id: Uuid,
+    pub server_id: Uuid,
+    pub renewal_secret: Uuid,
+    pub duration: chrono::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerWriterMountDisposition {
+    Fresh,
+    Resumed,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerWriterMountPreparation {
+    pub grant: LeaseGrant,
+    pub disposition: ServerWriterMountDisposition,
 }
 
 /// Server-owned release controls for customer-visible lifecycle operations.
@@ -281,6 +304,66 @@ impl BranchLifecycle {
         Ok(BranchMountGrant {
             branch_name: request.branch_name,
             lease: grant,
+        })
+    }
+
+    /// Resolve one configured server mount to a stable, revision-scoped writer
+    /// capability before the data database is opened.
+    ///
+    /// The server secret deterministically recovers the same lease after a
+    /// crash. Once a head publication advances the branch revision, the next
+    /// clean startup derives a fresh never-reused lease/token pair.
+    pub async fn prepare_server_writer_mount(
+        &self,
+        request: ServerWriterMountRequest,
+    ) -> Result<ServerWriterMountPreparation, BranchLifecycleError> {
+        if !self.features.mount {
+            return Err(BranchLifecycleError::FeatureDisabled("branch mount"));
+        }
+        validate_name(&request.branch_name)?;
+        if request.branch_id.is_nil()
+            || request.server_id.is_nil()
+            || request.renewal_secret.is_nil()
+            || request.branch_id == request.server_id
+            || request.branch_id == request.renewal_secret
+            || request.server_id == request.renewal_secret
+        {
+            return Err(CatalogError::Invalid(
+                "server mount identities must be distinct and non-nil".to_string(),
+            )
+            .into());
+        }
+        let branch = self
+            .catalog
+            .branch_by_name(&request.branch_name)
+            .await?
+            .filter(|branch| branch.id == request.branch_id && branch.state == BranchState::Ready)
+            .ok_or_else(|| {
+                CatalogError::NotFound(format!("{} ({})", request.branch_name, request.branch_id))
+            })?;
+        let lease_request = derive_server_lease_request(&request, branch.revision);
+        let leases = self.leases();
+        if self.catalog.lease(lease_request.lease_id).await?.is_some() {
+            let grant = leases.recover_writer(lease_request).await?;
+            if grant.lease.root
+                != branch
+                    .root
+                    .clone()
+                    .ok_or_else(|| CatalogError::OperationConflict(grant.lease.id.to_string()))?
+            {
+                return Err(CatalogError::OperationConflict(grant.lease.id.to_string()).into());
+            }
+            let disposition = if grant.lease.is_unexpired(catalog_timestamp(Utc::now())) {
+                ServerWriterMountDisposition::Resumed
+            } else {
+                ServerWriterMountDisposition::RecoveryRequired
+            };
+            return Ok(ServerWriterMountPreparation { grant, disposition });
+        }
+        let grant = leases.acquire_branch_record(branch, lease_request).await?;
+        Ok(ServerWriterMountPreparation {
+            grant,
+            disposition: ServerWriterMountDisposition::Fresh,
         })
     }
 
@@ -643,6 +726,34 @@ impl BranchLifecycle {
             )));
         }
         Ok(branch)
+    }
+}
+
+fn derive_server_lease_request(
+    request: &ServerWriterMountRequest,
+    branch_revision: u64,
+) -> LeaseAcquireRequest {
+    let derive = |label: &[u8]| {
+        let mut digest = Sha256::new();
+        digest.update(b"zerofs/server-writer-mount/v1\0");
+        digest.update(label);
+        digest.update(request.renewal_secret.as_bytes());
+        digest.update(request.server_id.as_bytes());
+        digest.update(request.branch_id.as_bytes());
+        digest.update(branch_revision.to_be_bytes());
+        let digest = digest.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes)
+    };
+    LeaseAcquireRequest {
+        lease_id: derive(b"lease"),
+        renewal_token: derive(b"renewal"),
+        subject_id: request.branch_id,
+        access_mode: LeaseAccessMode::Write,
+        duration: request.duration,
     }
 }
 
@@ -2078,35 +2189,49 @@ mod tests {
                 .unwrap(),
             Some(bytes::Bytes::from_static(b"after"))
         );
-        let next_request = BranchMountRequest {
+        let server_request = ServerWriterMountRequest {
             branch_name: "writable".to_string(),
-            lease: LeaseAcquireRequest {
-                lease_id: Uuid::new_v4(),
-                renewal_token: Uuid::new_v4(),
-                subject_id: branch_id,
-                access_mode: LeaseAccessMode::Write,
-                duration: chrono::Duration::microseconds(1),
-            },
+            branch_id,
+            server_id: Uuid::new_v4(),
+            renewal_secret: Uuid::new_v4(),
+            duration: chrono::Duration::seconds(1),
         };
-        let next_mount = lifecycle
-            .mount_branch_by_name(next_request.clone())
-            .await
-            .unwrap();
-        assert_eq!(next_mount.lease.lease.root, published.root.unwrap());
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let mut invalid_server_request = server_request.clone();
+        invalid_server_request.duration = chrono::Duration::zero();
         assert!(matches!(
-            lifecycle.mount_branch_by_name(next_request.clone()).await,
+            lifecycle
+                .prepare_server_writer_mount(invalid_server_request)
+                .await,
             Err(BranchLifecycleError::Lease(
-                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::OperationConflict(_))
+                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::Invalid(_))
             ))
         ));
+        let next_mount = lifecycle
+            .prepare_server_writer_mount(server_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(next_mount.disposition, ServerWriterMountDisposition::Fresh);
+        assert_eq!(next_mount.grant.lease.root, published.root.unwrap());
         assert_eq!(
             lifecycle
-                .leases()
-                .recover_writer(next_request.lease)
+                .prepare_server_writer_mount(server_request.clone())
                 .await
-                .expect("expired writer recovery must not extend the retained capability"),
-            next_mount.lease
+                .unwrap(),
+            ServerWriterMountPreparation {
+                grant: next_mount.grant.clone(),
+                disposition: ServerWriterMountDisposition::Resumed,
+            }
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert_eq!(
+            lifecycle
+                .prepare_server_writer_mount(server_request)
+                .await
+                .unwrap(),
+            ServerWriterMountPreparation {
+                grant: next_mount.grant,
+                disposition: ServerWriterMountDisposition::RecoveryRequired,
+            }
         );
         catalog.close().await.unwrap();
     }

@@ -83,6 +83,18 @@ impl LeaseLifecycle {
             .await?
             .filter(|branch| branch.id == request.subject_id)
             .ok_or_else(|| CatalogError::NotFound(format!("{name} ({})", request.subject_id)))?;
+        self.acquire_branch_record(branch, request).await
+    }
+
+    pub(crate) async fn acquire_branch_record(
+        &self,
+        branch: super::BranchRecord,
+        request: LeaseAcquireRequest,
+    ) -> Result<LeaseGrant, LeaseLifecycleError> {
+        validate_duration(request.duration)?;
+        if branch.id != request.subject_id || branch.state != super::BranchState::Ready {
+            return Err(CatalogError::OperationConflict(request.lease_id.to_string()).into());
+        }
         let root = branch
             .root
             .clone()

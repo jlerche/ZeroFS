@@ -46,7 +46,8 @@ pub use lifecycle::{
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchFeatureConfig,
     BranchInspection, BranchLifecycle, BranchLifecycleError, BranchLineageInspection,
     BranchMountGrant, BranchMountRequest, HistoricalResource, HistoricalResourceStatus,
-    MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
+    MAX_ADMINISTRATIVE_INSPECTION_RECORDS, ServerWriterMountDisposition,
+    ServerWriterMountPreparation, ServerWriterMountRequest,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
