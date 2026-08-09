@@ -21,7 +21,9 @@ mod write;
 
 pub use reclaim::{ChainOutcome, PassOutcome, PassStatus};
 #[allow(unused_imports)] // The standalone binary does not compile the catalog consumer.
-pub(crate) use reclaim::{PersistedPrivateGcArtifact, QUIESCENT_AFTER_DEFAULT};
+pub(crate) use reclaim::{
+    PersistedPrivateGcArtifact, PrivateGcCandidateOutcome, QUIESCENT_AFTER_DEFAULT,
+};
 
 use crate::db::{Db, ExtentRefGuard, Transaction};
 use crate::frame_codec::FrameCodec;
@@ -300,6 +302,11 @@ impl ExtentStore {
             branch_id,
             database_identity,
         })
+    }
+
+    #[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+    pub(crate) fn check_private_gc_serving_authority(&self) -> Result<(), FsError> {
+        self.db.check_serving_authority()
     }
 
     /// Rotate allocation to a previously reserved epoch while holding the

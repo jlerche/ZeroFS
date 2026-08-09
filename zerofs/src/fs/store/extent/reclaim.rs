@@ -165,6 +165,65 @@ pub(crate) struct DecodedPrivateGcArtifact {
     batch: PreparedPrivateGcBatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+pub(crate) enum PrivateGcCandidateOutcome {
+    Deleted { bytes: u64 },
+    AlreadyAbsent,
+}
+
+/// Exclusive reference-publication authority retained by the coordinator
+/// through final validation, physical deletion, absence confirmation, and the
+/// caller's durable progress publication.
+#[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+pub(crate) struct PrivateGcBarrier {
+    store: ExtentStore,
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+#[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+impl PrivateGcBarrier {
+    pub(crate) async fn delete_candidate(
+        &self,
+        candidate: &PrivateGcCandidate,
+    ) -> Result<PrivateGcCandidateOutcome, FsError> {
+        match self.store.verify_segment_reclaimable(candidate.segid).await {
+            SegmentDeadVerdict::Keep => Err(FsError::IoError),
+            SegmentDeadVerdict::ObjectAbsent => Ok(PrivateGcCandidateOutcome::AlreadyAbsent),
+            SegmentDeadVerdict::Reclaim => {
+                let Some(expected_identity) = candidate.object_identity.as_ref() else {
+                    return Err(FsError::IoError);
+                };
+                let current_identity = self
+                    .store
+                    .segment_store()
+                    .object_identity(candidate.segid)
+                    .await
+                    .map_err(|_| FsError::IoError)?;
+                if &current_identity != expected_identity {
+                    return Err(FsError::IoError);
+                }
+                self.store
+                    .segment_store()
+                    .delete_segment(candidate.segid)
+                    .await
+                    .map_err(|_| FsError::IoError)?;
+                match self
+                    .store
+                    .segment_store()
+                    .object_identity(candidate.segid)
+                    .await
+                {
+                    Err(SegmentStoreError::NotFound) => Ok(PrivateGcCandidateOutcome::Deleted {
+                        bytes: expected_identity.size,
+                    }),
+                    Ok(_) | Err(_) => Err(FsError::IoError),
+                }
+            }
+        }
+    }
+}
+
 #[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
 impl DecodedPrivateGcArtifact {
     pub(crate) fn guard_id(&self) -> uuid::Uuid {
@@ -413,6 +472,14 @@ pub enum PassStatus {
 }
 
 impl ExtentStore {
+    #[allow(dead_code)] // The standalone binary omits the catalog coordinator.
+    pub(crate) async fn private_gc_barrier(&self) -> PrivateGcBarrier {
+        PrivateGcBarrier {
+            store: self.clone(),
+            _guard: self.extent_ref_barrier.clone().write_owned().await,
+        }
+    }
+
     /// Recover and strictly decode one immutable candidate artifact. This is
     /// read-only: catalog guard revalidation still precedes any future delete.
     #[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
@@ -467,20 +534,6 @@ impl ExtentStore {
             candidate_digest: batch.candidate_digest.clone(),
             _private: (),
         })
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)] // The standalone binary omits the catalog integration test.
-    pub(crate) async fn delete_prepared_private_candidates_for_test(
-        &self,
-        batch: &PreparedPrivateGcBatch,
-    ) {
-        for candidate in &batch.candidates {
-            self.segment_store()
-                .delete_segment(candidate.segid)
-                .await
-                .unwrap();
-        }
     }
 
     /// Build one deterministic bounded candidate set from a non-active epoch.

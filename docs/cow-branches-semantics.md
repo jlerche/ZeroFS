@@ -504,6 +504,19 @@ primitive grants no deletion authority. Physical deletion remains disabled
 pending guard-bound recovery validation, former-writer fencing/quiescence, and
 the barrier-through-delete worker.
 
+The live-process worker is narrower than crash recovery. It accepts only the
+opaque artifact capability issued to the same process-unique publisher that is
+still bound to the extent store. For each cursor position it takes the exclusive
+FrameLoc-publication barrier, rechecks serving authority, the live guard,
+authenticated marker, exact sealed epoch revision, artifact owner/digest, and
+both current and durable forward maps. It then streams and matches the strong
+object identity, deletes, confirms absence, and publishes the next durable
+cursor while retaining that same barrier. An already absent object advances as
+such; any ambiguity retains it. Completion atomically retires the guard, and an
+exact replay returns the completed audit. No restart may use this live-only
+capability: after process loss the non-expiring guard stays in place until a
+separate durable former-writer and object-request quiescence proof is available.
+
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
 active writer, and authoritative guard attachment proves the requested term was

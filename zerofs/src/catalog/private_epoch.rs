@@ -1,10 +1,11 @@
 use super::{
-    BranchState, Catalog, CatalogError, CatalogMutation, PrivateEpochRecord, PrivateEpochState,
-    catalog_timestamp,
+    BranchState, Catalog, CatalogError, CatalogMutation, LocalGcGuardRecord, LocalGcProgressRecord,
+    PrivateEpochRecord, PrivateEpochState, catalog_timestamp,
 };
 use crate::fs::store::ExtentStore;
 use crate::fs::store::extent::{
-    PersistedPrivateGcArtifact, PrivatePublisherIdentity, PublisherDrainReceipt,
+    PersistedPrivateGcArtifact, PrivateGcCandidateOutcome, PrivatePublisherIdentity,
+    PublisherDrainReceipt,
 };
 use crate::segment_store::{SegmentPoolAuthority, SegmentStore, SegmentStoreError};
 use chrono::{DateTime, Utc};
@@ -73,6 +74,180 @@ impl PrivateEpochLifecycle {
     pub(crate) fn with_publisher(mut self, extent_store: &ExtentStore) -> Self {
         self.publisher = extent_store.private_publisher_identity();
         self
+    }
+
+    /// Run an already guarded batch only in the exact live publisher process
+    /// that prepared it. Crash recovery intentionally cannot use this entry
+    /// point: it requires a separate durable writer-fence/quiescence proof.
+    #[allow(dead_code)] // Production scheduling remains disabled pending restart fencing.
+    pub(crate) async fn run_live_gc_guard(
+        &self,
+        extent_store: &ExtentStore,
+        artifact: &PersistedPrivateGcArtifact,
+    ) -> Result<LocalGcProgressRecord, PrivateEpochLifecycleError> {
+        let publisher = self.publisher.as_ref().ok_or_else(|| {
+            CatalogError::OperationConflict("private GC publisher is not bound".to_string())
+        })?;
+        if extent_store.private_publisher_identity().as_ref() != Some(publisher)
+            || publisher.publisher_id != artifact.publisher_id()
+            || publisher.branch_id != artifact.branch_id()
+            || publisher.database_identity != artifact.database_identity()
+        {
+            return Err(CatalogError::OperationConflict(
+                "private GC live publisher identity".to_string(),
+            )
+            .into());
+        }
+        let decoded = extent_store
+            .load_private_gc_artifact(artifact.guard_id())
+            .await
+            .map_err(|_| {
+                SegmentStoreError::ObjectStore("private GC artifact decode".to_string())
+            })?;
+        let batch = decoded.batch();
+        if decoded.guard_id() != artifact.guard_id()
+            || batch.publisher_id != artifact.publisher_id()
+            || batch.branch_id != artifact.branch_id()
+            || batch.database_identity != artifact.database_identity()
+            || batch.epoch != artifact.epoch()
+            || batch.candidates.len() as u32 != artifact.candidate_count()
+            || batch.candidate_digest != artifact.candidate_digest()
+        {
+            return Err(CatalogError::OperationConflict(
+                "private GC recovered artifact identity".to_string(),
+            )
+            .into());
+        }
+
+        loop {
+            extent_store
+                .check_private_gc_serving_authority()
+                .map_err(|_| {
+                    CatalogError::OperationConflict("private GC serving authority".to_string())
+                })?;
+            let barrier = extent_store.private_gc_barrier().await;
+            extent_store
+                .check_private_gc_serving_authority()
+                .map_err(|_| {
+                    CatalogError::OperationConflict("private GC serving authority".to_string())
+                })?;
+            let snapshot = self.catalog.snapshot().await?;
+            if let Some(progress) = snapshot.local_gc_progress.get(&artifact.guard_id())
+                && progress.completed_at.is_some()
+            {
+                validate_progress_artifact(progress, artifact)?;
+                return Ok(progress.clone());
+            }
+            let guard = snapshot
+                .local_gc_guards
+                .get(&artifact.guard_id())
+                .ok_or_else(|| {
+                    CatalogError::OperationConflict(format!(
+                        "private GC guard {} is not active",
+                        artifact.guard_id()
+                    ))
+                })?;
+            validate_guard_artifact(guard, artifact)?;
+            let proof = SegmentStore::authenticate_branch_epoch(
+                Arc::clone(&self.segment_pool),
+                &self.authority,
+                guard.epoch,
+            )
+            .await?;
+            let epoch = snapshot
+                .private_epochs
+                .get(&guard.epoch)
+                .ok_or_else(|| CatalogError::NotFound(format!("private epoch {}", guard.epoch)))?;
+            if !record_matches_proof(epoch, &proof)
+                || epoch.state != PrivateEpochState::SealedPrivate
+                || epoch.revision != guard.epoch_revision
+                || proof.branch_id != batch.branch_id
+                || proof.database_identity != batch.database_identity
+            {
+                return Err(CatalogError::OperationConflict(format!(
+                    "private GC guarded epoch {}",
+                    guard.epoch
+                ))
+                .into());
+            }
+            let current = match snapshot.local_gc_progress.get(&guard.id) {
+                Some(progress) => {
+                    validate_progress_artifact(progress, artifact)?;
+                    progress.clone()
+                }
+                None => {
+                    let initial = LocalGcProgressRecord {
+                        id: guard.id,
+                        revision: 1,
+                        branch_id: guard.branch_id,
+                        epoch: guard.epoch,
+                        epoch_revision: guard.epoch_revision,
+                        candidate_count: guard.candidate_count,
+                        candidate_digest: guard.candidate_digest.clone(),
+                        next_candidate: 0,
+                        deleted_objects: 0,
+                        deleted_bytes: 0,
+                        already_absent: 0,
+                        started_at: guard.created_at,
+                        updated_at: guard.created_at,
+                        completed_at: None,
+                    };
+                    self.catalog
+                        .apply(CatalogMutation::PublishLocalGcProgress(initial))
+                        .await?;
+                    drop(barrier);
+                    continue;
+                }
+            };
+            let candidate = batch
+                .candidates
+                .get(current.next_candidate as usize)
+                .ok_or_else(|| {
+                    CatalogError::Corrupt("private GC cursor exceeds artifact".to_string())
+                })?;
+            let outcome = barrier.delete_candidate(candidate).await.map_err(|_| {
+                CatalogError::OperationConflict(format!(
+                    "private GC candidate {:?} retained",
+                    candidate.segid
+                ))
+            })?;
+            extent_store
+                .check_private_gc_serving_authority()
+                .map_err(|_| {
+                    CatalogError::OperationConflict("private GC serving authority".to_string())
+                })?;
+            let updated_at = current
+                .updated_at
+                .checked_add_signed(chrono::Duration::microseconds(1))
+                .ok_or_else(|| CatalogError::Corrupt("private GC time overflow".to_string()))?;
+            let mut next = current;
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::Corrupt("private GC revision overflow".to_string()))?;
+            next.next_candidate += 1;
+            match outcome {
+                PrivateGcCandidateOutcome::Deleted { bytes } => {
+                    next.deleted_objects += 1;
+                    next.deleted_bytes =
+                        next.deleted_bytes.checked_add(bytes).ok_or_else(|| {
+                            CatalogError::Corrupt("private GC byte count overflow".to_string())
+                        })?;
+                }
+                PrivateGcCandidateOutcome::AlreadyAbsent => next.already_absent += 1,
+            }
+            next.updated_at = updated_at;
+            if next.next_candidate == next.candidate_count {
+                next.completed_at = Some(updated_at);
+            }
+            self.catalog
+                .apply(CatalogMutation::PublishLocalGcProgress(next.clone()))
+                .await?;
+            drop(barrier);
+            if next.completed_at.is_some() {
+                return Ok(next);
+            }
+        }
     }
 
     /// Attach one immutable, exact-writer candidate artifact to authoritative
@@ -332,6 +507,42 @@ fn record_matches_proof(
         && record.database_identity == proof.database_identity
 }
 
+fn validate_guard_artifact(
+    guard: &LocalGcGuardRecord,
+    artifact: &PersistedPrivateGcArtifact,
+) -> Result<(), CatalogError> {
+    if guard.id != artifact.guard_id()
+        || guard.branch_id != artifact.branch_id()
+        || guard.epoch != artifact.epoch()
+        || guard.candidate_count != artifact.candidate_count()
+        || guard.candidate_digest != artifact.candidate_digest()
+    {
+        return Err(CatalogError::OperationConflict(format!(
+            "private GC guard {} artifact identity",
+            guard.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_progress_artifact(
+    progress: &LocalGcProgressRecord,
+    artifact: &PersistedPrivateGcArtifact,
+) -> Result<(), CatalogError> {
+    if progress.id != artifact.guard_id()
+        || progress.branch_id != artifact.branch_id()
+        || progress.epoch != artifact.epoch()
+        || progress.candidate_count != artifact.candidate_count()
+        || progress.candidate_digest != artifact.candidate_digest()
+    {
+        return Err(CatalogError::OperationConflict(format!(
+            "private GC progress {} artifact identity",
+            progress.id
+        )));
+    }
+    Ok(())
+}
+
 fn reconcile_seal(
     current: PrivateEpochRecord,
     request: &PrivateEpochSealRequest,
@@ -383,7 +594,7 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchDeleteOperation, BranchDeletePhase, BranchRecord, BranchState, CatalogMutation,
-        DurableRoot, LocalGcProgressRecord, SlateDbCatalog,
+        DurableRoot, SlateDbCatalog,
     };
     use crate::config::CompressionConfig;
     use crate::db::Db;
@@ -393,7 +604,7 @@ mod tests {
     use crate::fs::store::ExtentStore;
     use crate::segment::SEGMENT_INFO;
     use bytes::Bytes;
-    use object_store::{ObjectStore, memory::InMemory, path::Path};
+    use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
     fn ready_branch(id: Uuid, now: DateTime<Utc>) -> BranchRecord {
         BranchRecord {
@@ -914,42 +1125,27 @@ mod tests {
                 .unwrap(),
             guard
         );
-        extent
-            .delete_prepared_private_candidates_for_test(&batch)
-            .await;
-        let progress_at = guard.created_at + chrono::Duration::microseconds(1);
-        let initial_progress = LocalGcProgressRecord {
-            id: guard.id,
-            revision: 1,
-            branch_id: guard.branch_id,
-            epoch: guard.epoch,
-            epoch_revision: guard.epoch_revision,
-            candidate_count: guard.candidate_count,
-            candidate_digest: guard.candidate_digest.clone(),
-            next_candidate: 0,
-            deleted_objects: 0,
-            deleted_bytes: 0,
-            already_absent: 0,
-            started_at: progress_at,
-            updated_at: progress_at,
-            completed_at: None,
-        };
-        catalog
-            .apply(CatalogMutation::PublishLocalGcProgress(
-                initial_progress.clone(),
-            ))
+        let completed_progress = lifecycle
+            .run_live_gc_guard(&extent, &artifact)
             .await
             .unwrap();
-        let mut completed_progress = initial_progress;
-        completed_progress.revision = 2;
-        completed_progress.next_candidate = 1;
-        completed_progress.deleted_objects = 1;
-        completed_progress.updated_at += chrono::Duration::microseconds(1);
-        completed_progress.completed_at = Some(completed_progress.updated_at);
-        catalog
-            .apply(CatalogMutation::PublishLocalGcProgress(completed_progress))
-            .await
-            .unwrap();
+        assert_eq!(completed_progress.next_candidate, 1);
+        assert_eq!(completed_progress.deleted_objects, 1);
+        assert_eq!(completed_progress.already_absent, 0);
+        assert!(completed_progress.completed_at.is_some());
+        assert!(
+            pool.get(&Path::from(batch.candidates[0].segid.object_key()))
+                .await
+                .is_err(),
+            "the worker must confirm the candidate object is absent"
+        );
+        assert_eq!(
+            lifecycle
+                .run_live_gc_guard(&extent, &artifact)
+                .await
+                .unwrap(),
+            completed_progress
+        );
         let delete_at = catalog_timestamp(now + chrono::Duration::microseconds(6));
         catalog
             .apply(CatalogMutation::StartBranchDelete {
