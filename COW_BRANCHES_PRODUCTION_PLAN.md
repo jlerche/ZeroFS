@@ -276,7 +276,7 @@
 
 - [x] Build a model test that computes ideal reachability and compares it with collector decisions.
 - [ ] Test catalog changes during root capture, marking, inventory, quarantine, and deletion.
-- [ ] Test branches and checkpoints created immediately before and after the inventory cutoff.
+- [x] Test branches and checkpoints created immediately before and after the inventory cutoff.
 - [x] Test deletion of parents and source checkpoints with surviving descendants.
 - [ ] Test active, expired, renewed, and corrupted leases.
 - [ ] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
@@ -610,5 +610,11 @@
 ### 2026-08-08: ideal two-observation GC model
 
 - The complete collector test now computes its expected first candidates and final deletions with independent set operations over physical inventory, first roots, second roots, absent objects, and the immutable inventory cutoff. It compares published inventory/revalidation totals and every final segment-pool presence decision against that oracle rather than only asserting hand-written counts.
-- The fixture covers a pinned checkpoint-shaped root present at cutoff, an object proven by its storage metadata to have been written after cutoff, another pinned checkpoint-shaped root introduced between observations, a candidate that becomes reachable, an already-absent candidate, and two stably unreachable unchanged candidates. The post-cutoff object and both reachable classes survive; only the oracle's stable unreachable set is physically reclaimed. Catalog-driven branch and checkpoint creation immediately around capture remains a separate open case.
-- Descendant-preserving branch deletion remains covered by the lifecycle tests: named source checkpoints and live parents can be deleted without retargeting or invalidating the surviving child's owned root. This closes the descendant, ideal-decision, and eventual-reclamation items; catalog-driven cutoff creation, mutation-at-every-phase, lease corruption, artifact corruption, and restart matrices remain separate GC-safety work.
+- The fixture covers a pinned checkpoint-shaped root present at cutoff, an object proven by its storage metadata to have been written after cutoff, another pinned checkpoint-shaped root introduced between observations, a candidate that becomes reachable, an already-absent candidate, and two stably unreachable unchanged candidates. The post-cutoff object and both reachable classes survive; only the oracle's stable unreachable set is physically reclaimed. The following catalog-driven case separately exercises branch and checkpoint publication around capture.
+- Descendant-preserving branch deletion remains covered by the lifecycle tests: named source checkpoints and live parents can be deleted without retargeting or invalidating the surviving child's owned root. This closes the descendant, ideal-decision, and eventual-reclamation items; mutation-at-every-phase, lease corruption, artifact corruption, and restart matrices remain separate GC-safety work.
+
+### 2026-08-08: catalog-driven inventory cutoff fence
+
+- Four independently verifiable roots with distinct pool segments are prepared: a branch and named checkpoint are published before `RootCaptureLifecycle::begin`, then another branch and checkpoint are published immediately after its durable root snapshot and inventory cutoff. The captured run contains exactly the pre-cutoff catalog roots and excludes both post-cutoff roots; a fresh run contains all four.
+- The stale run may finish marking its immutable pins, but quarantine publication fails the captured catalog-generation fence after the post-cutoff catalog mutations. It remains in `Marking`, records no accepted unreachable observation, and every pool object is asserted present. This proves a branch/checkpoint racing the cutoff cannot turn its older physical segment into an accepted deletion candidate.
+- Branch roots use the production root-store ownership/result proof, checkpoint roots use exact SlateDB checkpoint identities, and both sides are authenticated during capture. This closes the catalog-driven cutoff creation case; mutations after later persisted GC phases remain in the broader phase matrix.

@@ -1275,6 +1275,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_roots_created_around_cutoff_fence_stale_inventory() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segment_pool = Path::from("gc-cutoff-pool");
+        let mut roots = Vec::new();
+        for index in 0..4u64 {
+            let data_path = Path::from(format!("gc-cutoff-root-{index}"));
+            let db = Db::builder(data_path.clone(), Arc::clone(&store))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap();
+            let segment = Segid::new(20, index * 256);
+            db.put(
+                KeyCodec::new().extent_key(index + 1, 0),
+                FrameLoc {
+                    segid: segment,
+                    frame_index: 0,
+                    byte_offset: 0,
+                    byte_len: 1,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            db.flush().await.unwrap();
+            let checkpoint = db
+                .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+            store
+                .put(
+                    &Path::from(format!("{segment_pool}/{}", segment.object_key())),
+                    bytes::Bytes::from_static(b"x").into(),
+                )
+                .await
+                .unwrap();
+            roots.push((
+                ImmutableCheckpoint {
+                    database_path: data_path,
+                    checkpoint_id: checkpoint.id,
+                    manifest_id: checkpoint.manifest_id,
+                }
+                .durable_root(),
+                segment,
+            ));
+        }
+        let root_store =
+            SlateDbRootStore::new(Arc::clone(&store), Path::from("gc-cutoff-branches"))
+                .with_segment_pool_root(segment_pool.clone());
+        let branch_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for (index, destination_id) in [(0usize, branch_ids[0]), (2, branch_ids[1])] {
+            let source = ImmutableCheckpoint::from_durable_root(&roots[index].0).unwrap();
+            roots[index].0 = root_store
+                .create_from_checkpoint(Uuid::new_v4(), destination_id, &source)
+                .await
+                .unwrap();
+            assert_eq!(
+                roots[index].0.identity,
+                format!("gc-cutoff-branches/{destination_id}")
+            );
+        }
+
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("gc-cutoff-catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let before = catalog_timestamp(Utc::now());
+        let before_branch = BranchRecord {
+            id: branch_ids[0],
+            revision: 1,
+            name: "before-cutoff".to_string(),
+            state: BranchState::Ready,
+            root: Some(roots[0].0.clone()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: before,
+            updated_at: before,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(before_branch.clone()))
+            .await
+            .unwrap();
+        let before_checkpoint = CheckpointRecord {
+            id: ImmutableCheckpoint::from_durable_root(&roots[1].0)
+                .unwrap()
+                .checkpoint_id,
+            revision: 1,
+            branch_id: before_branch.id,
+            name: "before-checkpoint".to_string(),
+            root: roots[1].0.clone(),
+            created_at: before,
+            updated_at: before,
+        };
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(before_checkpoint.clone()))
+            .await
+            .unwrap();
+
+        let lifecycle = RootCaptureLifecycle::new(catalog.clone(), root_store);
+        let run = lifecycle.begin(Uuid::new_v4()).await.unwrap();
+        assert!(run.inventory_cutoff >= before);
+        assert!(run.roots.contains(&GcRootPin {
+            kind: GcRootKind::Branch,
+            root: roots[0].0.clone(),
+        }));
+        assert!(run.roots.contains(&GcRootPin {
+            kind: GcRootKind::Checkpoint,
+            root: roots[1].0.clone(),
+        }));
+
+        let after = run.inventory_cutoff + Duration::microseconds(1);
+        let after_branch = BranchRecord {
+            id: branch_ids[1],
+            revision: 1,
+            name: "after-cutoff".to_string(),
+            state: BranchState::Ready,
+            root: Some(roots[2].0.clone()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: after,
+            updated_at: after,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(after_branch.clone()))
+            .await
+            .unwrap();
+        let after_checkpoint = CheckpointRecord {
+            id: ImmutableCheckpoint::from_durable_root(&roots[3].0)
+                .unwrap()
+                .checkpoint_id,
+            revision: 1,
+            branch_id: after_branch.id,
+            name: "after-checkpoint".to_string(),
+            root: roots[3].0.clone(),
+            created_at: after,
+            updated_at: after,
+        };
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(after_checkpoint))
+            .await
+            .unwrap();
+        assert!(!run.roots.iter().any(|pin| pin.root == roots[2].0));
+        assert!(!run.roots.iter().any(|pin| pin.root == roots[3].0));
+
+        lifecycle.mark(run.id).await.unwrap();
+        assert!(matches!(
+            lifecycle.quarantine(run.id).await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::RevisionConflict { .. }
+            ))
+        ));
+        assert_eq!(
+            catalog.gc_run(run.id).await.unwrap().unwrap().phase,
+            GcRunPhase::Marking
+        );
+        for (_, segment) in &roots {
+            assert!(
+                store
+                    .head(&Path::from(format!(
+                        "{segment_pool}/{}",
+                        segment.object_key()
+                    )))
+                    .await
+                    .is_ok(),
+                "a generation race must retain every pool object"
+            );
+        }
+
+        let fresh = lifecycle.begin(Uuid::new_v4()).await.unwrap();
+        for expected in [
+            (GcRootKind::Branch, &roots[0].0),
+            (GcRootKind::Checkpoint, &roots[1].0),
+            (GcRootKind::Branch, &roots[2].0),
+            (GcRootKind::Checkpoint, &roots[3].0),
+        ] {
+            assert!(fresh.roots.contains(&GcRootPin {
+                kind: expected.0,
+                root: expected.1.clone(),
+            }));
+        }
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn collector_matches_ideal_two_observation_model_and_cutoff() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let data_path = Path::from("gc-revalidation-data");
