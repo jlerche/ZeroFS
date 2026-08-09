@@ -301,7 +301,7 @@
 
 ### Epic 6.1: Ship lifecycle behavior safely
 
-- [ ] Release create, list, inspect, mount, checkpoint deletion, and descendant-preserving branch deletion behind feature controls where appropriate.
+- [x] Release create, list, inspect, mount, checkpoint deletion, and descendant-preserving branch deletion behind feature controls where appropriate.
 - [ ] Provide a reviewed offline legacy-to-pool migration that preserves the exact volume key, reserves every imported epoch, rejects duplicate physical segment IDs across sources, and publishes authoritative completion; alternatively rewrite every colliding segment ID and `FrameLoc`.
 - [x] Document exact semantics for logical deletion, active mounts, tombstones, name reuse, and asynchronous reclamation.
 - [x] Provide administrative inspection for branch UUIDs, durable roots, leases, tombstones, and incomplete operations.
@@ -350,11 +350,11 @@
 
 ### Epic 7.3: Engineering acceptance
 
-- [ ] The workspace compiles and passes formatting, linting, unit, integration, fault-injection, and model-test gates.
-- [ ] The implementation is split into coherent, reviewable subsystems.
-- [ ] Production behavior is documented with operational limits and failure semantics.
-- [ ] Metrics, alerts, administrative inspection, rollout controls, and a deletion kill switch are available.
-- [ ] The research branch remains reference material and is not merged wholesale.
+- [x] The workspace compiles and passes formatting, linting, unit, integration, fault-injection, and model-test gates.
+- [x] The implementation is split into coherent, reviewable subsystems.
+- [x] Production behavior is documented with operational limits and failure semantics.
+- [x] Metrics, alerts, administrative inspection, rollout controls, and a deletion kill switch are available.
+- [x] The research branch remains reference material and is not merged wholesale.
 
 ## Review findings that motivated this plan
 
@@ -789,3 +789,9 @@
 - `CreateBranch` carries permanent operation/destination UUIDs plus the exact source branch UUID and checkpoint name. SlateDB resolves that name once, reserves the source before clone I/O, authenticates the independent destination root, and publishes `Ready` before acknowledgement. Server-assigned creation time is recovered from the operation record, so concurrent or response-loss retries need not reproduce a timestamp and cannot retarget a reused source name.
 - `DeleteBranch` carries a permanent deletion operation UUID plus exact branch UUID/name. The lifecycle derives the consumed revision from the live branch or matching permanent operation/tombstone, rejects conflicting identities, fences new mounts, drains writers, preserves descendants and reader roots, and returns the same logical result across ambiguous retries and name reuse.
 - CLI create/delete commands print exact retry UUIDs before mutation. Successful authoritative commits reconcile the identical root-free JSON/PostgreSQL customer projection best-effort; mutation responses expose only operation UUID, branch UUID, name, and state. A Unix-socket test proves the generated client preserves exact identities, while lifecycle coverage exercises concurrent creation and deletion retry after name reuse.
+
+### 2026-08-09: lifecycle release and engineering acceptance
+
+- The configured server now owns the complete lifecycle release surface: default-off independent controls guard branch creation, writer mount admission, checkpoint deletion, and descendant-preserving branch deletion before authoritative work, while branch/checkpoint list and inspection remain read-only. The active mount renews before serving, stops serving on renewal uncertainty, and publishes its immutable head after shutdown. Every successful mutation commits to SlateDB first and only then reconciles the selected identical root-free JSON/PostgreSQL projection on a best-effort basis.
+- The current tree passes `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, the complete default unit/integration suite, the 61-case failpoint crash suite, strict DST Clippy, all six deterministic simulation/model tests, and the seeded failpoint-crash DST case. The audit repaired both specialized harnesses after the production constructor gained an optional pool-global segment-writer epoch reservation argument, preventing those gates from silently drifting outside normal compilation.
+- The implementation remains divided across storage/root, independently keyed SlateDB catalog, lifecycle/lease/deletion, streaming global/local GC, customer projection, RPC/CLI, and serving-assembly commits instead of importing the research implementation. Production limits, fail-closed semantics, metrics, Prometheus alerts, bounded administration/cleanup, independent release controls, conservative deletion policy, and the rapid deletion kill switch are documented and executable. `jacob/cow-branches-poc-research` remains a separate reference branch and is not an ancestor or wholesale merge of this main-based production history.

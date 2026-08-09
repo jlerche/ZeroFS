@@ -202,6 +202,7 @@ impl Storage {
                     zerofs::config::CompressionConfig::default(),
                 ),
                 None,
+                None,
                 Some(scale.seal_threshold),
             )
             .await
