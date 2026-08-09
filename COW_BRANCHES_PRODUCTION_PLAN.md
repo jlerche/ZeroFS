@@ -265,12 +265,12 @@
 
 ### Epic 5.1: Validate branch lifecycle safety
 
-- [ ] Port only research-branch tests that correspond to claims made by the new design.
-- [ ] Test process crashes before and after every lifecycle linearization point.
-- [ ] Test ambiguous object-store success and retry behavior.
-- [ ] Test stale clients, duplicate operation IDs, and conflicting operation IDs.
-- [ ] Test checkpoint and branch name reuse with stable UUID isolation.
-- [ ] Test deep lineages while avoiding a runtime dependency on ancestor availability.
+- [x] Port only research-branch tests that correspond to claims made by the new design.
+- [x] Test process crashes before and after every lifecycle linearization point.
+- [x] Test ambiguous object-store success and retry behavior.
+- [x] Test stale clients, duplicate operation IDs, and conflicting operation IDs.
+- [x] Test checkpoint and branch name reuse with stable UUID isolation.
+- [x] Test deep lineages while avoiding a runtime dependency on ancestor availability.
 
 ### Epic 5.2: Validate GC safety
 
@@ -599,3 +599,10 @@
 - Successful durable passes publish Prometheus counters for passes, examined objects, removed objects, already-absent reconciliations, and retained objects, labeled by `tombstones`, `completed_gc_artifacts`, or `obsolete_gc_artifacts`. A labeled backlog gauge exports the tombstone pass's observed eligible lower bound or the artifact pass's conservative zero/one continuation signal.
 - Metric recording is observational only and occurs after the authoritative catalog batch or confirmed object-store deletes succeed. SlateDB remains the local and production cleanup authority; PostgreSQL and JSON remain identical customer projections and carry neither cleanup cursors nor operational metric state.
 - A recorder-backed test checks the exact exported names, kind label, counter values, and backlog gauge. This completes Epic 4.6; cadence tuning, alert thresholds, and fleet-level capacity validation remain Epic 5.3 and rollout work.
+
+### 2026-08-08: production lifecycle fault matrix
+
+- The research branch was audited by behavioral claim rather than copied wholesale. Production equivalents retain its relevant exact-operation, lost-response, deletion-fence, mount/lease, name-reuse, descendant-survival, and lineage cases; tests coupled to the research branch's monolithic object-store registry, forced creator takeover records, or ancestor-path GC were deliberately not imported into the independent-key SlateDB design.
+- A restart matrix reconstructs the lifecycle object and resumes one exact create before reservation, after the atomic reservation, after clone/result storage but before catalog root publication, after root publication, and after atomic `Ready` publication. Every state converges on the same authenticated root, and a subsequent exact retry returns the same branch.
+- Existing focused fault stores prove applied clone and immutable-result writes reconcile after lost responses; exact catalog tests reject stale revisions and conflicting operation reuse while accepting duplicates. Branch/checkpoint deletion and lease tests cover applied-response loss, writer races, exact release/renewal, and name reuse without retargeting stable UUIDs.
+- A 32-level lineage test creates each child from the exact current checkpoint, deletes that checkpoint and its live parent catalog record, removes the original physical named checkpoint after the first clone, and continues from the child's owned root. At completion only the deepest branch is live, every historical stable ID is tombstoned, snapshot validation succeeds, and root verification does not consult live ancestor catalog records.

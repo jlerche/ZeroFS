@@ -318,8 +318,9 @@ pub enum BranchLifecycleError {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CatalogMutation, CheckpointDeleteRequest, CheckpointRecord, DurableRoot, LeaseAccessMode,
-        LeaseAcquireRequest, SlateDbCatalog, catalog_timestamp,
+        BranchDeleteRequest, BranchDeleteResult, CatalogMutation, CheckpointDeleteRequest,
+        CheckpointRecord, DurableRoot, LeaseAccessMode, LeaseAcquireRequest, SlateDbCatalog,
+        catalog_timestamp,
     };
     use slatedb::Db;
     use slatedb::admin::AdminBuilder;
@@ -728,6 +729,277 @@ mod tests {
             )
             .await
             .unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_recovers_from_every_persisted_linearization_boundary() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // 0: before reservation; 1: reserved; 2: clone/result durably written;
+        // 3: destination root recorded; 4: ready publication committed.
+        for persisted_boundary in 0..=4 {
+            let case_root = format!("lifecycle-crash/{persisted_boundary}");
+            let catalog_path = Path::from(format!("{case_root}/catalog"));
+            let branch_root = Path::from(format!("{case_root}/branches"));
+            let catalog = Arc::new(
+                SlateDbCatalog::open(catalog_path.clone(), Arc::clone(&store))
+                    .await
+                    .unwrap(),
+            );
+            let now = catalog_timestamp(Utc::now());
+            let source_path = Path::from(format!("{case_root}/source"));
+            let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+                .await
+                .unwrap();
+            source_db.put(b"key", b"value").await.unwrap();
+            let checkpoint = source_db
+                .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+                .await
+                .unwrap();
+            source_db.close().await.unwrap();
+            let source = ImmutableCheckpoint {
+                database_path: source_path,
+                checkpoint_id: checkpoint.id,
+                manifest_id: checkpoint.manifest_id,
+            };
+            let parent = BranchRecord {
+                id: Uuid::new_v4(),
+                revision: 1,
+                name: "parent".to_string(),
+                state: BranchState::Ready,
+                root: Some(source.durable_root()),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            };
+            catalog
+                .apply(CatalogMutation::CreateBranch(parent.clone()))
+                .await
+                .unwrap();
+            catalog
+                .apply(CatalogMutation::CreateCheckpoint(CheckpointRecord {
+                    id: source.checkpoint_id,
+                    revision: 1,
+                    branch_id: parent.id,
+                    name: "source".to_string(),
+                    root: source.durable_root(),
+                    created_at: now,
+                    updated_at: now,
+                }))
+                .await
+                .unwrap();
+            let roots = SlateDbRootStore::new(Arc::clone(&store), branch_root.clone());
+            let request = BranchCreateRequest {
+                operation_id: Uuid::new_v4(),
+                destination_id: Uuid::new_v4(),
+                destination_name: format!("child-{persisted_boundary}"),
+                source: source.clone(),
+                created_at: now,
+            };
+            if persisted_boundary >= 1 {
+                catalog
+                    .apply(CatalogMutation::ReserveBranchCreate {
+                        branch: BranchRecord {
+                            id: request.destination_id,
+                            revision: 1,
+                            name: request.destination_name.clone(),
+                            state: BranchState::Creating,
+                            root: None,
+                            parent_id: Some(parent.id),
+                            origin_checkpoint_id: Some(source.checkpoint_id),
+                            created_at: now,
+                            updated_at: now,
+                        },
+                        operation: Box::new(BranchCreateOperation {
+                            id: request.operation_id,
+                            revision: 1,
+                            destination_id: request.destination_id,
+                            destination_name: request.destination_name.clone(),
+                            source_checkpoint_id: source.checkpoint_id,
+                            source_root: source.durable_root(),
+                            parent_id: Some(parent.id),
+                            phase: BranchCreatePhase::Reserved,
+                            destination_root: None,
+                            created_at: now,
+                            updated_at: now,
+                        }),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let destination_root = if persisted_boundary >= 2 {
+                Some(
+                    roots
+                        .create_from_checkpoint(
+                            request.operation_id,
+                            request.destination_id,
+                            &source,
+                        )
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if persisted_boundary >= 3 {
+                catalog
+                    .apply(CatalogMutation::RecordBranchCreateRoot {
+                        operation_id: request.operation_id,
+                        expected_revision: 1,
+                        destination_root: destination_root.clone().unwrap(),
+                        updated_at: now,
+                    })
+                    .await
+                    .unwrap();
+            }
+            if persisted_boundary >= 4 {
+                catalog
+                    .apply(CatalogMutation::PublishBranchCreate {
+                        operation_id: request.operation_id,
+                        expected_revision: 2,
+                        updated_at: now,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            catalog.close().await.unwrap();
+            drop(catalog);
+            drop(roots);
+
+            let restarted_catalog = Arc::new(
+                SlateDbCatalog::open(catalog_path, Arc::clone(&store))
+                    .await
+                    .unwrap(),
+            );
+            let restarted_roots = SlateDbRootStore::new(Arc::clone(&store), branch_root);
+            let restarted =
+                BranchLifecycle::new(restarted_catalog.clone(), restarted_roots.clone());
+            let ready = restarted
+                .create_from_checkpoint(request.clone())
+                .await
+                .unwrap();
+            assert_eq!(ready.id, request.destination_id);
+            assert_eq!(ready.state, BranchState::Ready);
+            restarted_roots
+                .verify(ready.root.as_ref().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted.create_from_checkpoint(request).await.unwrap(),
+                ready
+            );
+            restarted_catalog.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_lineage_uses_stable_ids_without_live_catalog_ancestors() {
+        const LINEAGE_DEPTH: usize = 32;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("deep-lineage/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let now = catalog_timestamp(Utc::now());
+        let source_path = Path::from("deep-lineage/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"deep", b"value").await.unwrap();
+        let first_checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let mut source = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: first_checkpoint.id,
+            manifest_id: first_checkpoint.manifest_id,
+        };
+        let mut branch = BranchRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            name: "lineage-0".to_string(),
+            state: BranchState::Ready,
+            root: Some(source.durable_root()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+        let roots = SlateDbRootStore::new(Arc::clone(&store), Path::from("deep-lineage/branches"));
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots.clone());
+
+        for depth in 0..LINEAGE_DEPTH {
+            let checkpoint = CheckpointRecord {
+                id: source.checkpoint_id,
+                revision: 1,
+                branch_id: branch.id,
+                name: format!("source-{depth}"),
+                root: source.durable_root(),
+                created_at: now,
+                updated_at: now,
+            };
+            catalog
+                .apply(CatalogMutation::CreateCheckpoint(checkpoint.clone()))
+                .await
+                .unwrap();
+            let child = lifecycle
+                .create_from_checkpoint(BranchCreateRequest {
+                    operation_id: Uuid::new_v4(),
+                    destination_id: Uuid::new_v4(),
+                    destination_name: format!("lineage-{}", depth + 1),
+                    source: source.clone(),
+                    created_at: now,
+                })
+                .await
+                .unwrap();
+            lifecycle
+                .deletions()
+                .delete_checkpoint(CheckpointDeleteRequest {
+                    checkpoint_id: checkpoint.id,
+                    expected_revision: checkpoint.revision,
+                    name: checkpoint.name,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                lifecycle
+                    .deletions()
+                    .delete_branch(BranchDeleteRequest {
+                        operation_id: Uuid::new_v4(),
+                        branch_id: branch.id,
+                        expected_revision: branch.revision,
+                        name: branch.name,
+                    })
+                    .await
+                    .unwrap(),
+                BranchDeleteResult::Deleted(_)
+            ));
+            if depth == 0 {
+                AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+                    .build()
+                    .delete_checkpoint(first_checkpoint.id)
+                    .await
+                    .unwrap();
+            }
+            source = ImmutableCheckpoint::from_durable_root(child.root.as_ref().unwrap()).unwrap();
+            branch = child;
+        }
+
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.branches.len(), 1);
+        assert_eq!(snapshot.branches.get(&branch.id), Some(&branch));
+        assert_eq!(snapshot.tombstones.len(), LINEAGE_DEPTH * 2);
+        roots.verify(branch.root.as_ref().unwrap()).await.unwrap();
         catalog.close().await.unwrap();
     }
 }
