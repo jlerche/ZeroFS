@@ -289,7 +289,8 @@
 ### Epic 5.3: Validate scale and operability
 
 - [x] Establish supported production limits for branches, checkpoints, lineage depth, leases, and segment inventory.
-- [ ] Benchmark root capture and mark generation at those limits.
+- [x] Benchmark root capture and logical mark generation at the supported root cardinality.
+- [ ] Benchmark physical checkpoint-open mark latency at the root envelope on a representative backend.
 - [x] Verify memory use is bounded by run/shard size rather than total storage size.
 - [x] Verify external work obeys a derived, observable merge-amplification bound across roots, references, and inventory.
 - [ ] Verify foreground branch and mount latency remains acceptable during GC.
@@ -824,3 +825,9 @@
 - For `R > 0` initial sorted runs in one shard, any record is written at most `2 + floor(log2(R)) + ceil(log2(popcount(R)))` times: its initial run, binary-carry levels, bounded pairwise finalization rounds, and the authoritative final file. Empty shards write no records. The implementation computes this bound from actual per-shard run counts and durably records the maximum as `max_write_passes` in both mark and inventory statistics; the `zerofs_gc_max_record_write_passes{phase=...}` gauge exposes it operationally. Catalog validation accepts legacy zero and bounds new values with a monotone envelope derived from the global run total; it does not incorrectly apply the non-monotone exact formula to a cross-shard sum.
 - Inventory finalization previously handed every resident carry run to a two-input merger. Spill counts whose binary representation contained more than two set bits could consequently fail. It now uses the same bounded pairwise rounds as mark finalization; a focused three-resident-run test covers the former failure shape.
 - The amplification probe now separates catalog storage from counted root/artifact storage and asserts successful mark bytes against `references * 16 * max_write_passes` plus exact per-file framing. Inventory/report bytes are bounded by `objects * 68 * (max_write_passes + 1)` plus exact framing, where the additional pass is the quarantine output. At 20,000 and 40,000 same-shard records, both mark and inventory report 3/4 and 5/5 initial-runs/write-passes respectively and cross multipart thresholds. The plan records this explicit bounded merge contract instead of the disproven strict-linear wording.
+
+### 2026-08-09: supported-cardinality logical mark benchmark
+
+- Mark enumeration now feeds a shared production `MarkBuildState`; both physical checkpoint readers and the ignored qualification probe use the same bounded buffering, spill, binary-carry merge, authoritative finalization, checksum verification, and artifact-I/O implementation. The test-only source changes only how decoded `Segid` references enter that state.
+- `gc_mark_generation_supported_logical_envelope` emits one unique same-shard reference for every supported logical root: 4,096 live branches times 257 branch/checkpoint roots, or 1,052,672 roots/references/unique segments. On the qualification host, the optimized run completed in 609 ms, produced 129 initial runs with a 10-pass maximum, read 168,020,581 artifact bytes, and wrote 168,020,581 bytes through 384 ordinary puts plus 129 multipart uploads/705 parts. Observed writes remain below the exact 168,479,333-byte record-plus-framing bound.
+- Combined with the exact-cardinality root-capture probe, this closes the in-process logical root and mark-artifact benchmark row. The synthetic source intentionally bypasses physical SlateDB checkpoint opens, provider pagination, and network service time. A separate unchecked row retains representative-backend physical-open qualification rather than folding those costs into an in-memory claim.

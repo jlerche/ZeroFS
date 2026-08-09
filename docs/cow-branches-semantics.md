@@ -1016,6 +1016,22 @@ than a linearity claim. In-memory timings and list pagination still do not
 qualify representative backend latency; supported-envelope mark duration and
 concurrent foreground latency remain separate release gates.
 
+The ignored release benchmark
+`gc_mark_generation_supported_logical_envelope` exercises the same production
+mark state used after each physical reference is decoded. It supplies one
+unique same-shard `Segid` for every supported logical root—1,052,672 roots,
+references, and unique segments—then runs bounded buffering, spill,
+binary-carry merge, finalization, checksum verification, and artifact I/O. On
+the 2026-08-09 qualification host it completed in 609 ms, produced 129 initial
+runs with a 10-pass maximum, and read and wrote 168,020,581 artifact bytes. The
+write total is below the exact 168,479,333-byte record-plus-framing bound.
+
+This benchmark combines with exact-cardinality root capture to qualify the
+in-process logical pipeline. Its synthetic source deliberately excludes
+opening 1,052,672 physical SlateDB checkpoints and excludes provider/network
+latency. Those costs remain an explicit representative-backend release gate;
+they are not inferred from the memory-store result.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

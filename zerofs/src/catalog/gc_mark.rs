@@ -67,6 +67,28 @@ pub(crate) struct GcMarkBuild {
     pub(crate) stats: GcMarkStats,
 }
 
+struct MarkBuildState {
+    buffers: [Vec<Segid>; 256],
+    run_paths: [OnlineRuns; 256],
+    buffered: usize,
+    sequence: u64,
+    references_enumerated: u64,
+    intermediate_runs: u64,
+}
+
+impl Default for MarkBuildState {
+    fn default() -> Self {
+        Self {
+            buffers: array::from_fn(|_| Vec::new()),
+            run_paths: array::from_fn(|_| OnlineRuns::default()),
+            buffered: 0,
+            sequence: 0,
+            references_enumerated: 0,
+            intermediate_runs: 0,
+        }
+    }
+}
+
 impl GcMarkStore {
     pub(crate) fn new(roots: SlateDbRootStore) -> Self {
         let object_store = roots.object_store();
@@ -88,12 +110,7 @@ impl GcMarkStore {
         roots: &[GcRootPin],
     ) -> Result<GcMarkBuild, GcMarkError> {
         let digest = decode_digest(root_digest)?;
-        let mut buffers: [Vec<Segid>; 256] = array::from_fn(|_| Vec::new());
-        let mut run_paths: [OnlineRuns; 256] = array::from_fn(|_| OnlineRuns::default());
-        let mut buffered = 0usize;
-        let mut sequence = 0u64;
-        let mut references_enumerated = 0u64;
-        let mut intermediate_runs = 0u64;
+        let mut state = MarkBuildState::default();
         let codec = KeyCodec::new();
         let (start, end) = codec.prefix_range(KeyPrefix::Extent);
 
@@ -107,45 +124,74 @@ impl GcMarkStore {
                         pin.root.identity
                     ))
                 })?;
-                let shard = (location.segid.counter & 0xff) as usize;
-                buffers[shard].push(location.segid);
-                references_enumerated = references_enumerated.checked_add(1).ok_or_else(|| {
-                    GcMarkError::Corrupt("enumerated reference count overflow".to_string())
-                })?;
-                buffered += 1;
-                if buffered >= ENUMERATION_BUFFER_SEGMENTS {
-                    self.flush_buffers(
-                        run_id,
-                        digest,
-                        sequence,
-                        &mut buffers,
-                        &mut run_paths,
-                        &mut intermediate_runs,
-                    )
+                self.push_reference(run_id, digest, location.segid, &mut state)
                     .await?;
-                    sequence = sequence.checked_add(1).ok_or_else(|| {
-                        GcMarkError::Corrupt("mark-run sequence overflow".to_string())
-                    })?;
-                    buffered = 0;
-                }
             }
             drop(entries);
             reader.close().await?;
         }
-        if buffered != 0 {
+        self.finish_observation(run_id, digest, roots.len() as u64, state)
+            .await
+    }
+
+    async fn push_reference(
+        &self,
+        run_id: Uuid,
+        digest: [u8; 32],
+        segid: Segid,
+        state: &mut MarkBuildState,
+    ) -> Result<(), GcMarkError> {
+        let shard = (segid.counter & 0xff) as usize;
+        state.buffers[shard].push(segid);
+        state.references_enumerated =
+            state.references_enumerated.checked_add(1).ok_or_else(|| {
+                GcMarkError::Corrupt("enumerated reference count overflow".to_string())
+            })?;
+        state.buffered = state
+            .buffered
+            .checked_add(1)
+            .ok_or_else(|| GcMarkError::Corrupt("mark buffer count overflow".to_string()))?;
+        if state.buffered >= ENUMERATION_BUFFER_SEGMENTS {
             self.flush_buffers(
                 run_id,
                 digest,
-                sequence,
-                &mut buffers,
-                &mut run_paths,
-                &mut intermediate_runs,
+                state.sequence,
+                &mut state.buffers,
+                &mut state.run_paths,
+                &mut state.intermediate_runs,
+            )
+            .await?;
+            state.sequence = state
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| GcMarkError::Corrupt("mark-run sequence overflow".to_string()))?;
+            state.buffered = 0;
+        }
+        Ok(())
+    }
+
+    async fn finish_observation(
+        &self,
+        run_id: Uuid,
+        digest: [u8; 32],
+        roots_enumerated: u64,
+        mut state: MarkBuildState,
+    ) -> Result<GcMarkBuild, GcMarkError> {
+        if state.buffered != 0 {
+            self.flush_buffers(
+                run_id,
+                digest,
+                state.sequence,
+                &mut state.buffers,
+                &mut state.run_paths,
+                &mut state.intermediate_runs,
             )
             .await?;
         }
 
         let mut shards = Vec::with_capacity(256);
-        let max_write_passes = run_paths
+        let max_write_passes = state
+            .run_paths
             .iter()
             .map(OnlineRuns::max_write_passes)
             .max()
@@ -156,7 +202,7 @@ impl GcMarkStore {
                     run_id,
                     digest,
                     shard,
-                    std::mem::take(&mut run_paths[shard as usize]).into_paths(),
+                    std::mem::take(&mut state.run_paths[shard as usize]).into_paths(),
                 )
                 .await?,
             );
@@ -170,13 +216,33 @@ impl GcMarkStore {
         Ok(GcMarkBuild {
             shards,
             stats: GcMarkStats {
-                roots_enumerated: roots.len() as u64,
-                references_enumerated,
-                intermediate_runs,
+                roots_enumerated,
+                references_enumerated: state.references_enumerated,
+                intermediate_runs: state.intermediate_runs,
                 unique_segments,
                 max_write_passes,
             },
         })
+    }
+
+    #[cfg(test)]
+    async fn build_synthetic_observation<I>(
+        &self,
+        run_id: Uuid,
+        digest: [u8; 32],
+        roots_enumerated: u64,
+        references: I,
+    ) -> Result<GcMarkBuild, GcMarkError>
+    where
+        I: IntoIterator<Item = Segid>,
+    {
+        let mut state = MarkBuildState::default();
+        for segid in references {
+            self.push_reference(run_id, digest, segid, &mut state)
+                .await?;
+        }
+        self.finish_observation(run_id, digest, roots_enumerated, state)
+            .await
     }
 
     async fn flush_buffers(
@@ -671,7 +737,84 @@ pub(crate) enum GcMarkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{MAX_CHECKPOINTS_PER_BRANCH, MAX_LIVE_BRANCHES};
+    use crate::fault_store::FaultStore;
     use object_store::memory::InMemory;
+    use std::time::Instant;
+
+    /// Qualifies the mark buffering, spill, merge, finalization, verification,
+    /// and artifact-I/O path at the declared maximum logical root count. The
+    /// synthetic reference source deliberately excludes physical checkpoint
+    /// open latency, which requires a representative deployed object store.
+    #[tokio::test]
+    #[ignore = "release-mode supported logical-root mark benchmark"]
+    async fn gc_mark_generation_supported_logical_envelope() {
+        let root_count = MAX_LIVE_BRANCHES
+            .checked_mul(MAX_CHECKPOINTS_PER_BRANCH + 1)
+            .unwrap() as u64;
+        let (counting, counters) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = counting;
+        let marker = GcMarkStore::new(SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("mark-envelope/branches"),
+        ));
+        let started = Instant::now();
+        let build = marker
+            .build_synthetic_observation(
+                Uuid::new_v4(),
+                [3u8; 32],
+                root_count,
+                (0..root_count).map(|index| Segid::new(11, index * 256)),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(build.stats.roots_enumerated, root_count);
+        assert_eq!(build.stats.references_enumerated, root_count);
+        assert_eq!(build.stats.unique_segments, root_count);
+        assert_eq!(build.stats.intermediate_runs, 129);
+        assert_eq!(build.stats.max_write_passes, 10);
+        assert_eq!(build.shards.len(), 256);
+        assert_eq!(build.shards[0].segment_count, root_count);
+        assert!(
+            build.shards[1..]
+                .iter()
+                .all(|shard| shard.segment_count == 0)
+        );
+        let artifact_files =
+            counters.put_count() as u64 + counters.multipart_initiate_count() as u64;
+        let observed_write_bytes = counters.put_bytes() + counters.multipart_bytes();
+        let derived_write_bound = root_count
+            .checked_mul(MARK_RECORD_BYTES)
+            .and_then(|bytes| bytes.checked_mul(u64::from(build.stats.max_write_passes)))
+            .and_then(|bytes| bytes.checked_add(artifact_files * MARK_FILE_OVERHEAD_BYTES))
+            .unwrap();
+        assert!(observed_write_bytes <= derived_write_bound);
+        println!(
+            "{}",
+            serde_json::json!({
+                "logical_roots": root_count,
+                "references": build.stats.references_enumerated,
+                "unique_segments": build.stats.unique_segments,
+                "intermediate_runs": build.stats.intermediate_runs,
+                "max_write_passes": build.stats.max_write_passes,
+                "derived_write_bound_bytes": derived_write_bound,
+                "observed_write_bytes": observed_write_bytes,
+                "elapsed_ms": elapsed.as_millis(),
+                "object_store": {
+                    "gets": counters.get_count(),
+                    "puts": counters.put_count(),
+                    "lists": counters.list_count(),
+                    "get_bytes": counters.get_bytes(),
+                    "put_bytes": counters.put_bytes(),
+                    "multipart_initiates": counters.multipart_initiate_count(),
+                    "multipart_parts": counters.multipart_part_count(),
+                    "multipart_completes": counters.multipart_complete_count(),
+                    "multipart_bytes": counters.multipart_bytes(),
+                },
+            })
+        );
+    }
 
     #[test]
     fn binary_carry_write_pass_bound_covers_merge_level_transitions() {
