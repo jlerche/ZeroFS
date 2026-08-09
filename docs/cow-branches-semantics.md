@@ -746,6 +746,13 @@ it stops the next batch, leaves the durable cursor unchanged, and does not stop
 capture, marking, reporting, quarantine, or revalidation. Re-enabling resumes
 from the same authoritative SlateDB progress record.
 
+The default deletion policy is additionally conservative even while disabled:
+64 objects per batch and a required 24-hour recorded revalidation grace. An
+enabled caller may choose another bounded batch and minimum grace, but the
+minimum cannot fall below the protocol's 390-second lease, skew, and propagation
+floor. Deletion rejects a run whose durable second observation used less grace
+than the active policy requires; changing policy cannot rewrite that history.
+
 The run record contains only run UUID, generation, cutoff, segment-pool
 identity, both immutable observation root-list identities/digests, mark and
 candidate shard locations/checksums, bounded work statistics, phase, quarantine

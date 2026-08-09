@@ -20,6 +20,7 @@ use uuid::Uuid;
 const ROOT_VERIFY_CONCURRENCY: usize = 16;
 /// Five-minute maximum lease + 30-second skew + one-minute propagation bound.
 pub(crate) const MIN_REVALIDATION_GRACE_SECONDS: u64 = 390;
+pub const DEFAULT_GC_DELETION_MIN_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_DELETE_BATCH_SIZE: u32 = 4_096;
 pub(crate) const MAX_ARTIFACT_CLEANUP_OBJECTS: usize = 4_096;
 const GC_ARTIFACT_PREFIX: &str = "__zerofs_gc";
@@ -29,13 +30,18 @@ static ACTIVE_GC_QUARANTINES: OnceLock<Mutex<BTreeMap<Uuid, i64>>> = OnceLock::n
 pub struct GcDeletionPolicy {
     pub enabled: bool,
     pub batch_size: u32,
+    /// Minimum separation the durable second observation must have required
+    /// from the first quarantine. The production default is 24 hours and the
+    /// invariant floor remains the lease/skew/propagation bound.
+    pub minimum_revalidation_grace_seconds: u64,
 }
 
 impl Default for GcDeletionPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            batch_size: 256,
+            batch_size: 64,
+            minimum_revalidation_grace_seconds: DEFAULT_GC_DELETION_MIN_GRACE_SECONDS,
         }
     }
 }
@@ -669,6 +675,12 @@ impl RootCaptureLifecycle {
             ))
             .into());
         }
+        if policy.minimum_revalidation_grace_seconds < MIN_REVALIDATION_GRACE_SECONDS {
+            return Err(CatalogError::Invalid(format!(
+                "GC delete minimum revalidation grace must be at least {MIN_REVALIDATION_GRACE_SECONDS} seconds"
+            ))
+            .into());
+        }
         let mut run = self
             .gc_run_for_phase(run_id)
             .await?
@@ -686,6 +698,13 @@ impl RootCaptureLifecycle {
         let observation = run.revalidation.clone().ok_or_else(|| {
             CatalogError::OperationConflict(format!("{run_id}: revalidation is incomplete"))
         })?;
+        if observation.grace_seconds < policy.minimum_revalidation_grace_seconds {
+            return Err(CatalogError::OperationConflict(format!(
+                "GC run {run_id} used {} seconds of revalidation grace, below deletion policy minimum {}",
+                observation.grace_seconds, policy.minimum_revalidation_grace_seconds
+            ))
+            .into());
+        }
         // Valid root publication is forward-closed: it can inherit only from
         // roots captured at H or allocate a globally fresh pool segment ID.
         // Thus a post-H mutation cannot resurrect one of H's unreachable IDs;
@@ -1707,6 +1726,7 @@ mod tests {
         let policy = GcDeletionPolicy {
             enabled: true,
             batch_size: 1,
+            minimum_revalidation_grace_seconds: MIN_REVALIDATION_GRACE_SECONDS,
         };
         lifecycle.deletion_control.enable();
         let completed = lifecycle.delete_batch(run_id, policy).await.unwrap();
@@ -2136,6 +2156,7 @@ mod tests {
                     GcDeletionPolicy {
                         enabled: true,
                         batch_size: 1,
+                        minimum_revalidation_grace_seconds: MIN_REVALIDATION_GRACE_SECONDS,
                     },
                 )
                 .await,
@@ -2572,6 +2593,7 @@ mod tests {
         let policy = GcDeletionPolicy {
             enabled: true,
             batch_size: 1,
+            minimum_revalidation_grace_seconds: MIN_REVALIDATION_GRACE_SECONDS,
         };
         assert!(matches!(
             lifecycle.delete_batch(run.id, policy).await,
@@ -2579,6 +2601,17 @@ mod tests {
                 if message.contains("rapid kill switch")
         ));
         deletion_control.enable();
+        let conservative_policy = GcDeletionPolicy {
+            minimum_revalidation_grace_seconds: MIN_REVALIDATION_GRACE_SECONDS + 1,
+            ..policy
+        };
+        assert!(matches!(
+            lifecycle.delete_batch(run.id, conservative_policy).await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(ref message)
+            )) if message.contains("below deletion policy minimum")
+        ));
+        assert_eq!(catalog.gc_run(run.id).await.unwrap().unwrap(), validated);
         let partial = lifecycle.delete_batch(run.id, policy).await.unwrap();
         assert_eq!(partial.phase, GcRunPhase::Deleting);
         assert_eq!(partial.revision, 7);
