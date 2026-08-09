@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revalidation_enforces_grace_and_filters_absent_candidates_without_deleting() {
+    async fn collector_matches_ideal_two_observation_model_and_cutoff() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let data_path = Path::from("gc-revalidation-data");
         let db = Db::builder(data_path.clone(), Arc::clone(&store))
@@ -1317,6 +1317,7 @@ mod tests {
         let absent = Segid::new(12, 512);
         let retained = Segid::new(12, 768);
         let retained_two = Segid::new(12, 1_024);
+        let newer_than_cutoff = Segid::new(12, 1_280);
         for segment in [reachable, became_reachable, absent, retained, retained_two] {
             store
                 .put(
@@ -1326,8 +1327,50 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let now = catalog_timestamp(Utc::now());
-        let inventory_cutoff = now + Duration::seconds(1);
+        let mut newest_existing = DateTime::<Utc>::MIN_UTC;
+        for segment in [reachable, became_reachable, absent, retained, retained_two] {
+            newest_existing = newest_existing.max(
+                store
+                    .head(&Path::from(format!(
+                        "{segment_pool}/{}",
+                        segment.object_key()
+                    )))
+                    .await
+                    .unwrap()
+                    .last_modified,
+            );
+        }
+        let inventory_cutoff = catalog_timestamp(newest_existing + Duration::microseconds(1));
+        let now = inventory_cutoff;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newer_path = Path::from(format!("{segment_pool}/{}", newer_than_cutoff.object_key()));
+        store
+            .put(&newer_path, bytes::Bytes::from_static(b"x").into())
+            .await
+            .unwrap();
+        assert!(
+            store.head(&newer_path).await.unwrap().last_modified > inventory_cutoff,
+            "the post-cutoff fixture must actually be newer than the immutable cutoff"
+        );
+        let inventory_eligible = std::collections::BTreeSet::from([
+            reachable,
+            became_reachable,
+            absent,
+            retained,
+            retained_two,
+        ]);
+        let first_reachable = std::collections::BTreeSet::from([reachable]);
+        let first_candidates = inventory_eligible
+            .difference(&first_reachable)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let second_reachable = std::collections::BTreeSet::from([reachable, became_reachable]);
+        let absent_before_revalidation = std::collections::BTreeSet::from([absent]);
+        let ideal_deletions = first_candidates
+            .difference(&second_reachable)
+            .copied()
+            .filter(|segment| !absent_before_revalidation.contains(segment))
+            .collect::<std::collections::BTreeSet<_>>();
         let run = GcRunRecord {
             id: Uuid::new_v4(),
             revision: 1,
@@ -1406,7 +1449,17 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .candidate_objects,
-            4
+            first_candidates.len() as u64
+        );
+        let inventory_stats = quarantined.inventory_stats.as_ref().unwrap();
+        assert_eq!(
+            inventory_stats.objects_seen,
+            inventory_eligible.len() as u64 + 1
+        );
+        assert_eq!(inventory_stats.objects_newer_than_cutoff, 1);
+        assert_eq!(
+            inventory_stats.reachable_objects,
+            first_reachable.len() as u64
         );
         let obsolete_policy = GcArtifactCleanupPolicy {
             observed_at: quarantined.updated_at + Duration::seconds(1),
@@ -1525,10 +1578,19 @@ mod tests {
             .stats
             .as_ref()
             .unwrap();
-        assert_eq!(stats.first_observation_candidates, 4);
-        assert_eq!(stats.became_reachable, 1);
-        assert_eq!(stats.already_absent, 1);
-        assert_eq!(stats.retained_candidates, 2);
+        assert_eq!(
+            stats.first_observation_candidates,
+            first_candidates.len() as u64
+        );
+        assert_eq!(
+            stats.became_reachable,
+            first_candidates.intersection(&second_reachable).count() as u64
+        );
+        assert_eq!(
+            stats.already_absent,
+            absent_before_revalidation.len() as u64
+        );
+        assert_eq!(stats.retained_candidates, ideal_deletions.len() as u64);
         let observation = validated.revalidation.as_ref().unwrap();
         let observation_prefix = Path::from(format!("{GC_ARTIFACT_PREFIX}/{}", observation.id));
         assert!(store.list(Some(&observation_prefix)).next().await.is_some());
@@ -1648,8 +1710,8 @@ mod tests {
         assert_eq!(completed.revision, 8);
         let deletion = completed.deletion.as_ref().unwrap();
         assert_eq!(deletion.next_shard, 256);
-        assert_eq!(deletion.deleted_objects, 2);
-        assert_eq!(deletion.deleted_bytes, 2);
+        assert_eq!(deletion.deleted_objects, ideal_deletions.len() as u64);
+        assert_eq!(deletion.deleted_bytes, ideal_deletions.len() as u64);
         assert_eq!(deletion.already_absent, 0);
         assert!(deletion.completed_at.is_some());
         assert!(matches!(
@@ -1661,6 +1723,26 @@ mod tests {
                 .await,
             Err(object_store::Error::NotFound { .. })
         ));
+        for segment in [
+            reachable,
+            became_reachable,
+            absent,
+            retained,
+            retained_two,
+            newer_than_cutoff,
+        ] {
+            let object = Path::from(format!("{segment_pool}/{}", segment.object_key()));
+            let should_be_absent =
+                absent_before_revalidation.contains(&segment) || ideal_deletions.contains(&segment);
+            assert_eq!(
+                matches!(
+                    store.head(&object).await,
+                    Err(object_store::Error::NotFound { .. })
+                ),
+                should_be_absent,
+                "collector decision for {segment:?} disagrees with the ideal two-observation model"
+            );
+        }
         assert!(matches!(
             store
                 .head(&Path::from(format!(

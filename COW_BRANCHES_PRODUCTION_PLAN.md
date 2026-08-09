@@ -274,16 +274,16 @@
 
 ### Epic 5.2: Validate GC safety
 
-- [ ] Build a model test that computes ideal reachability and compares it with collector decisions.
+- [x] Build a model test that computes ideal reachability and compares it with collector decisions.
 - [ ] Test catalog changes during root capture, marking, inventory, quarantine, and deletion.
 - [ ] Test branches and checkpoints created immediately before and after the inventory cutoff.
-- [ ] Test deletion of parents and source checkpoints with surviving descendants.
+- [x] Test deletion of parents and source checkpoints with surviving descendants.
 - [ ] Test active, expired, renewed, and corrupted leases.
 - [ ] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
 - [ ] Test collector crashes and restarts in every persisted phase.
 - [ ] Test partial and ambiguous object-store deletes.
 - [ ] Assert that uncertainty always retains data.
-- [ ] Assert eventual reclamation once an object is stably unreachable.
+- [x] Assert eventual reclamation once an object is stably unreachable.
 
 ### Epic 5.3: Validate scale and operability
 
@@ -606,3 +606,9 @@
 - A restart matrix reconstructs the lifecycle object and resumes one exact create before reservation, after the atomic reservation, after clone/result storage but before catalog root publication, after root publication, and after atomic `Ready` publication. Every state converges on the same authenticated root, and a subsequent exact retry returns the same branch.
 - Existing focused fault stores prove applied clone and immutable-result writes reconcile after lost responses; exact catalog tests reject stale revisions and conflicting operation reuse while accepting duplicates. Branch/checkpoint deletion and lease tests cover applied-response loss, writer races, exact release/renewal, and name reuse without retargeting stable UUIDs.
 - A 32-level lineage test creates each child from the exact current checkpoint, deletes that checkpoint and its live parent catalog record, removes the original physical named checkpoint after the first clone, and continues from the child's owned root. At completion only the deepest branch is live, every historical stable ID is tombstoned, snapshot validation succeeds, and root verification does not consult live ancestor catalog records.
+
+### 2026-08-08: ideal two-observation GC model
+
+- The complete collector test now computes its expected first candidates and final deletions with independent set operations over physical inventory, first roots, second roots, absent objects, and the immutable inventory cutoff. It compares published inventory/revalidation totals and every final segment-pool presence decision against that oracle rather than only asserting hand-written counts.
+- The fixture covers a pinned checkpoint-shaped root present at cutoff, an object proven by its storage metadata to have been written after cutoff, another pinned checkpoint-shaped root introduced between observations, a candidate that becomes reachable, an already-absent candidate, and two stably unreachable unchanged candidates. The post-cutoff object and both reachable classes survive; only the oracle's stable unreachable set is physically reclaimed. Catalog-driven branch and checkpoint creation immediately around capture remains a separate open case.
+- Descendant-preserving branch deletion remains covered by the lifecycle tests: named source checkpoints and live parents can be deleted without retargeting or invalidating the surviving child's owned root. This closes the descendant, ideal-decision, and eventual-reclamation items; catalog-driven cutoff creation, mutation-at-every-phase, lease corruption, artifact corruption, and restart matrices remain separate GC-safety work.
