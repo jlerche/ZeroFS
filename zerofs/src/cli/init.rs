@@ -152,6 +152,37 @@ impl CatalogRuntime {
         Ok(branch)
     }
 
+    pub(crate) async fn create_initial_branch(
+        &self,
+        request: zerofs::catalog::InitialBranchCreateRequest,
+    ) -> Result<zerofs::catalog::BranchRecord> {
+        let branch = self
+            .lifecycle
+            .create_initial_from_checkpoint(request)
+            .await
+            .context("Failed to bootstrap authoritative branch")?;
+        self.reconcile_projection("initial branch bootstrap").await;
+        Ok(branch)
+    }
+
+    pub(crate) async fn resume_initial_branch(
+        &self,
+        operation_id: uuid::Uuid,
+        destination_id: uuid::Uuid,
+        destination_name: &str,
+    ) -> Result<Option<zerofs::catalog::BranchRecord>> {
+        let branch = self
+            .lifecycle
+            .resume_initial_create(operation_id, destination_id, destination_name)
+            .await
+            .context("Failed to resume authoritative branch bootstrap")?;
+        if branch.is_some() {
+            self.reconcile_projection("initial branch bootstrap resume")
+                .await;
+        }
+        Ok(branch)
+    }
+
     pub(crate) async fn delete_branch(
         &self,
         operation_id: uuid::Uuid,
@@ -1957,5 +1988,117 @@ mod role_decision_tests {
         assert!(recovering_handoff);
         assert!(elected_leader);
         assert!(faults.get_count() >= 3);
+    }
+}
+
+#[cfg(test)]
+mod catalog_runtime_tests {
+    use super::CatalogRuntime;
+    use slatedb::Db;
+    use slatedb::admin::AdminBuilder;
+    use slatedb::config::{CheckpointOptions, CheckpointScope};
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path;
+    use std::sync::Arc;
+    use zerofs::catalog::{
+        BranchFeatureConfig, CatalogConfig, CustomerCatalogListRequest, CustomerResourceKind,
+        ImmutableCheckpoint, InitialBranchCreateRequest, JsonCatalogProjection, catalog_timestamp,
+    };
+
+    #[tokio::test]
+    async fn initial_branch_resume_reconciles_customer_projection() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("bootstrap-projection/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"baseline", b"data").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("bootstrap-source".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(Some("bootstrap-source"))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let config = CatalogConfig {
+            slatedb_path: "bootstrap-projection/catalog".to_string(),
+            features: BranchFeatureConfig {
+                create: true,
+                mount: false,
+                checkpoint_delete: false,
+                branch_delete: false,
+            },
+        };
+        let lifecycle = config
+            .open_branch_lifecycle(
+                Arc::clone(&store),
+                Path::from("bootstrap-projection/branches"),
+                Path::from("bootstrap-projection/segment-pool"),
+            )
+            .await
+            .unwrap();
+        let request = InitialBranchCreateRequest {
+            operation_id: uuid::Uuid::new_v4(),
+            destination_id: uuid::Uuid::new_v4(),
+            destination_name: "main".to_string(),
+            source: ImmutableCheckpoint {
+                database_path: source_path,
+                checkpoint_id: checkpoint.id,
+                manifest_id: checkpoint.manifest_id,
+            },
+            created_at: catalog_timestamp(physical.create_time),
+        };
+        lifecycle
+            .create_initial_from_checkpoint(request.clone())
+            .await
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let projection = Arc::new(JsonCatalogProjection::new(
+            directory.path().join("customer-catalog.json"),
+        ));
+        let runtime = CatalogRuntime {
+            lifecycle,
+            volume_id: uuid::Uuid::new_v4(),
+            projection: Some(projection),
+        };
+        let branch = runtime
+            .resume_initial_branch(
+                request.operation_id,
+                request.destination_id,
+                &request.destination_name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let page = runtime
+            .customer_catalog()
+            .unwrap()
+            .list(CustomerCatalogListRequest {
+                kind: Some(CustomerResourceKind::Branch),
+                parent_id: None,
+                state: None,
+                after: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].resource_id, branch.id);
+        assert_eq!(page.records[0].name, "main");
+        runtime.lifecycle.close().await.unwrap();
     }
 }

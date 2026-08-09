@@ -48,8 +48,8 @@ pub use lifecycle::{
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchFeatureConfig,
     BranchInspection, BranchLifecycle, BranchLifecycleError, BranchLineageInspection,
     BranchMountGrant, BranchMountRequest, CheckpointCreateRequest, HistoricalResource,
-    HistoricalResourceStatus, MAX_ADMINISTRATIVE_INSPECTION_RECORDS, ServerWriterMountDisposition,
-    ServerWriterMountPreparation, ServerWriterMountRequest,
+    HistoricalResourceStatus, InitialBranchCreateRequest, MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
+    ServerWriterMountDisposition, ServerWriterMountPreparation, ServerWriterMountRequest,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
@@ -531,12 +531,7 @@ impl BranchCreateOperation {
         validate_id(self.destination_id, "branch create destination")?;
         validate_name(&self.destination_name)?;
         validate_id(self.source_checkpoint_id, "branch create source checkpoint")?;
-        let source_branch_id = self.parent_id.ok_or_else(|| {
-            CatalogError::Invalid(
-                "branch create operation requires its exact source branch UUID".to_string(),
-            )
-        })?;
-        validate_id(source_branch_id, "branch create source branch")?;
+        validate_optional_id(self.parent_id, "branch create source branch")?;
         validate_root(&self.source_root)?;
         if self.destination_id == self.source_checkpoint_id
             || self.id == self.destination_id
@@ -2646,7 +2641,16 @@ pub(crate) fn gc_root_digest(roots: &[GcRootPin]) -> Result<String, CatalogError
 
 fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {
     let mut destinations = std::collections::BTreeSet::new();
+    let mut genesis_operations = 0usize;
     for operation in snapshot.branch_create_operations.values() {
+        if operation.parent_id.is_none() {
+            genesis_operations += 1;
+            if genesis_operations > 1 {
+                return Err(CatalogError::Corrupt(
+                    "catalog contains multiple parentless genesis operations".to_string(),
+                ));
+            }
+        }
         if !destinations.insert(operation.destination_id) {
             return Err(CatalogError::Corrupt(format!(
                 "multiple create operations target branch {}",
@@ -2664,10 +2668,11 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                             operation.id
                         ))
                     })?;
+                let expected_origin = operation.parent_id.map(|_| operation.source_checkpoint_id);
                 if branch.state != BranchState::Creating
                     || branch.name != operation.destination_name
                     || branch.parent_id != operation.parent_id
-                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    || branch.origin_checkpoint_id != expected_origin
                     || branch.root.is_some()
                 {
                     return Err(CatalogError::Corrupt(format!(
@@ -2675,7 +2680,10 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                         operation.id
                     )));
                 }
-                if operation.phase == BranchCreatePhase::Reserved {
+                if operation.parent_id.is_none() {
+                    // A genesis operation is sourced from an exact physical
+                    // checkpoint outside the previously empty catalog.
+                } else if operation.phase == BranchCreatePhase::Reserved {
                     let source = snapshot
                         .checkpoints
                         .get(&operation.source_checkpoint_id)
@@ -2724,9 +2732,11 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                                 deletion.branch_id == branch.id
                                     && deletion.phase == BranchDeletePhase::Draining
                             }));
+                    let expected_origin =
+                        operation.parent_id.map(|_| operation.source_checkpoint_id);
                     if !state_matches
                         || branch.parent_id != operation.parent_id
-                        || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                        || branch.origin_checkpoint_id != expected_origin
                     {
                         return Err(CatalogError::Corrupt(format!(
                             "published operation {} disagrees with its destination branch",

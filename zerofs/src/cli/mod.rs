@@ -205,6 +205,23 @@ pub enum CheckpointCommands {
 
 #[derive(Subcommand)]
 pub enum BranchCommands {
+    /// Bootstrap the one parentless branch from an offline physical checkpoint
+    Bootstrap {
+        #[arg(short, long)]
+        config: PathBuf,
+        name: String,
+        #[arg(long)]
+        source_checkpoint: String,
+        /// Stable destination UUID for an exact retry
+        #[arg(long)]
+        id: Option<uuid::Uuid>,
+        /// Stable operation UUID for an exact retry
+        #[arg(long)]
+        operation_id: Option<uuid::Uuid>,
+        /// Confirm the source volume and every catalog/GC process are stopped
+        #[arg(long)]
+        confirm_offline: bool,
+    },
     /// Create a branch from one named checkpoint on an exact source branch
     Create {
         #[arg(short, long)]

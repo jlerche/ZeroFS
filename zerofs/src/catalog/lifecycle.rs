@@ -20,6 +20,15 @@ pub struct BranchCreateRequest {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InitialBranchCreateRequest {
+    pub operation_id: Uuid,
+    pub destination_id: Uuid,
+    pub destination_name: String,
+    pub source: ImmutableCheckpoint,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCreateFromCheckpointNameRequest {
     pub operation_id: Uuid,
@@ -867,17 +876,115 @@ impl BranchLifecycle {
                 .await?;
             self.operation(request.operation_id).await?
         };
+        self.finish_create(operation, &request.source, request.created_at)
+            .await
+    }
+
+    /// Bootstrap the one parentless catalog branch from an exact physical
+    /// checkpoint while the source volume is offline.
+    ///
+    /// The ordinary reservation/root/publication protocol remains in force;
+    /// only the source checkpoint is outside the previously empty catalog.
+    /// SlateDB admission permits exactly one such genesis operation forever.
+    pub async fn create_initial_from_checkpoint(
+        &self,
+        request: InitialBranchCreateRequest,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
+        self.require_create_enabled()?;
+        let existing = self
+            .catalog
+            .branch_create_operation(request.operation_id)
+            .await?;
+        let operation = if let Some(existing) = existing {
+            if existing.destination_id != request.destination_id
+                || existing.destination_name != request.destination_name
+                || existing.source_checkpoint_id != request.source.checkpoint_id
+                || existing.source_root != request.source.durable_root()
+                || existing.parent_id.is_some()
+                || existing.created_at != request.created_at
+            {
+                return Err(
+                    CatalogError::OperationConflict(request.operation_id.to_string()).into(),
+                );
+            }
+            existing
+        } else {
+            self.roots.verify_checkpoint(&request.source).await?;
+            let branch = BranchRecord {
+                id: request.destination_id,
+                revision: 1,
+                name: request.destination_name.clone(),
+                state: BranchState::Creating,
+                root: None,
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: request.created_at,
+                updated_at: request.created_at,
+            };
+            let reservation = BranchCreateOperation {
+                id: request.operation_id,
+                revision: 1,
+                destination_id: request.destination_id,
+                destination_name: request.destination_name.clone(),
+                source_checkpoint_id: request.source.checkpoint_id,
+                source_root: request.source.durable_root(),
+                parent_id: None,
+                phase: BranchCreatePhase::Reserved,
+                destination_root: None,
+                created_at: request.created_at,
+                updated_at: request.created_at,
+            };
+            self.catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch,
+                    operation: Box::new(reservation),
+                })
+                .await?;
+            self.operation(request.operation_id).await?
+        };
+        self.finish_create(operation, &request.source, request.created_at)
+            .await
+    }
+
+    /// Resume an already-reserved genesis operation without resolving a
+    /// mutable physical checkpoint name again. A missing operation is not an
+    /// error so the offline CLI can distinguish first publication from retry.
+    pub async fn resume_initial_create(
+        &self,
+        operation_id: Uuid,
+        destination_id: Uuid,
+        destination_name: &str,
+    ) -> Result<Option<BranchRecord>, BranchLifecycleError> {
+        self.require_create_enabled()?;
+        let Some(operation) = self.catalog.branch_create_operation(operation_id).await? else {
+            return Ok(None);
+        };
+        if operation.destination_id != destination_id
+            || operation.destination_name != destination_name
+            || operation.parent_id.is_some()
+        {
+            return Err(CatalogError::OperationConflict(operation_id.to_string()).into());
+        }
+        let source = ImmutableCheckpoint::from_durable_root(&operation.source_root)?;
+        let created_at = operation.created_at;
+        self.finish_create(operation, &source, created_at)
+            .await
+            .map(Some)
+    }
+
+    async fn finish_create(
+        &self,
+        operation: BranchCreateOperation,
+        source: &ImmutableCheckpoint,
+        created_at: DateTime<Utc>,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
         if operation.phase == BranchCreatePhase::Published {
             return self.ready_branch(operation.destination_id).await;
         }
         let destination_root = match operation.phase {
             BranchCreatePhase::Reserved => {
                 self.roots
-                    .create_from_checkpoint(
-                        request.operation_id,
-                        request.destination_id,
-                        &request.source,
-                    )
+                    .create_from_checkpoint(operation.id, operation.destination_id, source)
                     .await?
             }
             BranchCreatePhase::RootCreated => {
@@ -892,14 +999,14 @@ impl BranchLifecycle {
         self.roots.verify(&destination_root).await?;
         self.catalog
             .apply(CatalogMutation::RecordBranchCreateRoot {
-                operation_id: request.operation_id,
+                operation_id: operation.id,
                 expected_revision: operation.revision,
                 destination_root: destination_root.clone(),
-                updated_at: transition_time(request.created_at),
+                updated_at: transition_time(created_at),
             })
             .await?;
 
-        let operation = self.operation(request.operation_id).await?;
+        let operation = self.operation(operation.id).await?;
         if operation.phase == BranchCreatePhase::Published {
             return self.ready_branch(operation.destination_id).await;
         }
@@ -914,12 +1021,12 @@ impl BranchLifecycle {
         self.roots.verify(&destination_root).await?;
         self.catalog
             .apply(CatalogMutation::PublishBranchCreate {
-                operation_id: request.operation_id,
+                operation_id: operation.id,
                 expected_revision: operation.revision,
-                updated_at: transition_time(request.created_at),
+                updated_at: transition_time(created_at),
             })
             .await?;
-        self.ready_branch(request.destination_id).await
+        self.ready_branch(operation.destination_id).await
     }
 
     async fn operation(
@@ -1198,6 +1305,341 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
+
+    async fn reserve_genesis(
+        catalog: &SlateDbCatalog,
+        request: &InitialBranchCreateRequest,
+    ) -> BranchCreateOperation {
+        let operation = BranchCreateOperation {
+            id: request.operation_id,
+            revision: 1,
+            destination_id: request.destination_id,
+            destination_name: request.destination_name.clone(),
+            source_checkpoint_id: request.source.checkpoint_id,
+            source_root: request.source.durable_root(),
+            parent_id: None,
+            phase: BranchCreatePhase::Reserved,
+            destination_root: None,
+            created_at: request.created_at,
+            updated_at: request.created_at,
+        };
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: BranchRecord {
+                    id: request.destination_id,
+                    revision: 1,
+                    name: request.destination_name.clone(),
+                    state: BranchState::Creating,
+                    root: None,
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: request.created_at,
+                    updated_at: request.created_at,
+                },
+                operation: Box::new(operation.clone()),
+            })
+            .await
+            .unwrap();
+        operation
+    }
+
+    #[tokio::test]
+    async fn offline_genesis_bootstrap_is_exact_independent_and_singleton() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("genesis/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"baseline", b"postgres-data").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("bootstrap-source".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(Some("bootstrap-source"))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let source = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("genesis/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let roots = SlateDbRootStore::new(Arc::clone(&store), Path::from("genesis/branches"));
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots.clone());
+        let request = InitialBranchCreateRequest {
+            operation_id: Uuid::new_v4(),
+            destination_id: Uuid::new_v4(),
+            destination_name: "main".to_string(),
+            source: source.clone(),
+            created_at: catalog_timestamp(physical.create_time),
+        };
+
+        let created = lifecycle
+            .create_initial_from_checkpoint(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(created.parent_id, None);
+        assert_eq!(created.origin_checkpoint_id, None);
+        assert_eq!(created.state, BranchState::Ready);
+        assert_eq!(
+            lifecycle
+                .create_initial_from_checkpoint(request.clone())
+                .await
+                .unwrap(),
+            created
+        );
+        roots.verify(created.root.as_ref().unwrap()).await.unwrap();
+
+        let error = lifecycle
+            .create_initial_from_checkpoint(InitialBranchCreateRequest {
+                operation_id: Uuid::new_v4(),
+                destination_id: Uuid::new_v4(),
+                destination_name: "second-main".to_string(),
+                source: source.clone(),
+                created_at: request.created_at,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BranchLifecycleError::Catalog(CatalogError::OperationConflict(_))
+        ));
+
+        AdminBuilder::new(source_path, Arc::clone(&store))
+            .build()
+            .delete_checkpoint(checkpoint.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            lifecycle
+                .resume_initial_create(
+                    request.operation_id,
+                    request.destination_id,
+                    &request.destination_name,
+                )
+                .await
+                .unwrap(),
+            Some(created.clone())
+        );
+        assert_eq!(
+            lifecycle
+                .create_initial_from_checkpoint(request)
+                .await
+                .unwrap(),
+            created
+        );
+        let clone = Db::open(
+            Path::from(created.root.as_ref().unwrap().identity.clone()),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            clone.get(b"baseline").await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"postgres-data")
+        );
+        clone.close().await.unwrap();
+        catalog.snapshot().await.unwrap().validate().unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_genesis_resume_does_not_retarget_reused_source_name() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("genesis-reserved/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"baseline", b"original").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("bootstrap-source".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(Some("bootstrap-source"))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = InitialBranchCreateRequest {
+            operation_id: Uuid::new_v4(),
+            destination_id: Uuid::new_v4(),
+            destination_name: "main".to_string(),
+            source: ImmutableCheckpoint {
+                database_path: source_path.clone(),
+                checkpoint_id: checkpoint.id,
+                manifest_id: checkpoint.manifest_id,
+            },
+            created_at: catalog_timestamp(physical.create_time),
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("genesis-reserved/catalog"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        reserve_genesis(catalog.as_ref(), &request).await;
+
+        AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .delete_checkpoint(checkpoint.id)
+            .await
+            .unwrap();
+        let source_db = Db::open(source_path, Arc::clone(&store)).await.unwrap();
+        source_db.put(b"baseline", b"replacement").await.unwrap();
+        source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("bootstrap-source".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+
+        let lifecycle = BranchLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(Arc::clone(&store), Path::from("genesis-reserved/branches")),
+        );
+        assert!(matches!(
+            lifecycle
+                .resume_initial_create(
+                    request.operation_id,
+                    request.destination_id,
+                    &request.destination_name,
+                )
+                .await,
+            Err(BranchLifecycleError::RootStore(_))
+        ));
+        let operation = catalog
+            .branch_create_operation(request.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.phase, BranchCreatePhase::Reserved);
+        assert_eq!(operation.source_root, request.source.durable_root());
+        catalog.snapshot().await.unwrap().validate().unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_created_genesis_resumes_after_source_checkpoint_is_deleted() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("genesis-root-created/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"baseline", b"original").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("bootstrap-source".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(Some("bootstrap-source"))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = InitialBranchCreateRequest {
+            operation_id: Uuid::new_v4(),
+            destination_id: Uuid::new_v4(),
+            destination_name: "main".to_string(),
+            source: ImmutableCheckpoint {
+                database_path: source_path.clone(),
+                checkpoint_id: checkpoint.id,
+                manifest_id: checkpoint.manifest_id,
+            },
+            created_at: catalog_timestamp(physical.create_time),
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from("genesis-root-created/catalog"),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        let operation = reserve_genesis(catalog.as_ref(), &request).await;
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("genesis-root-created/branches"),
+        );
+        let destination_root = roots
+            .create_from_checkpoint(
+                request.operation_id,
+                request.destination_id,
+                &request.source,
+            )
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::RecordBranchCreateRoot {
+                operation_id: operation.id,
+                expected_revision: operation.revision,
+                destination_root: destination_root.clone(),
+                updated_at: transition_time(operation.created_at),
+            })
+            .await
+            .unwrap();
+        AdminBuilder::new(source_path, Arc::clone(&store))
+            .build()
+            .delete_checkpoint(checkpoint.id)
+            .await
+            .unwrap();
+
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let branch = lifecycle
+            .resume_initial_create(
+                request.operation_id,
+                request.destination_id,
+                &request.destination_name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch.state, BranchState::Ready);
+        assert_eq!(branch.root.as_ref(), Some(&destination_root));
+        assert_eq!(branch.parent_id, None);
+        assert_eq!(branch.origin_checkpoint_id, None);
+        catalog.snapshot().await.unwrap().validate().unwrap();
+        catalog.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn checkpoint_publication_authenticates_and_retries_without_generation_change() {

@@ -156,6 +156,24 @@ async fn async_main() -> Result<()> {
             }
         },
         cli::Commands::Branch { subcommand } => match subcommand {
+            cli::BranchCommands::Bootstrap {
+                config,
+                name,
+                source_checkpoint,
+                id,
+                operation_id,
+                confirm_offline,
+            } => {
+                cli::branch::bootstrap_branch(
+                    &config,
+                    &name,
+                    &source_checkpoint,
+                    id,
+                    operation_id,
+                    confirm_offline,
+                )
+                .await?;
+            }
             cli::BranchCommands::Create {
                 config,
                 name,

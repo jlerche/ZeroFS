@@ -385,7 +385,9 @@ impl SlateDbCatalog {
         let gc_runs = self.scan_records::<GcRunRecord>(GC_RUN_PREFIX).await?;
         let expected_source_holds = branch_create_operations
             .iter()
-            .filter(|operation| operation.phase == BranchCreatePhase::Reserved)
+            .filter(|operation| {
+                operation.phase == BranchCreatePhase::Reserved && operation.parent_id.is_some()
+            })
             .map(|operation| branch_create_source_key(operation.source_checkpoint_id, operation.id))
             .collect::<BTreeSet<_>>();
         let mut source_hold_iterator = self.db.scan_prefix(BRANCH_CREATE_SOURCE_PREFIX, ..).await?;
@@ -1121,12 +1123,9 @@ impl SlateDbCatalog {
             .filter(|operation| operation.phase != BranchCreatePhase::Published)
         {
             operation.validate()?;
-            let parent_id = operation.parent_id.ok_or_else(|| {
-                CatalogError::Corrupt(format!(
-                    "incomplete branch create {} lost its parent",
-                    operation.id
-                ))
-            })?;
+            let Some(parent_id) = operation.parent_id else {
+                continue;
+            };
             let blocker = blockers.get_mut(&parent_id).ok_or_else(|| {
                 CatalogError::Corrupt(format!(
                     "branch create {} has no blocker parent {parent_id}",
@@ -1243,12 +1242,9 @@ impl SlateDbCatalog {
             .values()
             .filter(|operation| operation.phase != BranchCreatePhase::Published)
         {
-            let parent_id = operation.parent_id.ok_or_else(|| {
-                CatalogError::Corrupt(format!(
-                    "incomplete branch create {} lost its parent",
-                    operation.id
-                ))
-            })?;
+            let Some(parent_id) = operation.parent_id else {
+                continue;
+            };
             let blocker = expected.get_mut(&parent_id).ok_or_else(|| {
                 CatalogError::Corrupt(format!(
                     "branch create {} has no blocker parent {parent_id}",
@@ -2144,6 +2140,7 @@ impl SlateDbCatalog {
                 operation.validate()?;
                 ensure_initial_revision(branch.revision)?;
                 ensure_initial_revision(operation.revision)?;
+                let expected_origin = operation.parent_id.map(|_| operation.source_checkpoint_id);
                 if branch.state != BranchState::Creating
                     || branch.root.is_some()
                     || operation.phase != BranchCreatePhase::Reserved
@@ -2151,7 +2148,7 @@ impl SlateDbCatalog {
                     || branch.id != operation.destination_id
                     || branch.name != operation.destination_name
                     || branch.parent_id != operation.parent_id
-                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    || branch.origin_checkpoint_id != expected_origin
                     || branch.created_at != operation.created_at
                     || branch.updated_at != operation.updated_at
                     || operation.updated_at != operation.created_at
@@ -2177,27 +2174,27 @@ impl SlateDbCatalog {
                     &branch.name,
                 )
                 .await?;
-                let source = self
-                    .get_record::<CheckpointRecord>(checkpoint_key(operation.source_checkpoint_id))
-                    .await?
-                    .ok_or_else(|| {
-                        CatalogError::NotFound(operation.source_checkpoint_id.to_string())
-                    })?;
-                if source.root != operation.source_root
-                    || operation.parent_id != Some(source.branch_id)
-                {
-                    return Err(CatalogError::OperationConflict(format!(
-                        "source checkpoint {} identity changed",
-                        source.id
-                    )));
-                }
-                if self.has_local_gc_guard_for_branch(source.branch_id).await? {
-                    return Err(CatalogError::OperationConflict(format!(
-                        "branch {} has an active local GC guard",
-                        source.branch_id
-                    )));
-                }
                 if let Some(parent_id) = operation.parent_id {
+                    let source = self
+                        .get_record::<CheckpointRecord>(checkpoint_key(
+                            operation.source_checkpoint_id,
+                        ))
+                        .await?
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(operation.source_checkpoint_id.to_string())
+                        })?;
+                    if source.root != operation.source_root || parent_id != source.branch_id {
+                        return Err(CatalogError::OperationConflict(format!(
+                            "source checkpoint {} identity changed",
+                            source.id
+                        )));
+                    }
+                    if self.has_local_gc_guard_for_branch(source.branch_id).await? {
+                        return Err(CatalogError::OperationConflict(format!(
+                            "branch {} has an active local GC guard",
+                            source.branch_id
+                        )));
+                    }
                     ensure_known_resource(self.db.as_ref(), parent_id, TombstoneKind::Branch)
                         .await?;
                     let mut parent_blockers =
@@ -2211,6 +2208,17 @@ impl SlateDbCatalog {
                         private_gc_branch_blocker_key(parent_id),
                         &parent_blockers,
                     )?;
+                } else {
+                    let mut branches = self.db.scan_prefix(BRANCH_PREFIX, ..).await?;
+                    let mut operations = self
+                        .db
+                        .scan_prefix(BRANCH_CREATE_OPERATION_PREFIX, ..)
+                        .await?;
+                    if branches.next().await?.is_some() || operations.next().await?.is_some() {
+                        return Err(CatalogError::OperationConflict(
+                            "the catalog genesis branch is already reserved".to_string(),
+                        ));
+                    }
                 }
                 let lineage_depth = self
                     .next_lineage_depth_unlocked(operation.parent_id)
@@ -2236,10 +2244,12 @@ impl SlateDbCatalog {
                     branch_create_operation_key(operation.id),
                     &operation,
                 )?;
-                batch.put(
-                    branch_create_source_key(operation.source_checkpoint_id, operation.id),
-                    operation.destination_id.to_string(),
-                );
+                if operation.parent_id.is_some() {
+                    batch.put(
+                        branch_create_source_key(operation.source_checkpoint_id, operation.id),
+                        operation.destination_id.to_string(),
+                    );
+                }
             }
             CatalogMutation::RecordBranchCreateRoot {
                 operation_id,
@@ -2301,20 +2311,23 @@ impl SlateDbCatalog {
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(operation.destination_id.to_string()))?;
                 if operation.phase == BranchCreatePhase::Published {
+                    let expected_origin =
+                        operation.parent_id.map(|_| operation.source_checkpoint_id);
                     if branch.state == BranchState::Ready
                         && branch.parent_id == operation.parent_id
-                        && branch.origin_checkpoint_id == Some(operation.source_checkpoint_id)
+                        && branch.origin_checkpoint_id == expected_origin
                     {
                         return Ok(state.generation);
                     }
                     return Err(CatalogError::OperationConflict(operation_id.to_string()));
                 }
+                let expected_origin = operation.parent_id.map(|_| operation.source_checkpoint_id);
                 if operation.phase != BranchCreatePhase::RootCreated
                     || branch.state != BranchState::Creating
                     || branch.root.is_some()
                     || branch.name != operation.destination_name
                     || branch.parent_id != operation.parent_id
-                    || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
+                    || branch.origin_checkpoint_id != expected_origin
                 {
                     return Err(CatalogError::OperationConflict(operation_id.to_string()));
                 }
@@ -2336,29 +2349,25 @@ impl SlateDbCatalog {
                 branch.state = BranchState::Ready;
                 branch.root = Some(root);
                 branch.updated_at = updated_at;
-                let parent_id = operation.parent_id.ok_or_else(|| {
-                    CatalogError::Corrupt(format!(
-                        "branch create operation {} lost its parent",
-                        operation.id
-                    ))
-                })?;
-                let mut parent_blockers =
-                    self.private_gc_branch_blockers_unlocked(parent_id).await?;
-                decrement_blocker(
-                    &mut parent_blockers.incomplete_children,
-                    "child-create blocker",
-                )?;
                 put_json(
                     &mut batch,
                     branch_create_operation_key(operation.id),
                     &operation,
                 )?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
-                put_json(
-                    &mut batch,
-                    private_gc_branch_blocker_key(parent_id),
-                    &parent_blockers,
-                )?;
+                if let Some(parent_id) = operation.parent_id {
+                    let mut parent_blockers =
+                        self.private_gc_branch_blockers_unlocked(parent_id).await?;
+                    decrement_blocker(
+                        &mut parent_blockers.incomplete_children,
+                        "child-create blocker",
+                    )?;
+                    put_json(
+                        &mut batch,
+                        private_gc_branch_blocker_key(parent_id),
+                        &parent_blockers,
+                    )?;
+                }
             }
             #[cfg(test)]
             CatalogMutation::CreateBranch(record) => {
@@ -3899,8 +3908,8 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchState, DurableRoot, GcInventoryStats, GcQuarantineShard, GcRevalidationRecord,
-        GcRevalidationStats, RootCaptureLifecycle, RootCaptureLifecycleError, SlateDbRootStore,
-        catalog_timestamp, lease::LEASE_CLOCK_SKEW,
+        GcRevalidationStats, GcRootKind, GcRootPin, RootCaptureLifecycle,
+        RootCaptureLifecycleError, SlateDbRootStore, catalog_timestamp, lease::LEASE_CLOCK_SKEW,
     };
     use chrono::Utc;
     use slatedb::object_store::memory::InMemory;
@@ -4110,6 +4119,76 @@ mod tests {
         assert_eq!(snapshot.generation, 3);
         assert!(snapshot.branches.is_empty());
         assert_eq!(snapshot.tombstones.get(&record.id).unwrap().name, "main");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn genesis_reservation_is_snapshot_valid_without_customer_source_hold() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("genesis-reservation"), store)
+            .await
+            .unwrap();
+        let now = catalog_timestamp(Utc::now());
+        let branch_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let source_checkpoint_id = Uuid::new_v4();
+        let source_root = DurableRoot {
+            identity: "physical-source".to_string(),
+            manifest_id: format!("{}@1", source_checkpoint_id),
+        };
+        let reservation = CatalogMutation::ReserveBranchCreate {
+            branch: BranchRecord {
+                id: branch_id,
+                revision: 1,
+                name: "main".to_string(),
+                state: BranchState::Creating,
+                root: None,
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            operation: Box::new(BranchCreateOperation {
+                id: operation_id,
+                revision: 1,
+                destination_id: branch_id,
+                destination_name: "main".to_string(),
+                source_checkpoint_id,
+                source_root: source_root.clone(),
+                parent_id: None,
+                phase: BranchCreatePhase::Reserved,
+                destination_root: None,
+                created_at: now,
+                updated_at: now,
+            }),
+        };
+
+        catalog.apply(reservation.clone()).await.unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        snapshot.validate().unwrap();
+        assert_eq!(
+            snapshot.gc_root_pins(),
+            vec![GcRootPin {
+                kind: GcRootKind::Checkpoint,
+                root: source_root.clone(),
+            }]
+        );
+        assert!(
+            catalog
+                .db
+                .get(branch_create_source_key(source_checkpoint_id, operation_id,))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .private_gc_branch_blockers_unlocked(branch_id)
+                .await
+                .unwrap(),
+            PrivateGcBranchBlockers::empty(branch_id)
+        );
+        assert_eq!(catalog.apply(reservation).await.unwrap(), 1);
         catalog.close().await.unwrap();
     }
 

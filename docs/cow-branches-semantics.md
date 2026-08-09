@@ -164,6 +164,45 @@ prints the exact `--id`/`--operation-id` retry values before issuing a mutation.
 Both mutations commit through authoritative SlateDB before best-effort
 PostgreSQL/JSON reconciliation; their response contains no storage root.
 
+### Initial branch bootstrap
+
+One offline command converts an existing, non-catalog ZeroFS database that
+already writes through `storage.segment_pool_path` into the single parentless
+catalog branch. A legacy per-database segment namespace must complete the
+separate offline pool migration first. Create a permanent named checkpoint
+through the ordinary base server, then stop every source reader, writer,
+catalog process, GC collector, and maintenance process. Add `[catalog]` to a
+configuration that retains the exact same shared pool and has no
+`[catalog.mount]`. Explicitly enable the existing default-off creation control
+with `catalog.authority.features.create = true`; it must remain enabled for any
+bootstrap retry and may be disabled afterward if descendant creation is not yet
+being released. Then run:
+
+```text
+zerofs branch bootstrap -c zerofs.toml main \
+  --source-checkpoint postgres-base \
+  --id <stable-branch-uuid> --operation-id <stable-operation-uuid> \
+  --confirm-offline
+```
+
+The command prints generated exact-retry UUIDs before mutation when they are
+not supplied. The authoritative catalog must have no branch or branch-create
+history. Its reservation records a parentless genesis operation and the exact
+external physical checkpoint before clone I/O; the normal root-created and
+published phases then create an authenticated independent database below
+`catalog.branch_database_root`. Exact retry must reproduce the operation,
+destination, name, physical checkpoint UUID/manifest, and normalized creation
+time. Any second genesis operation conflicts permanently.
+
+The resulting customer branch has no parent or origin checkpoint because the
+bootstrap checkpoint was never a customer catalog resource. The physical
+source may be retained for rollback or its named checkpoint may be removed
+after publication; the destination's independently authenticated clone root
+remains readable. Bootstrap is deliberately not an RPC and refuses to read the
+configuration until `--confirm-offline` is present. That flag records the
+operator's quiescence attestation; it is not a mechanical fence against a live
+source or a second catalog authority.
+
 ### Create and retry contract
 
 A create request contains `operation_id`, destination UUID/name, exact source
