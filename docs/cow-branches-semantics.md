@@ -348,9 +348,13 @@ The live database, catalog, private branch root, and shared pool must occupy
 pairwise-disjoint object-store namespaces.
 Projection open or reconciliation failure is logged but never invalidates the
 SlateDB authority; a later reconciliation can rebuild the projection.
-Catalog startup is currently single-node only: configuration rejects combining
-`[catalog]` with `[replication]` until catalog open and close follow elected
-active ownership and takeover rather than running independently on both nodes.
+Catalog open and projection reconciliation are the final fallible single-node
+serving-assembly step, and orderly shutdown explicitly closes the catalog.
+Read-only and checkpoint servers never open it. Configuration rejects combining
+`[catalog]` with `[replication]`: a separate SlateDB writer cannot safely derive
+catalog authority from the data-plane election because a stale late open could
+fence the promoted catalog writer. HA catalog support requires catalog mutations
+to share the replicated writer authority domain.
 
 Operational inspection reads one validated SlateDB generation and returns a
 bounded UUID-ordered page of one resource kind. The production maximum is 256

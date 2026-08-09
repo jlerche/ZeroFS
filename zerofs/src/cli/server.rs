@@ -814,6 +814,15 @@ pub struct InitResult {
     pub(crate) catalog_runtime: Option<crate::cli::init::CatalogRuntime>,
 }
 
+async fn close_catalog_runtime(
+    runtime: Option<&crate::cli::init::CatalogRuntime>,
+) -> anyhow::Result<()> {
+    if let Some(runtime) = runtime {
+        runtime.close().await?;
+    }
+    Ok(())
+}
+
 const STARTUP_BANNER: &str = r#"
 ⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
 ⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
@@ -888,12 +897,16 @@ pub async fn run_server(
         Some(shared_maintenance_runtime().clone())
     };
 
+    // Register fallible process-signal state before opening either SlateDB
+    // database so an unsupported/broken signal backend cannot strand a writer.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     crate::telemetry::send_startup_event(&settings);
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let fs = init_result.fs;
     let authority = init_result.authority;
-    let _catalog_runtime = init_result.catalog_runtime;
+    let catalog_runtime = init_result.catalog_runtime;
     let leadership_deposed = authority
         .as_ref()
         .map_or_else(CancellationToken::new, |authority| authority.loss_token());
@@ -904,8 +917,12 @@ pub async fn run_server(
         return Err(leadership_lost_error());
     }
 
-    if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
-        ensure_nbd_directory(&fs).await?;
+    if !db_mode.is_read_only()
+        && settings.servers.nbd.is_some()
+        && let Err(error) = ensure_nbd_directory(&fs).await
+    {
+        close_catalog_runtime(catalog_runtime.as_ref()).await?;
+        return Err(error);
     }
 
     let telemetry_handle = crate::telemetry::start_periodic_reporting(
@@ -1067,8 +1084,6 @@ pub async fn run_server(
         None
     };
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
     #[cfg(feature = "webui")]
     let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
         let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
@@ -1097,6 +1112,7 @@ pub async fn run_server(
     server_handles.extend(webui_handles);
 
     if server_handles.is_empty() {
+        close_catalog_runtime(catalog_runtime.as_ref()).await?;
         return Err(anyhow::anyhow!(
             "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
         ));
@@ -1194,6 +1210,9 @@ pub async fn run_server(
     if db_mode.is_read_only() {
         if let Err(e) = fs.db.close().await {
             tracing::error!("Database close failed: {:?}", e);
+            if let Err(catalog_error) = close_catalog_runtime(catalog_runtime.as_ref()).await {
+                tracing::warn!("authoritative catalog close also failed: {catalog_error:#}");
+            }
             return Err(e);
         }
     } else {
@@ -1217,13 +1236,17 @@ pub async fn run_server(
         return Err(leadership_lost_error());
     }
 
-    // Retain authority monitors until the database is closed.
+    let catalog_close_result = close_catalog_runtime(catalog_runtime.as_ref()).await;
+
+    // Retain authority monitors until both data and catalog databases close.
     if let Some(authority) = authority {
         authority.finish_after_close().await;
     }
     if leadership_deposed.is_cancelled() {
+        // The catalog is already closed above.
         return Err(leadership_lost_error());
     }
+    catalog_close_result?;
 
     info!("Shutdown complete");
     Ok(())

@@ -1912,6 +1912,10 @@ impl SlateDbCatalog {
 
 #[async_trait]
 impl Catalog for SlateDbCatalog {
+    async fn close(&self) -> Result<(), CatalogError> {
+        SlateDbCatalog::close(self).await
+    }
+
     async fn snapshot(&self) -> Result<CatalogSnapshot, CatalogError> {
         let _guard = self.lock.lock().await;
         let state = self.state_unlocked().await?;

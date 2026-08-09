@@ -195,6 +195,14 @@ impl std::fmt::Debug for BranchLifecycle {
 }
 
 impl BranchLifecycle {
+    /// Close the authoritative catalog after serving has stopped. Callers must
+    /// retain elected serving authority until this completes during an orderly
+    /// shutdown; a deposed process closes without attempting new mutations.
+    pub async fn close(&self) -> Result<(), BranchLifecycleError> {
+        self.catalog.close().await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(catalog: Arc<dyn Catalog>, roots: SlateDbRootStore) -> Self {
         Self::new_with_features(catalog, roots, BranchFeatureConfig::all_enabled())
@@ -2010,6 +2018,8 @@ mod tests {
                 crate::catalog::LeaseLifecycleError::Catalog(CatalogError::NotFound(_))
             ))
         ));
+        enabled.close().await.unwrap();
+        lifecycle.close().await.unwrap();
     }
 
     #[test]

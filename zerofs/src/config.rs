@@ -1026,7 +1026,7 @@ impl Settings {
             }
             if self.replication.is_some() {
                 anyhow::bail!(
-                    "[catalog] cannot be combined with [replication] until authoritative catalog ownership follows HA role election"
+                    "[catalog] cannot be combined with [replication] until the catalog shares the replicated writer authority domain"
                 );
             }
         }
@@ -2226,7 +2226,7 @@ connection_string = "postgresql://catalog.invalid/zerofs"
             format!("{content}\n[replication]\nnode_id = \"n1\"\nrole = \"leader\"\n");
         let error = format!("{:#}", write_and_load(&with_replication).unwrap_err());
         assert!(error.contains("cannot be combined with [replication]"));
-        assert!(error.contains("HA role election"));
+        assert!(error.contains("replicated writer authority domain"));
     }
 
     #[test]

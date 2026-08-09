@@ -2144,6 +2144,11 @@ pub enum CatalogError {
 #[async_trait]
 #[allow(dead_code)] // Read methods are consumed incrementally as lifecycle APIs land.
 pub(crate) trait Catalog: Send + Sync {
+    /// Close backend resources owned by this catalog. In-memory test adapters
+    /// need no action; durable backends override this boundary.
+    async fn close(&self) -> Result<(), CatalogError> {
+        Ok(())
+    }
     async fn snapshot(&self) -> Result<CatalogSnapshot, CatalogError>;
     async fn branch(&self, id: Uuid) -> Result<Option<BranchRecord>, CatalogError>;
     async fn branch_by_name(&self, name: &str) -> Result<Option<BranchRecord>, CatalogError>;

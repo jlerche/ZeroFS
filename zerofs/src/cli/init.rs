@@ -38,12 +38,30 @@ pub(crate) struct CatalogRuntime {
     projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
 }
 
+impl CatalogRuntime {
+    pub(crate) async fn close(&self) -> Result<()> {
+        self.lifecycle
+            .close()
+            .await
+            .context("Failed to close authoritative SlateDB branch catalog")
+    }
+}
+
 async fn open_catalog_runtime(
     config: Option<&crate::config::BranchCatalogConfig>,
     object_store: Arc<dyn object_store::ObjectStore>,
     database_path: &str,
     segment_pool_path: Option<&str>,
+    db_mode: DatabaseMode,
 ) -> Result<Option<CatalogRuntime>> {
+    if db_mode.is_read_only() {
+        if config.is_some() {
+            tracing::info!(
+                "Read-only/checkpoint server does not open the authoritative branch catalog"
+            );
+        }
+        return Ok(None);
+    }
     let Some(config) = config else {
         return Ok(None);
     };
@@ -107,7 +125,6 @@ struct StartupContext {
     actual_db_path: String,
     segment_pool_path: Option<String>,
     segment_pool_authority: Option<crate::segment_store::SegmentPoolAuthority>,
-    catalog_runtime: Option<CatalogRuntime>,
     block_transformer: Arc<dyn BlockTransformer>,
     segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
@@ -268,14 +285,6 @@ impl StartupContext {
             .await?;
         }
 
-        let catalog_runtime = open_catalog_runtime(
-            settings.catalog.as_ref(),
-            Arc::clone(&object_store),
-            &actual_db_path,
-            segment_pool_path.as_deref(),
-        )
-        .await?;
-
         info!("Starting ZeroFS server with {} backend", object_store);
         info!("DB Path: {}", actual_db_path);
         info!(
@@ -402,7 +411,6 @@ impl StartupContext {
             actual_db_path,
             segment_pool_path,
             segment_pool_authority,
-            catalog_runtime,
             block_transformer,
             segment_codec: crate::frame_codec::FrameCodec::new(
                 &encryption_key,
@@ -1017,9 +1025,8 @@ impl ReconciledDb {
             wal_object_store,
             object_tracer,
             actual_db_path,
-            segment_pool_path: _,
+            segment_pool_path,
             segment_pool_authority,
-            catalog_runtime,
             block_transformer: _,
             segment_codec,
             cache_config: _,
@@ -1243,6 +1250,17 @@ impl ReconciledDb {
             );
         }
 
+        // This is the final fallible serving-assembly step. Catalog use is
+        // rejected with HA replication until it can share one writer domain.
+        let catalog_runtime = open_catalog_runtime(
+            settings.catalog.as_ref(),
+            Arc::clone(&object_store),
+            &actual_db_path,
+            segment_pool_path.as_deref(),
+            db_mode,
+        )
+        .await?;
+
         Ok(InitResult {
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
@@ -1292,8 +1310,8 @@ pub async fn initialize_filesystem(
 #[cfg(test)]
 mod role_decision_tests {
     use super::{
-        ImmediateRoleDecision, StartupContext, ensure_shared_pool_has_no_legacy_segments,
-        immediate_role_decision, open_catalog_runtime,
+        DatabaseMode, ImmediateRoleDecision, StartupContext,
+        ensure_shared_pool_has_no_legacy_segments, immediate_role_decision, open_catalog_runtime,
     };
     use crate::config::{BranchCatalogConfig, CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
@@ -1360,6 +1378,7 @@ mod role_decision_tests {
             Arc::clone(&store),
             "runtime/live",
             Some("runtime/segments"),
+            DatabaseMode::ReadWrite,
         )
         .await
         .unwrap()
@@ -1389,6 +1408,7 @@ mod role_decision_tests {
             store,
             "runtime/live",
             Some("runtime/segments"),
+            DatabaseMode::ReadWrite,
         )
         .await
         .expect("projection failure must not invalidate SlateDB authority")
@@ -1415,11 +1435,29 @@ mod role_decision_tests {
             Arc::new(InMemory::new()),
             "runtime/live",
             Some("runtime/segments"),
+            DatabaseMode::ReadWrite,
         )
         .await
         .err()
         .unwrap();
         assert!(error.to_string().contains("must be disjoint"));
+
+        let read_only = open_catalog_runtime(
+            Some(&overlapping),
+            Arc::new(InMemory::new()),
+            "runtime/live",
+            Some("runtime/segments"),
+            DatabaseMode::ReadOnly,
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_only.is_none(),
+            "read-only mode must not reach catalog namespace checks or storage I/O"
+        );
+
+        fallback.close().await.unwrap();
+        runtime.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1495,7 +1533,6 @@ mod role_decision_tests {
             actual_db_path: "db".into(),
             segment_pool_path: None,
             segment_pool_authority: None,
-            catalog_runtime: None,
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
                 &[0; 32],
                 CompressionConfig::default(),
