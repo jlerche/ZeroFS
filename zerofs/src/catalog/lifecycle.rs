@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deep_lineage_uses_stable_ids_without_live_catalog_ancestors() {
+    async fn deep_lineage_descendant_remains_readable_and_writable_without_live_ancestors() {
         const LINEAGE_DEPTH: usize = 32;
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1434,6 +1434,23 @@ mod tests {
         assert_eq!(snapshot.branches.get(&branch.id), Some(&branch));
         assert_eq!(snapshot.tombstones.len(), LINEAGE_DEPTH * 2);
         roots.verify(branch.root.as_ref().unwrap()).await.unwrap();
+
+        let descendant_path = Path::from(branch.root.as_ref().unwrap().identity.clone());
+        let descendant = Db::open(descendant_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            descendant.get(b"deep").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"value"))
+        );
+        descendant.put(b"descendant", b"independent").await.unwrap();
+        descendant.close().await.unwrap();
+        let reopened = Db::open(descendant_path, Arc::clone(&store)).await.unwrap();
+        assert_eq!(
+            reopened.get(b"descendant").await.unwrap(),
+            Some(bytes::Bytes::from_static(b"independent"))
+        );
+        reopened.close().await.unwrap();
         catalog.close().await.unwrap();
     }
 

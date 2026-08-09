@@ -333,11 +333,11 @@
 
 ### Epic 7.1: Functional acceptance
 
-- [ ] A ready branch remains readable and writable after deletion of its source checkpoint.
-- [ ] A descendant remains readable and writable after deletion of any or all logical ancestors.
-- [ ] Branch and checkpoint operations are idempotent across retries and process crashes.
-- [ ] Name reuse cannot confuse identities or delete the wrong incarnation.
-- [ ] Existing mounts follow the documented lease and deletion behavior.
+- [x] A ready branch remains readable and writable after deletion of its source checkpoint.
+- [x] A descendant remains readable and writable after deletion of any or all logical ancestors.
+- [x] Branch and checkpoint operations are idempotent across retries and process crashes.
+- [x] Name reuse cannot confuse identities or delete the wrong incarnation.
+- [x] Existing mounts follow the documented lease and deletion behavior.
 
 ### Epic 7.2: GC acceptance
 
@@ -696,3 +696,9 @@
 - `CatalogConfig` now owns independent default-off controls for branch creation, branch mounting, checkpoint deletion, and descendant-preserving branch deletion. A configured lifecycle rejects a disabled operation before name resolution, lease acquisition, root I/O, or catalog mutation; direct lease acquisition carries the same mount control, while renewal/release remain available for existing grants. Read-only list and inspection remain available.
 - The controls are process configuration, not durable authority. SlateDB remains the local and production source of lifecycle truth, and identical PostgreSQL/JSON projections receive neither controls nor storage metadata.
 - Focused coverage proves the public configured construction path defaults off and that enabling mount admission reaches the ordinary exact-name/UUID lease checks. The release item remains open until the server constructs this lifecycle, exposes the selected APIs, and binds mount lease renewal/release to serving shutdown.
+
+### 2026-08-08: functional acceptance audit
+
+- `clone_root_survives_named_source_deletion_and_retries_exactly` deletes the named physical source checkpoint, replays the exact clone operation, verifies the independent root, reads inherited data through the writable destination database, writes a child value, and confirms the source is unchanged.
+- `deep_lineage_descendant_remains_readable_and_writable_without_live_ancestors` creates 32 successive checkpoint-based descendants, logically deletes each source checkpoint and ancestor branch, physically deletes the original named checkpoint, then opens the sole surviving descendant, reads inherited data, writes independent data, reopens it, and reads that write.
+- `create_recovers_from_every_persisted_linearization_boundary`, the lost-response checkpoint deletion test, and concurrent branch deletion retries cover every persisted create boundary plus ambiguous deletion responses. The mount/name-reuse tests bind exact UUID/root/token identities across catalog restart, deletion, replacement-name publication, renewal rejection, release, and expiry. Together these executable cases satisfy the five functional acceptance rows without treating PostgreSQL or JSON as lifecycle authority.
