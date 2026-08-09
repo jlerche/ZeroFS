@@ -50,7 +50,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 15;
+pub const CATALOG_SCHEMA_VERSION: u32 = 16;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -476,6 +476,38 @@ pub enum TombstoneKind {
     Checkpoint,
 }
 
+/// Permanent, root-free reservation left after bulky historical metadata is
+/// compacted. Catalog UUIDs are never reusable, even after customer-visible
+/// tombstone retention expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[doc(hidden)]
+pub enum RetiredCatalogKind {
+    Branch,
+    Checkpoint,
+    BranchCreateOperation,
+    BranchDeleteOperation,
+    GcRun,
+    Lease,
+    LocalGcRun,
+}
+
+impl From<TombstoneKind> for RetiredCatalogKind {
+    fn from(value: TombstoneKind) -> Self {
+        match value {
+            TombstoneKind::Branch => Self::Branch,
+            TombstoneKind::Checkpoint => Self::Checkpoint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct RetiredCatalogId {
+    pub id: Uuid,
+    pub kind: RetiredCatalogKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TombstoneRecord {
     pub id: Uuid,
@@ -493,6 +525,31 @@ pub struct TombstoneRecord {
     pub deletion_operation_id: Option<Uuid>,
     pub deleted_generation: u64,
     pub deleted_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
+pub(crate) const MAX_TOMBSTONE_CLEANUP_SCAN: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TombstoneCleanupPolicy {
+    /// Tombstones deleted at or before this caller-selected retention cutoff
+    /// may be compacted if every authoritative dependency is also clear.
+    pub retain_after: DateTime<Utc>,
+    pub scan_limit: usize,
+    pub compact_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TombstoneCleanupReport {
+    pub examined: u64,
+    pub compacted: u64,
+    pub retained_by_age: u64,
+    pub retained_by_roots: u64,
+    pub retained_by_dependency: u64,
+    /// Eligible records observed after the mutation budget was exhausted.
+    /// This is a bounded lower-bound backlog signal, not a catalog-wide scan.
+    pub eligible_backlog_lower_bound: u64,
+    pub cursor_wrapped: bool,
 }
 
 /// Authoritative local-GC eligibility state for one authenticated pool epoch.
@@ -1404,6 +1461,12 @@ impl TombstoneRecord {
     }
 }
 
+impl RetiredCatalogId {
+    fn validate(&self) -> Result<(), CatalogError> {
+        validate_id(self.id, "retired catalog")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub schema_version: u32,
@@ -1425,6 +1488,9 @@ pub struct CatalogSnapshot {
     #[serde(default)]
     pub tombstones: BTreeMap<Uuid, TombstoneRecord>,
     #[serde(default)]
+    #[doc(hidden)]
+    pub retired_catalog_ids: BTreeMap<Uuid, RetiredCatalogId>,
+    #[serde(default)]
     pub private_epochs: BTreeMap<u64, PrivateEpochRecord>,
     #[serde(default)]
     pub local_gc_guards: BTreeMap<Uuid, LocalGcGuardRecord>,
@@ -1445,6 +1511,7 @@ impl Default for CatalogSnapshot {
             leases: BTreeMap::new(),
             lease_tombstones: BTreeMap::new(),
             tombstones: BTreeMap::new(),
+            retired_catalog_ids: BTreeMap::new(),
             private_epochs: BTreeMap::new(),
             local_gc_guards: BTreeMap::new(),
             local_gc_progress: BTreeMap::new(),
@@ -1488,6 +1555,11 @@ impl CatalogSnapshot {
             |record| record.id,
             TombstoneRecord::validate,
         )?;
+        validate_records(
+            &self.retired_catalog_ids,
+            |record| record.id,
+            RetiredCatalogId::validate,
+        )?;
         for (epoch, record) in &self.private_epochs {
             record.validate()?;
             if *epoch != record.epoch {
@@ -1504,7 +1576,13 @@ impl CatalogSnapshot {
                 .tombstones
                 .get(&record.branch_id)
                 .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Branch);
-            if !(compatible_live || record.state == PrivateEpochState::Exposed && deleted) {
+            let retired = self
+                .retired_catalog_ids
+                .get(&record.branch_id)
+                .is_some_and(|record| record.kind == RetiredCatalogKind::Branch);
+            if !(compatible_live
+                || record.state == PrivateEpochState::Exposed && (deleted || retired))
+            {
                 return Err(CatalogError::Corrupt(format!(
                     "private epoch {} has no compatible exact branch incarnation",
                     record.epoch
@@ -1581,6 +1659,11 @@ impl CatalogSnapshot {
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let retired_ids = self
+            .retired_catalog_ids
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let operation_ids = self
             .branch_create_operations
             .keys()
@@ -1648,6 +1731,15 @@ impl CatalogSnapshot {
             || !local_gc_ids.is_disjoint(&lease_ids)
             || !local_gc_ids.is_disjoint(&lease_tombstone_ids)
             || !local_gc_ids.is_disjoint(&tombstone_ids)
+            || !retired_ids.is_disjoint(&branch_ids)
+            || !retired_ids.is_disjoint(&checkpoint_ids)
+            || !retired_ids.is_disjoint(&operation_ids)
+            || !retired_ids.is_disjoint(&delete_operation_ids)
+            || !retired_ids.is_disjoint(&gc_run_ids)
+            || !retired_ids.is_disjoint(&lease_ids)
+            || !retired_ids.is_disjoint(&lease_tombstone_ids)
+            || !retired_ids.is_disjoint(&tombstone_ids)
+            || !retired_ids.is_disjoint(&local_gc_ids)
         {
             return Err(CatalogError::Corrupt(
                 "resource UUID appears in more than one catalog collection".to_string(),
@@ -2149,6 +2241,14 @@ pub(crate) trait Catalog: Send + Sync {
     ) -> Result<GcBlockerRecord, CatalogError>;
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError>;
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError>;
+    async fn cleanup_tombstones(
+        &self,
+        _policy: TombstoneCleanupPolicy,
+    ) -> Result<TombstoneCleanupReport, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support tombstone cleanup".to_string(),
+        ))
+    }
 
     /// Apply one atomic mutation and advance the root-snapshot generation.
     /// Updates/deletes carry per-record revisions, so unrelated mutations do
@@ -2294,6 +2394,10 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
                     .tombstones
                     .get(&operation.destination_id)
                     .is_some_and(|tombstone| tombstone.kind == TombstoneKind::Branch)
+                    && !snapshot
+                        .retired_catalog_ids
+                        .get(&operation.destination_id)
+                        .is_some_and(|record| record.kind == RetiredCatalogKind::Branch)
                 {
                     return Err(CatalogError::Corrupt(format!(
                         "published operation {} has no branch or tombstone",

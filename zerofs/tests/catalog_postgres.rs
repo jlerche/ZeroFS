@@ -4,7 +4,8 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 use zerofs::catalog::{
     BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CustomerMetadata, DurableRoot,
-    PostgresCatalogProjection, TombstoneKind, TombstoneRecord, catalog_timestamp,
+    PostgresCatalogProjection, RetiredCatalogId, RetiredCatalogKind, TombstoneKind,
+    TombstoneRecord, catalog_timestamp,
 };
 
 async fn connect(url: &str) -> (PostgresCatalogProjection, tokio_postgres::Client) {
@@ -112,6 +113,23 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
             .parent_id,
         None
     );
+    snapshot.generation = 5;
+    snapshot.tombstones.clear();
+    snapshot.retired_catalog_ids.insert(
+        branch_id,
+        RetiredCatalogId {
+            id: branch_id,
+            kind: RetiredCatalogKind::Branch,
+        },
+    );
+    projection.reconcile(volume_id, &snapshot).await.unwrap();
+    let compacted = projection
+        .record(volume_id, branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(compacted.state, "absent");
+    assert_eq!(compacted.customer_metadata, metadata);
 
     let forbidden_columns = inspection
         .query(

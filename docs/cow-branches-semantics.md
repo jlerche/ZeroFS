@@ -570,6 +570,25 @@ roots, and complete snapshots audit them. These internal indexes are storage
 authority only and are absent from the identical PostgreSQL and JSON customer
 projections.
 
+After a caller-selected retention cutoff, schema v16 may compact a full
+branch/checkpoint tombstone to a permanent root-free catalog-ID reservation.
+The reservation contains only the UUID and kind, so global UUID non-reuse and
+exact incarnation isolation survive without retaining names, lineage, roots,
+or deletion timestamps in authoritative SlateDB indefinitely. An eligible
+branch tombstone atomically validates and retires its published delete-operation
+UUID as another minimal reservation.
+
+Compaction is conservative. The exact branch blocker must report no leases and
+no incomplete child creation, the global blocker must report no root-retaining
+GC run, checkpoint history must still identify its branch, and the retention
+cutoff must have passed. Missing, malformed, or inconsistent authority retains
+the full record or fails closed. A durable UUID cursor makes each pass fair
+while fixed scan and mutation ceilings bound its work; one pass reports its
+age/root/dependency retention and an eligible-backlog lower bound. PostgreSQL
+and JSON do not receive reservation records. Both preserve the same customer
+metadata and historical fields while reconciliation changes the compacted
+resource from `deleted` to `absent`.
+
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
 active writer, and authoritative guard attachment proves the requested term was

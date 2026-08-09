@@ -346,6 +346,23 @@ mod tests {
                 .parent_id,
             None
         );
+        snapshot.generation = 5;
+        snapshot.tombstones.clear();
+        snapshot.retired_catalog_ids.insert(
+            branch_id,
+            crate::catalog::RetiredCatalogId {
+                id: branch_id,
+                kind: crate::catalog::RetiredCatalogKind::Branch,
+            },
+        );
+        projection.reconcile(volume_id, &snapshot).await.unwrap();
+        let compacted = projection
+            .record(volume_id, branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(compacted.state, "absent");
+        assert_eq!(compacted.customer_metadata, metadata);
         let json = tokio::fs::read_to_string(projection.path()).await.unwrap();
         assert!(!json.contains("secret-root"));
         assert!(!json.contains("secret-manifest"));

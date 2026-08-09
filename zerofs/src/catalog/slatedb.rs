@@ -6,8 +6,10 @@ use super::{
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
     LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
-    PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView, PrivateGcOwnerView, TombstoneKind,
-    TombstoneRecord, validate_name, validate_root, validate_timestamp,
+    MAX_TOMBSTONE_CLEANUP_SCAN, PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView,
+    PrivateGcOwnerView, RetiredCatalogId, RetiredCatalogKind, TombstoneCleanupPolicy,
+    TombstoneCleanupReport, TombstoneKind, TombstoneRecord, validate_name, validate_root,
+    validate_timestamp,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,6 +20,7 @@ use slatedb::config::WriteOptions;
 use slatedb::object_store::path::Path;
 use slatedb::{Db, WriteBatch};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -40,6 +43,9 @@ const LOCAL_GC_GUARD_PREFIX: &[u8] = b"catalog/local-gc-guard/";
 const LOCAL_GC_PROGRESS_PREFIX: &[u8] = b"catalog/local-gc-progress/";
 const PRIVATE_GC_BRANCH_BLOCKER_PREFIX: &[u8] = b"catalog/private-gc-branch-blocker/";
 const PRIVATE_GC_GLOBAL_BLOCKER_KEY: &[u8] = b"catalog/private-gc-global-blocker";
+const RETIRED_CATALOG_ID_PREFIX: &[u8] = b"catalog/retired-id/";
+#[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
+const TOMBSTONE_CLEANUP_CURSOR_KEY: &[u8] = b"catalog/tombstone-cleanup-cursor";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -54,11 +60,18 @@ const GC_DELETION_SCHEMA_VERSION: u32 = 11;
 const PRIVATE_EPOCH_SCHEMA_VERSION: u32 = 12;
 const LOCAL_GC_GUARD_SCHEMA_VERSION: u32 = 13;
 const TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION: u32 = 14;
+const PRIVATE_GC_BLOCKER_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
     schema_version: u32,
     generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
+struct TombstoneCleanupCursor {
+    after: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -206,6 +219,7 @@ impl SlateDbCatalog {
             PRIVATE_EPOCH_SCHEMA_VERSION,
             LOCAL_GC_GUARD_SCHEMA_VERSION,
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
+            PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -326,6 +340,9 @@ impl SlateDbCatalog {
         let tombstones = self
             .scan_records::<TombstoneRecord>(TOMBSTONE_PREFIX)
             .await?;
+        let retired_catalog_ids = self
+            .scan_records::<RetiredCatalogId>(RETIRED_CATALOG_ID_PREFIX)
+            .await?;
         let leases = self.scan_records::<LeaseRecord>(LEASE_PREFIX).await?;
         let lease_tombstones = self
             .scan_records::<LeaseTombstone>(LEASE_TOMBSTONE_PREFIX)
@@ -371,6 +388,10 @@ impl SlateDbCatalog {
                 .map(|record| (record.id, record))
                 .collect(),
             tombstones: tombstones
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            retired_catalog_ids: retired_catalog_ids
                 .into_iter()
                 .map(|record| (record.id, record))
                 .collect(),
@@ -559,6 +580,17 @@ impl SlateDbCatalog {
                 .entry(tombstone.id)
                 .or_insert_with(|| PrivateGcBranchBlockers::empty(tombstone.id));
         }
+        for retired in self
+            .scan_records::<RetiredCatalogId>(RETIRED_CATALOG_ID_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|record| record.kind == RetiredCatalogKind::Branch)
+        {
+            retired.validate()?;
+            blockers
+                .entry(retired.id)
+                .or_insert_with(|| PrivateGcBranchBlockers::empty(retired.id));
+        }
         for checkpoint in self
             .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
             .await?
@@ -646,13 +678,25 @@ impl SlateDbCatalog {
         snapshot: &CatalogSnapshot,
     ) -> Result<(), CatalogError> {
         let mut expected = BTreeMap::new();
-        for branch_id in snapshot.branches.keys().copied().chain(
-            snapshot
-                .tombstones
-                .values()
-                .filter(|record| record.kind == TombstoneKind::Branch)
-                .map(|record| record.id),
-        ) {
+        for branch_id in snapshot
+            .branches
+            .keys()
+            .copied()
+            .chain(
+                snapshot
+                    .tombstones
+                    .values()
+                    .filter(|record| record.kind == TombstoneKind::Branch)
+                    .map(|record| record.id),
+            )
+            .chain(
+                snapshot
+                    .retired_catalog_ids
+                    .values()
+                    .filter(|record| record.kind == RetiredCatalogKind::Branch)
+                    .map(|record| record.id),
+            )
+        {
             expected
                 .entry(branch_id)
                 .or_insert_with(|| PrivateGcBranchBlockers::empty(branch_id));
@@ -2583,6 +2627,204 @@ impl Catalog for SlateDbCatalog {
         self.get_record(tombstone_key(id)).await
     }
 
+    async fn cleanup_tombstones(
+        &self,
+        policy: TombstoneCleanupPolicy,
+    ) -> Result<TombstoneCleanupReport, CatalogError> {
+        validate_timestamp(policy.retain_after, "tombstone retention cutoff")?;
+        if policy.scan_limit == 0
+            || policy.scan_limit > MAX_TOMBSTONE_CLEANUP_SCAN
+            || policy.compact_limit == 0
+            || policy.compact_limit > policy.scan_limit
+        {
+            return Err(CatalogError::Invalid(format!(
+                "tombstone cleanup limits must satisfy 1 <= compact <= scan <= {MAX_TOMBSTONE_CLEANUP_SCAN}"
+            )));
+        }
+
+        let _guard = self.lock.lock().await;
+        let state = self.state_unlocked().await?;
+        let mut cursor = self
+            .get_record::<TombstoneCleanupCursor>(Bytes::from_static(TOMBSTONE_CLEANUP_CURSOR_KEY))
+            .await?
+            .unwrap_or_default();
+        if cursor.after.is_some_and(|id| id.is_nil()) {
+            return Err(CatalogError::Corrupt(
+                "tombstone cleanup cursor UUID is nil".to_string(),
+            ));
+        }
+        let cursor_suffix = cursor.after.map(|id| id.to_string().into_bytes());
+        let mut iterator = match cursor_suffix.as_deref() {
+            Some(suffix) => {
+                self.db
+                    .scan_prefix(
+                        TOMBSTONE_PREFIX,
+                        (Bound::Excluded(suffix), Bound::<&[u8]>::Unbounded),
+                    )
+                    .await?
+            }
+            None => self.db.scan_prefix(TOMBSTONE_PREFIX, ..).await?,
+        };
+        let global = self.private_gc_global_blockers_unlocked().await?;
+        let mut report = TombstoneCleanupReport::default();
+        let mut batch = WriteBatch::new();
+        let mut reached_end = false;
+
+        while report.examined < policy.scan_limit as u64 {
+            let Some(entry) = iterator.next().await? else {
+                reached_end = true;
+                break;
+            };
+            let tombstone = serde_json::from_slice::<TombstoneRecord>(&entry.value)?;
+            tombstone.validate()?;
+            if entry.key != tombstone_key(tombstone.id) {
+                return Err(CatalogError::Corrupt(format!(
+                    "tombstone key disagrees with {}",
+                    tombstone.id
+                )));
+            }
+            cursor.after = Some(tombstone.id);
+            report.examined += 1;
+
+            if tombstone.deleted_at > policy.retain_after {
+                report.retained_by_age += 1;
+                continue;
+            }
+            if global.root_retaining_gc_runs != 0 {
+                report.retained_by_roots += 1;
+                continue;
+            }
+            let owner_id = match tombstone.kind {
+                TombstoneKind::Branch => tombstone.id,
+                TombstoneKind::Checkpoint => match tombstone.parent_id {
+                    Some(parent_id) => parent_id,
+                    None => {
+                        report.retained_by_dependency += 1;
+                        continue;
+                    }
+                },
+            };
+            let blockers = self.private_gc_branch_blockers_unlocked(owner_id).await?;
+            if blockers.leases != 0 {
+                report.retained_by_roots += 1;
+                continue;
+            }
+            if blockers.incomplete_children != 0 {
+                report.retained_by_dependency += 1;
+                continue;
+            }
+
+            let delete_operation = if tombstone.kind == TombstoneKind::Branch {
+                match tombstone.deletion_operation_id {
+                    Some(operation_id) => {
+                        let operation = self
+                            .get_record::<BranchDeleteOperation>(branch_delete_operation_key(
+                                operation_id,
+                            ))
+                            .await?
+                            .ok_or_else(|| {
+                                CatalogError::Corrupt(format!(
+                                    "branch tombstone {} lost delete operation {operation_id}",
+                                    tombstone.id
+                                ))
+                            })?;
+                        operation.validate()?;
+                        if operation.phase != BranchDeletePhase::Published
+                            || operation.branch_id != tombstone.id
+                            || operation.branch_name != tombstone.name
+                            || operation.parent_id != tombstone.parent_id
+                            || operation.origin_checkpoint_id != tombstone.origin_checkpoint_id
+                            || tombstone.deleted_revision
+                                != Some(operation.expected_branch_revision)
+                            || operation.updated_at != tombstone.deleted_at
+                        {
+                            return Err(CatalogError::Corrupt(format!(
+                                "branch tombstone {} disagrees with delete operation {operation_id}",
+                                tombstone.id
+                            )));
+                        }
+                        Some(operation)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if report.compacted >= policy.compact_limit as u64 {
+                report.eligible_backlog_lower_bound += 1;
+                continue;
+            }
+            if self
+                .get_record::<RetiredCatalogId>(retired_catalog_id_key(tombstone.id))
+                .await?
+                .is_some()
+            {
+                return Err(CatalogError::Corrupt(format!(
+                    "catalog ID {} is both tombstoned and retired",
+                    tombstone.id
+                )));
+            }
+            put_json(
+                &mut batch,
+                retired_catalog_id_key(tombstone.id),
+                &RetiredCatalogId {
+                    id: tombstone.id,
+                    kind: tombstone.kind.into(),
+                },
+            )?;
+            batch.delete(tombstone_key(tombstone.id));
+            if let Some(operation) = delete_operation {
+                if self
+                    .get_record::<RetiredCatalogId>(retired_catalog_id_key(operation.id))
+                    .await?
+                    .is_some()
+                {
+                    return Err(CatalogError::Corrupt(format!(
+                        "branch delete operation {} is already retired",
+                        operation.id
+                    )));
+                }
+                put_json(
+                    &mut batch,
+                    retired_catalog_id_key(operation.id),
+                    &RetiredCatalogId {
+                        id: operation.id,
+                        kind: RetiredCatalogKind::BranchDeleteOperation,
+                    },
+                )?;
+                batch.delete(branch_delete_operation_key(operation.id));
+            }
+            report.compacted += 1;
+        }
+
+        if reached_end {
+            report.cursor_wrapped = cursor.after.is_some();
+            cursor.after = None;
+        }
+        put_json(
+            &mut batch,
+            Bytes::from_static(TOMBSTONE_CLEANUP_CURSOR_KEY),
+            &cursor,
+        )?;
+        if report.compacted != 0 {
+            put_json(
+                &mut batch,
+                Bytes::from_static(STATE_KEY),
+                &CatalogState {
+                    schema_version: CATALOG_SCHEMA_VERSION,
+                    generation: state.generation.checked_add(1).ok_or_else(|| {
+                        CatalogError::Corrupt("catalog generation overflow".to_string())
+                    })?,
+                },
+            )?;
+        }
+        self.db
+            .write_with_options(batch, &durable_write_options())
+            .await?;
+        Ok(report)
+    }
+
     async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
         let _guard = self.lock.lock().await;
         self.apply_unlocked(mutation).await
@@ -2648,6 +2890,10 @@ fn private_gc_branch_blocker_key(branch_id: Uuid) -> Bytes {
         PRIVATE_GC_BRANCH_BLOCKER_PREFIX,
         branch_id.to_string().as_bytes(),
     )
+}
+
+fn retired_catalog_id_key(id: Uuid) -> Bytes {
+    joined_key(RETIRED_CATALOG_ID_PREFIX, id.to_string().as_bytes())
 }
 
 fn gc_blocker_run_prefix(run_id: Uuid) -> Bytes {
@@ -2738,6 +2984,7 @@ async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogEr
         lease_tombstone_key(id),
         local_gc_guard_key(id),
         local_gc_progress_key(id),
+        retired_catalog_id_key(id),
     ] {
         ensure_absent(db, key, &id.to_string()).await?;
     }
@@ -2778,6 +3025,19 @@ async fn ensure_known_resource(
         .map(|bytes| serde_json::from_slice::<TombstoneRecord>(&bytes))
         .transpose()?;
     if tombstone.is_some_and(|record| record.kind == expected_kind) {
+        return Ok(());
+    }
+    let expected_retired_kind = match expected_kind {
+        TombstoneKind::Branch => RetiredCatalogKind::Branch,
+        TombstoneKind::Checkpoint => RetiredCatalogKind::Checkpoint,
+    };
+    if db
+        .get(retired_catalog_id_key(id))
+        .await?
+        .map(|bytes| serde_json::from_slice::<RetiredCatalogId>(&bytes))
+        .transpose()?
+        .is_some_and(|record| record.id == id && record.kind == expected_retired_kind)
+    {
         Ok(())
     } else {
         Err(CatalogError::NotFound(id.to_string()))
@@ -3366,6 +3626,303 @@ mod tests {
             catalog.snapshot().await,
             Err(CatalogError::Corrupt(message)) if message.contains("global blocker index")
         ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_cleanup_is_bounded_dependency_safe_and_preserves_uuid_reservations() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("tombstone-cleanup"), store)
+            .await
+            .unwrap();
+        let owner = branch("cleanup-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let leased_checkpoint = checkpoint(Uuid::new_v4(), owner.id, "leased-deleted");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(leased_checkpoint.clone()))
+            .await
+            .unwrap();
+        let now = catalog_timestamp(Utc::now());
+        let lease = LeaseRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            subject_kind: LeaseSubjectKind::Checkpoint,
+            subject_id: leased_checkpoint.id,
+            root: leased_checkpoint.root.clone(),
+            access_mode: LeaseAccessMode::Read,
+            token_hash: "b".repeat(64),
+            issued_at: now,
+            updated_at: now,
+            expires_at: now + chrono::Duration::seconds(10),
+        };
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: leased_checkpoint.revision,
+                lease: lease.clone(),
+            })
+            .await
+            .unwrap();
+        let deleted_at = now + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::DeleteCheckpoint {
+                id: leased_checkpoint.id,
+                expected_revision: leased_checkpoint.revision,
+                name: leased_checkpoint.name.clone(),
+                deleted_at,
+            })
+            .await
+            .unwrap();
+        let policy = |retain_after| TombstoneCleanupPolicy {
+            retain_after,
+            scan_limit: 2,
+            compact_limit: 1,
+        };
+        let young = catalog
+            .cleanup_tombstones(policy(deleted_at - chrono::Duration::microseconds(1)))
+            .await
+            .unwrap();
+        assert_eq!(young.retained_by_age, 1);
+        let leased = catalog
+            .cleanup_tombstones(policy(deleted_at))
+            .await
+            .unwrap();
+        assert_eq!(leased.retained_by_roots, 1);
+        catalog
+            .apply(CatalogMutation::EndLease {
+                id: lease.id,
+                expected_revision: lease.revision,
+                token_hash: lease.token_hash,
+                ended_at: deleted_at + chrono::Duration::microseconds(1),
+            })
+            .await
+            .unwrap();
+        let generation_before = catalog.snapshot().await.unwrap().generation;
+        let compacted = catalog
+            .cleanup_tombstones(policy(deleted_at + chrono::Duration::microseconds(1)))
+            .await
+            .unwrap();
+        assert_eq!(compacted.compacted, 1);
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.generation, generation_before + 1);
+        assert!(!snapshot.tombstones.contains_key(&leased_checkpoint.id));
+        assert_eq!(
+            snapshot.retired_catalog_ids[&leased_checkpoint.id].kind,
+            RetiredCatalogKind::Checkpoint
+        );
+        assert!(matches!(
+            ensure_resource_id_available(catalog.db.as_ref(), leased_checkpoint.id).await,
+            Err(CatalogError::AlreadyExists(_))
+        ));
+
+        let mut deleted_ids = Vec::new();
+        for index in 0..3 {
+            let record = checkpoint(Uuid::new_v4(), owner.id, &format!("bounded-{index}"));
+            catalog
+                .apply(CatalogMutation::CreateCheckpoint(record.clone()))
+                .await
+                .unwrap();
+            catalog
+                .apply(CatalogMutation::DeleteCheckpoint {
+                    id: record.id,
+                    expected_revision: record.revision,
+                    name: record.name,
+                    deleted_at: record.created_at,
+                })
+                .await
+                .unwrap();
+            deleted_ids.push(record.id);
+        }
+        let bounded = TombstoneCleanupPolicy {
+            retain_after: catalog_timestamp(Utc::now()),
+            scan_limit: 1,
+            compact_limit: 1,
+        };
+        for _ in 0..8 {
+            let report = catalog.cleanup_tombstones(bounded).await.unwrap();
+            assert!(report.examined <= 1);
+            assert!(report.compacted <= 1);
+        }
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert!(
+            deleted_ids
+                .iter()
+                .all(|id| snapshot.retired_catalog_ids.contains_key(id))
+        );
+
+        let source = checkpoint(Uuid::new_v4(), owner.id, "incomplete-source-history");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (destination, operation) = reserved_create(&source, "cleanup-child");
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: destination,
+                operation: Box::new(operation.clone()),
+            })
+            .await
+            .unwrap();
+        let root_created_at = catalog_timestamp(Utc::now()).max(operation.updated_at);
+        catalog
+            .apply(CatalogMutation::RecordBranchCreateRoot {
+                operation_id: operation.id,
+                expected_revision: operation.revision,
+                destination_root: DurableRoot {
+                    identity: "branches/cleanup-child".to_string(),
+                    manifest_id: "manifest/cleanup-child".to_string(),
+                },
+                updated_at: root_created_at,
+            })
+            .await
+            .unwrap();
+        let source_deleted_at = root_created_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::DeleteCheckpoint {
+                id: source.id,
+                expected_revision: source.revision,
+                name: source.name,
+                deleted_at: source_deleted_at,
+            })
+            .await
+            .unwrap();
+        let broad = TombstoneCleanupPolicy {
+            retain_after: source_deleted_at,
+            scan_limit: 16,
+            compact_limit: 16,
+        };
+        let retained = catalog.cleanup_tombstones(broad).await.unwrap();
+        assert_eq!(retained.retained_by_dependency, 1);
+        let published_at = source_deleted_at + chrono::Duration::microseconds(1);
+        catalog
+            .apply(CatalogMutation::PublishBranchCreate {
+                operation_id: operation.id,
+                expected_revision: operation.revision + 1,
+                updated_at: published_at,
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            catalog
+                .cleanup_tombstones(TombstoneCleanupPolicy {
+                    retain_after: published_at,
+                    ..broad
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            catalog
+                .snapshot()
+                .await
+                .unwrap()
+                .retired_catalog_ids
+                .contains_key(&source.id)
+        );
+
+        let doomed = branch("cleanup-deleted-branch");
+        catalog
+            .apply(CatalogMutation::CreateBranch(doomed.clone()))
+            .await
+            .unwrap();
+        delete_branch(&catalog, &doomed).await;
+        let delete_operation_id = catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .branch_delete_operations
+            .values()
+            .find(|operation| operation.branch_id == doomed.id)
+            .unwrap()
+            .id;
+        let broad = TombstoneCleanupPolicy {
+            retain_after: catalog_timestamp(Utc::now()),
+            scan_limit: 16,
+            compact_limit: 16,
+        };
+        for _ in 0..3 {
+            catalog.cleanup_tombstones(broad).await.unwrap();
+        }
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.retired_catalog_ids[&doomed.id].kind,
+            RetiredCatalogKind::Branch
+        );
+        assert_eq!(
+            snapshot.retired_catalog_ids[&delete_operation_id].kind,
+            RetiredCatalogKind::BranchDeleteOperation
+        );
+        assert!(
+            !snapshot
+                .branch_delete_operations
+                .contains_key(&delete_operation_id)
+        );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_cleanup_waits_for_root_retaining_global_gc_runs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("tombstone-cleanup-gc-fence"), store)
+            .await
+            .unwrap();
+        let owner = branch("cleanup-gc-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+        let deleted = checkpoint(Uuid::new_v4(), owner.id, "cleanup-gc-deleted");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(deleted.clone()))
+            .await
+            .unwrap();
+        let deleted_at = catalog_timestamp(Utc::now()).max(deleted.created_at);
+        catalog
+            .apply(CatalogMutation::DeleteCheckpoint {
+                id: deleted.id,
+                expected_revision: deleted.revision,
+                name: deleted.name,
+                deleted_at,
+            })
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        let roots = snapshot.gc_root_pins();
+        let run = GcRunRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            catalog_generation: snapshot.generation,
+            inventory_cutoff: deleted_at,
+            root_digest: crate::catalog::gc_root_digest(&roots).unwrap(),
+            roots,
+            segment_pool: ".zerofs/segment-pool".to_string(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
+            phase: GcRunPhase::Captured,
+            quarantine_at: None,
+            revalidation: None,
+            deletion: None,
+            created_at: deleted_at,
+            updated_at: deleted_at,
+        };
+        catalog
+            .begin_gc_run(snapshot.generation, run)
+            .await
+            .unwrap();
+        let report = catalog
+            .cleanup_tombstones(TombstoneCleanupPolicy {
+                retain_after: deleted_at,
+                scan_limit: 1,
+                compact_limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.retained_by_roots, 1);
+        assert!(catalog.tombstone(deleted.id).await.unwrap().is_some());
         catalog.close().await.unwrap();
     }
 
@@ -4282,7 +4839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v14_catalogs_to_targeted_blocker_schema() {
+    async fn migrates_v2_through_v15_catalogs_to_tombstone_compaction_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -4297,9 +4854,10 @@ mod tests {
             PRIVATE_EPOCH_SCHEMA_VERSION,
             LOCAL_GC_GUARD_SCHEMA_VERSION,
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
+            PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v15"));
+            let path = Path::from(format!("migration-v{prior_version}-v16"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await

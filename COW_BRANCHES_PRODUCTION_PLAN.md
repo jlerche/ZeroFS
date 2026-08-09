@@ -256,7 +256,7 @@
 
 ### Epic 4.6: Clean up metadata
 
-- [ ] Remove old tombstones only after no active lease or GC run can observe their catalog generation.
+- [x] Remove old tombstones only after no active lease or GC run can observe their catalog generation.
 - [ ] Remove completed GC run artifacts after a retention period.
 - [ ] Remove obsolete mark runs and quarantine records idempotently.
 - [ ] Bound cleanup work per pass and expose backlog metrics.
@@ -571,3 +571,10 @@
 - Every root-bearing lifecycle transition updates its record and blocker count in the same durable SlateDB batch. Checkpoint leases remain attributed through the live checkpoint or its root-free tombstone, deleted branch blocker records remain available until metadata retention is safe, and checked overflow/underflow or a missing record fails closed.
 - Upgrade rebuilds the derived records from authoritative roots before schema v15 publication. Full snapshots audit every derived count against those roots, while deletion-capable guard admission performs only exact keyed reads under the catalog mutation lock. PostgreSQL and JSON remain the same customer projection and receive none of these storage-authority indexes.
 - Focused proof covers same-branch checkpoint/lease/create blockers, unrelated branch roots that do not block, exact retry behavior, v2-through-v14 rebuilds, and corruption of either branch or global indexes. This closes the final Epic 4.5 scalability item; inherited, shared, global-GC-pinned, or ambiguous data still retains and falls back to the global collector.
+
+### 2026-08-08: bounded tombstone compaction
+
+- Catalog schema v16 can compact an expired full branch/checkpoint tombstone into a permanent root-free `(UUID, kind)` reservation. The compact marker preserves global never-reuse and exact-incarnation isolation without retaining storage roots, names, customer lineage, or deletion timestamps in authoritative SlateDB forever.
+- Eligibility uses the schema-v15 exact blocker records under the catalog mutation lock. Any lease attributed to the exact branch, incomplete child creation, root-retaining global GC run, missing checkpoint parent, immature retention cutoff, or inconsistent delete operation retains the full tombstone. A published branch-delete operation is validated, compacted to its own permanent UUID reservation, and removed atomically with its branch tombstone.
+- Each pass validates `1 <= compact <= scan <= 4096`, resumes after a durable SlateDB UUID cursor, examines no more than the scan ceiling, and advances the catalog generation once if it compacts one or more records. Its report separates age/root/dependency retention and exposes a bounded eligible-backlog lower bound; production scheduling and exported backlog gauges remain later Epic 4.6/5.3 work.
+- PostgreSQL and JSON remain identical customer projections. Reconciliation changes a compacted historical resource from `deleted` to `absent` while preserving its customer metadata and prior customer-facing fields; the compact marker itself is never projected. Focused tests prove lease and global-GC retention, bounded cursor progress, branch-delete audit compaction, permanent UUID rejection, snapshot consistency, and JSON projection behavior; the PostgreSQL integration asserts the same transition when its test database is configured.
