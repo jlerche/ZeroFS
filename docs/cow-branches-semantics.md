@@ -372,13 +372,21 @@ or GC authority. Durable roots, manifests, active leases, storage operation
 proofs, private epochs, GC guards, and permanent internal ID reservations remain
 in authoritative SlateDB for local and production deployments.
 Both backends expose the same bounded query contract: point lookup and stable
-UUID-ordered pages, optionally restricted to branches or checkpoints. A page is
-limited to 256 records and uses the last returned UUID as its exclusive cursor.
+UUID-ordered pages, optionally restricted by resource kind, historical parent,
+and customer-visible state. A page is limited to 256 records and uses the last
+returned UUID as its exclusive cursor.
 Deleted and compacted `absent` records remain queryable for customer audit;
 pagination never consults or exposes SlateDB roots, leases, or storage proofs.
-The admin RPC exposes that boundary as `ListBranches` and `GetBranchInfo`.
+The admin RPC exposes that boundary for branches and for checkpoints on the
+active branch. Catalog-backed checkpoint list/info reads return only `ready`
+projection records bound to that branch; they never fall back to retained
+physical SlateDB checkpoints. Legacy volumes without a catalog retain the old
+local physical read behavior.
 `zerofs branch list -c <config> [--after <uuid>] [--limit 1..256]` and
 `zerofs branch info -c <config> <uuid>` are thin clients over those calls.
+`zerofs checkpoint list -c <config> [--after <uuid>] [--limit 1..256]` exposes
+the same bounded checkpoint view, while checkpoint info accepts `--id` for an
+exact customer resource lookup.
 The wire record contains lifecycle identity, lineage, timestamps, observed
 projection generation, and customer metadata JSON; it has no field capable of
 carrying a durable root, manifest, lease, renewal secret, or writer proof.

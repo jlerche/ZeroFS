@@ -2218,15 +2218,17 @@ pub struct CustomerCatalogRecord {
 /// production admission limits.
 pub const MAX_CUSTOMER_CATALOG_PAGE_SIZE: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomerCatalogListRequest {
     pub kind: Option<CustomerResourceKind>,
+    pub parent_id: Option<Uuid>,
+    pub state: Option<String>,
     pub after: Option<Uuid>,
     pub limit: usize,
 }
 
 impl CustomerCatalogListRequest {
-    fn validate(self) -> Result<(), CatalogError> {
+    fn validate(&self) -> Result<(), CatalogError> {
         if self.limit == 0 || self.limit > MAX_CUSTOMER_CATALOG_PAGE_SIZE {
             return Err(CatalogError::Invalid(format!(
                 "customer catalog page size must be within 1..={MAX_CUSTOMER_CATALOG_PAGE_SIZE}"
@@ -2235,6 +2237,11 @@ impl CustomerCatalogListRequest {
         if self.after.is_some_and(|after| after.is_nil()) {
             return Err(CatalogError::Invalid(
                 "customer catalog cursor UUID cannot be nil".to_string(),
+            ));
+        }
+        if self.parent_id.is_some_and(|parent_id| parent_id.is_nil()) {
+            return Err(CatalogError::Invalid(
+                "customer catalog parent UUID cannot be nil".to_string(),
             ));
         }
         Ok(())

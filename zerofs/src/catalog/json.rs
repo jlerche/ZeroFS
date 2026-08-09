@@ -155,6 +155,17 @@ impl CatalogProjection for JsonCatalogProjection {
             .range((lower, Bound::Unbounded))
             .map(|(_, record)| record)
             .filter(|record| request.kind.is_none_or(|kind| record.kind == kind))
+            .filter(|record| {
+                request
+                    .parent_id
+                    .is_none_or(|parent_id| record.parent_id == Some(parent_id))
+            })
+            .filter(|record| {
+                request
+                    .state
+                    .as_deref()
+                    .is_none_or(|state| record.state == state)
+            })
             .take(request.limit + 1)
             .cloned()
             .collect::<Vec<_>>();
@@ -460,6 +471,8 @@ mod tests {
                 volume_id,
                 CustomerCatalogListRequest {
                     kind: None,
+                    parent_id: None,
+                    state: None,
                     after: None,
                     limit: 2,
                 },
@@ -481,6 +494,8 @@ mod tests {
                 volume_id,
                 CustomerCatalogListRequest {
                     kind: None,
+                    parent_id: None,
+                    state: None,
                     after: first.next_after,
                     limit: 2,
                 },
@@ -502,6 +517,8 @@ mod tests {
                 volume_id,
                 CustomerCatalogListRequest {
                     kind: Some(CustomerResourceKind::Branch),
+                    parent_id: None,
+                    state: None,
                     after: None,
                     limit: 2,
                 },
@@ -518,19 +535,58 @@ mod tests {
         );
         assert_eq!(branches.next_after, None);
 
+        let checkpoints = projection
+            .list(
+                volume_id,
+                CustomerCatalogListRequest {
+                    kind: Some(CustomerResourceKind::Checkpoint),
+                    parent_id: Some(first_branch_id),
+                    state: Some("ready".to_string()),
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.records.len(), 1);
+        assert_eq!(checkpoints.records[0].resource_id, checkpoint_id);
+        assert!(
+            projection
+                .list(
+                    volume_id,
+                    CustomerCatalogListRequest {
+                        kind: Some(CustomerResourceKind::Checkpoint),
+                        parent_id: Some(second_branch_id),
+                        state: Some("ready".to_string()),
+                        after: None,
+                        limit: 2,
+                    },
+                )
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
+
         for request in [
             CustomerCatalogListRequest {
                 kind: None,
+                parent_id: None,
+                state: None,
                 after: None,
                 limit: 0,
             },
             CustomerCatalogListRequest {
                 kind: None,
+                parent_id: None,
+                state: None,
                 after: None,
                 limit: MAX_CUSTOMER_CATALOG_PAGE_SIZE + 1,
             },
             CustomerCatalogListRequest {
                 kind: None,
+                parent_id: None,
+                state: None,
                 after: Some(Uuid::nil()),
                 limit: 1,
             },

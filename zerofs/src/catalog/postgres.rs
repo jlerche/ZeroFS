@@ -245,20 +245,42 @@ impl CatalogProjection for PostgresCatalogProjection {
                      FROM zerofs_catalog_projection_resources \
                      WHERE volume_id = $1 \
                        AND ($2::text IS NULL OR kind = $2) \
-                       AND ($3::uuid IS NULL OR resource_id > $3) \
-                     ORDER BY resource_id LIMIT $4";
+                       AND ($3::uuid IS NULL OR parent_id = $3) \
+                       AND ($4::text IS NULL OR state = $4) \
+                       AND ($5::uuid IS NULL OR resource_id > $5) \
+                     ORDER BY resource_id LIMIT $6";
         let kind = request.kind.map(CustomerResourceKind::as_str);
         let limit = i64::try_from(request.limit + 1)
             .expect("bounded customer catalog page size fits BIGINT");
         let rows = if let Some(client) = &self.read_client {
             client
-                .query(query, &[&volume_id, &kind, &request.after, &limit])
+                .query(
+                    query,
+                    &[
+                        &volume_id,
+                        &kind,
+                        &request.parent_id,
+                        &request.state,
+                        &request.after,
+                        &limit,
+                    ],
+                )
                 .await?
         } else {
             self.write_client
                 .lock()
                 .await
-                .query(query, &[&volume_id, &kind, &request.after, &limit])
+                .query(
+                    query,
+                    &[
+                        &volume_id,
+                        &kind,
+                        &request.parent_id,
+                        &request.state,
+                        &request.after,
+                        &limit,
+                    ],
+                )
                 .await?
         };
         let mut records = rows

@@ -3,9 +3,10 @@ use serde_json::Value;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 use zerofs::catalog::{
-    BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CustomerCatalogListRequest,
-    CustomerMetadata, CustomerResourceKind, DurableRoot, PostgresCatalogProjection,
-    RetiredCatalogId, RetiredCatalogKind, TombstoneKind, TombstoneRecord, catalog_timestamp,
+    BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CheckpointRecord,
+    CustomerCatalogListRequest, CustomerMetadata, CustomerResourceKind, DurableRoot,
+    PostgresCatalogProjection, RetiredCatalogId, RetiredCatalogKind, TombstoneKind,
+    TombstoneRecord, catalog_timestamp,
 };
 
 async fn connect(url: &str) -> (PostgresCatalogProjection, tokio_postgres::Client) {
@@ -30,6 +31,7 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
     let volume_id = Uuid::new_v4();
     let branch_id = Uuid::from_u128(1);
     let second_branch_id = Uuid::from_u128(3);
+    let checkpoint_id = Uuid::from_u128(2);
     let historical_parent = Uuid::new_v4();
     let now = catalog_timestamp(Utc::now());
     let mut snapshot = CatalogSnapshot {
@@ -70,13 +72,46 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
             updated_at: now,
         },
     );
+    snapshot.checkpoints.insert(
+        checkpoint_id,
+        CheckpointRecord {
+            id: checkpoint_id,
+            revision: 1,
+            branch_id,
+            name: "snapshot".to_string(),
+            root: DurableRoot {
+                identity: "checkpoint-storage-secret".to_string(),
+                manifest_id: "checkpoint-manifest-secret".to_string(),
+            },
+            created_at: now,
+            updated_at: now,
+        },
+    );
     projection.reconcile(volume_id, &snapshot).await.unwrap();
+
+    let checkpoints = projection
+        .list(
+            volume_id,
+            CustomerCatalogListRequest {
+                kind: Some(CustomerResourceKind::Checkpoint),
+                parent_id: Some(branch_id),
+                state: Some("ready".to_string()),
+                after: None,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(checkpoints.records.len(), 1);
+    assert_eq!(checkpoints.records[0].resource_id, checkpoint_id);
 
     let first_page = projection
         .list(
             volume_id,
             CustomerCatalogListRequest {
                 kind: Some(CustomerResourceKind::Branch),
+                parent_id: None,
+                state: None,
                 after: None,
                 limit: 1,
             },
@@ -90,6 +125,8 @@ async fn projection_reconciles_without_storage_secrets_and_preserves_metadata() 
             volume_id,
             CustomerCatalogListRequest {
                 kind: Some(CustomerResourceKind::Branch),
+                parent_id: None,
+                state: None,
                 after: first_page.next_after,
                 limit: 1,
             },

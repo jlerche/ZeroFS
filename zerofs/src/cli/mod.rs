@@ -155,10 +155,16 @@ pub enum CheckpointCommands {
         /// Name for the checkpoint (must be unique)
         name: String,
     },
-    /// List all checkpoints
+    /// List a bounded UUID-ordered page of live checkpoints
     List {
         #[arg(short, long)]
         config: PathBuf,
+        /// Exclusive stable UUID cursor returned by a prior page
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        /// Page size (1-256)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Delete a checkpoint by name
     Delete {
@@ -176,6 +182,9 @@ pub enum CheckpointCommands {
         config: PathBuf,
         /// Checkpoint name to query
         name: String,
+        /// Exact stable checkpoint UUID
+        #[arg(long)]
+        id: Option<uuid::Uuid>,
     },
 }
 

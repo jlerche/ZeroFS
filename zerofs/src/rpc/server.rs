@@ -242,7 +242,7 @@ impl AdminRpcServer {
         match (&self.checkpoint_catalog, self.catalog_configured) {
             (Some(catalog), _) => Ok(Some(catalog.as_ref())),
             (None, true) => Err(Status::failed_precondition(
-                "checkpoint mutation requires a configured active branch mount",
+                "checkpoint operation requires a configured active branch mount",
             )),
             (None, false) => Ok(None),
         }
@@ -438,8 +438,38 @@ impl AdminService for AdminRpcServer {
 
     async fn list_checkpoints(
         &self,
-        _request: Request<proto::ListCheckpointsRequest>,
+        request: Request<proto::ListCheckpointsRequest>,
     ) -> Result<Response<proto::ListCheckpointsResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(catalog) = self.checkpoint_catalog()? {
+            let after = request
+                .after
+                .map(|after| {
+                    uuid::Uuid::parse_str(&after)
+                        .map_err(|_| Status::invalid_argument("after must be a valid non-nil UUID"))
+                })
+                .transpose()?;
+            let limit = if request.limit == 0 {
+                100
+            } else {
+                request.limit as usize
+            };
+            let page = self
+                .customer_catalog()?
+                .list(CustomerCatalogListRequest {
+                    kind: Some(CustomerResourceKind::Checkpoint),
+                    parent_id: Some(catalog.branch_id()),
+                    state: Some("ready".to_string()),
+                    after,
+                    limit,
+                })
+                .await
+                .map_err(customer_catalog_status)?;
+            return self.success_response(proto::ListCheckpointsResponse {
+                checkpoints: page.records.into_iter().map(Into::into).collect(),
+                next_after: page.next_after.map(|id| id.to_string()),
+            });
+        }
         let checkpoints = self
             .checkpoint_manager
             .list_checkpoints()
@@ -448,6 +478,7 @@ impl AdminService for AdminRpcServer {
 
         self.success_response(proto::ListCheckpointsResponse {
             checkpoints: checkpoints.into_iter().map(|c| c.into()).collect(),
+            next_after: None,
         })
     }
 
@@ -487,7 +518,57 @@ impl AdminService for AdminRpcServer {
         &self,
         request: Request<proto::GetCheckpointInfoRequest>,
     ) -> Result<Response<proto::GetCheckpointInfoResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.name;
+        if let Some(catalog) = self.checkpoint_catalog()? {
+            let record = if request.checkpoint_id.is_empty() {
+                self.customer_catalog()?
+                    .list(CustomerCatalogListRequest {
+                        kind: Some(CustomerResourceKind::Checkpoint),
+                        parent_id: Some(catalog.branch_id()),
+                        state: Some("ready".to_string()),
+                        after: None,
+                        limit: zerofs::catalog::MAX_CUSTOMER_CATALOG_PAGE_SIZE,
+                    })
+                    .await
+                    .map_err(customer_catalog_status)?
+                    .records
+                    .into_iter()
+                    .find(|record| record.name == name)
+            } else {
+                let checkpoint_id =
+                    uuid::Uuid::parse_str(&request.checkpoint_id).map_err(|_| {
+                        Status::invalid_argument("checkpoint id must be a valid non-nil UUID")
+                    })?;
+                if checkpoint_id.is_nil() {
+                    return Err(Status::invalid_argument(
+                        "checkpoint id must be a valid non-nil UUID",
+                    ));
+                }
+                self.customer_catalog()?
+                    .record(checkpoint_id)
+                    .await
+                    .map_err(customer_catalog_status)?
+                    .filter(|record| {
+                        record.kind == CustomerResourceKind::Checkpoint
+                            && record.parent_id == Some(catalog.branch_id())
+                            && record.state == "ready"
+                    })
+            };
+            return match record {
+                Some(checkpoint) => self.success_response(proto::GetCheckpointInfoResponse {
+                    checkpoint: Some(checkpoint.into()),
+                }),
+                None => Err(Status::not_found(format!(
+                    "Checkpoint '{}' not found",
+                    if name.is_empty() {
+                        request.checkpoint_id
+                    } else {
+                        name
+                    }
+                ))),
+            };
+        }
 
         let info = self
             .checkpoint_manager
@@ -527,6 +608,8 @@ impl AdminService for AdminRpcServer {
             .customer_catalog()?
             .list(CustomerCatalogListRequest {
                 kind: Some(CustomerResourceKind::Branch),
+                parent_id: None,
+                state: None,
                 after,
                 limit,
             })
@@ -922,7 +1005,7 @@ mod tests {
     use crate::block_transformer::ZeroFsBlockTransformer;
     use crate::config::CompressionConfig;
     use crate::db::SlateDbHandle;
-    use crate::rpc::client::RpcClient;
+    use crate::rpc::client::{CheckpointView, RpcClient};
     use slatedb::DbBuilder;
     use slatedb::object_store::path::Path as DbPath;
     use std::time::Duration;
@@ -1197,7 +1280,7 @@ mod tests {
 
         assert!(
             client
-                .get_checkpoint_info("snapshot")
+                .get_checkpoint_info("snapshot", None)
                 .await
                 .unwrap()
                 .is_none()
@@ -1271,7 +1354,82 @@ mod tests {
             .set_customer_metadata(first_id, metadata)
             .await
             .unwrap();
+        let mut checkpoint_metadata = serde_json::Map::new();
+        checkpoint_metadata.insert(
+            "retention".to_string(),
+            serde_json::Value::String("customer".to_string()),
+        );
+        customer_catalog
+            .set_customer_metadata(checkpoint_id, checkpoint_metadata)
+            .await
+            .unwrap();
         (customer_catalog, first_id, second_id, directory)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reads_use_only_bound_root_free_customer_projection() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let physical_only = checkpoint_manager
+            .create_checkpoint_exact("physical-only")
+            .await
+            .unwrap();
+        let (customer_catalog, branch_id, _second_id, _directory) =
+            customer_catalog_fixture().await;
+        let checkpoint_id = uuid::Uuid::from_u128(2);
+        let authority: Arc<dyn CheckpointCatalogAuthority> = Arc::new(RecordingCheckpointCatalog {
+            branch_id,
+            ..Default::default()
+        });
+        let service = AdminRpcServer::new_with_catalog(
+            checkpoint_manager,
+            Some(authority),
+            true,
+            Some(customer_catalog),
+            fs,
+            CancellationToken::new(),
+        );
+
+        let page = service
+            .list_checkpoints(Request::new(proto::ListCheckpointsRequest {
+                after: None,
+                limit: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.checkpoints.len(), 1);
+        assert_eq!(page.checkpoints[0].id, checkpoint_id.to_string());
+        assert_eq!(page.checkpoints[0].branch_id, Some(branch_id.to_string()));
+        assert_eq!(
+            page.checkpoints[0].customer_metadata_json,
+            r#"{"retention":"customer"}"#
+        );
+        let encoded = format!("{:?}", page.checkpoints[0]);
+        assert!(!encoded.contains("storage-secret"));
+        assert!(!encoded.contains("manifest-secret"));
+        assert_ne!(page.checkpoints[0].id, physical_only.info.id.to_string());
+
+        let info = service
+            .get_checkpoint_info(Request::new(proto::GetCheckpointInfoRequest {
+                name: String::new(),
+                checkpoint_id: checkpoint_id.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .checkpoint
+            .unwrap();
+        assert_eq!(info.id, checkpoint_id.to_string());
+        assert_eq!(info.observed_generation, 7);
+
+        let error = service
+            .get_checkpoint_info(Request::new(proto::GetCheckpointInfoRequest {
+                name: "physical-only".to_string(),
+                checkpoint_id: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -1386,6 +1544,62 @@ mod tests {
             info.customer_metadata.get("project"),
             Some(&serde_json::Value::String("alpha".to_string()))
         );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_customer_read_client_round_trips_over_unix_socket() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let (customer_catalog, branch_id, _second_id, _projection_directory) =
+            customer_catalog_fixture().await;
+        let checkpoint_id = uuid::Uuid::from_u128(2);
+        let authority: Arc<dyn CheckpointCatalogAuthority> = Arc::new(RecordingCheckpointCatalog {
+            branch_id,
+            ..Default::default()
+        });
+        let shutdown = CancellationToken::new();
+        let service = AdminRpcServer::new_with_catalog(
+            checkpoint_manager,
+            Some(authority),
+            true,
+            Some(customer_catalog),
+            fs,
+            shutdown.clone(),
+        );
+        let socket_directory = tempfile::tempdir().unwrap();
+        let socket = socket_directory
+            .path()
+            .join("checkpoint-customer-admin.sock");
+        tokio::spawn({
+            let socket = socket.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = serve_unix(socket, service, shutdown).await;
+            }
+        });
+        let client = connect_with_retry(&socket).await;
+
+        let page = client.list_checkpoints(None, 1).await.unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.next_after, None);
+        let CheckpointView::Catalog(record) = &page.records[0] else {
+            panic!("catalog server returned a legacy physical checkpoint")
+        };
+        assert_eq!(record.resource_id, checkpoint_id);
+        assert_eq!(record.parent_id, Some(branch_id));
+        assert_eq!(
+            record.customer_metadata.get("retention"),
+            Some(&serde_json::Value::String("customer".to_string()))
+        );
+
+        let Some(CheckpointView::Catalog(info)) = client
+            .get_checkpoint_info("", Some(checkpoint_id))
+            .await
+            .unwrap()
+        else {
+            panic!("exact customer checkpoint info was unavailable")
+        };
+        assert_eq!(info.resource_id, checkpoint_id);
         shutdown.cancel();
     }
 

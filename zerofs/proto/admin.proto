@@ -60,6 +60,15 @@ message CheckpointInfo {
     string id = 1;
     string name = 2;
     google.protobuf.Timestamp created_at = 3;
+    // Present for catalog-backed customer reads; absent on the legacy local
+    // create/read path. No storage root or manifest is exposed.
+    string volume_id = 4;
+    string state = 5;
+    optional string branch_id = 6;
+    uint64 observed_generation = 7;
+    google.protobuf.Timestamp updated_at = 8;
+    google.protobuf.Timestamp deleted_at = 9;
+    string customer_metadata_json = 10;
 }
 
 message CreateCheckpointRequest {
@@ -70,10 +79,15 @@ message CreateCheckpointResponse {
     CheckpointInfo checkpoint = 1;
 }
 
-message ListCheckpointsRequest {}
+message ListCheckpointsRequest {
+    optional string after = 1;
+    // Zero selects the server default; otherwise must be within 1..=256.
+    uint32 limit = 2;
+}
 
 message ListCheckpointsResponse {
     repeated CheckpointInfo checkpoints = 1;
+    optional string next_after = 2;
 }
 
 message DeleteCheckpointRequest {
@@ -87,6 +101,8 @@ message DeleteCheckpointResponse {}
 
 message GetCheckpointInfoRequest {
     string name = 1;
+    // Exact customer resource UUID. Preferred for catalog-backed reads.
+    string checkpoint_id = 2;
 }
 
 message GetCheckpointInfoResponse {

@@ -135,14 +135,18 @@ async fn async_main() -> Result<()> {
             cli::CheckpointCommands::Create { config, name } => {
                 cli::checkpoint::create_checkpoint(&config, &name).await?;
             }
-            cli::CheckpointCommands::List { config } => {
-                cli::checkpoint::list_checkpoints(&config).await?;
+            cli::CheckpointCommands::List {
+                config,
+                after,
+                limit,
+            } => {
+                cli::checkpoint::list_checkpoints(&config, after, limit).await?;
             }
             cli::CheckpointCommands::Delete { config, name, id } => {
                 cli::checkpoint::delete_checkpoint(&config, &name, id).await?;
             }
-            cli::CheckpointCommands::Info { config, name } => {
-                cli::checkpoint::get_checkpoint_info(&config, &name).await?;
+            cli::CheckpointCommands::Info { config, name, id } => {
+                cli::checkpoint::get_checkpoint_info(&config, &name, id).await?;
             }
         },
         cli::Commands::Branch { subcommand } => match subcommand {

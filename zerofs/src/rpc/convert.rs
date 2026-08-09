@@ -56,8 +56,63 @@ impl From<CheckpointInfo> for proto::CheckpointInfo {
                 seconds: info.created_at as i64,
                 nanos: 0,
             }),
+            volume_id: String::new(),
+            state: String::new(),
+            branch_id: None,
+            observed_generation: 0,
+            updated_at: None,
+            deleted_at: None,
+            customer_metadata_json: String::new(),
         }
     }
+}
+
+impl From<CustomerCatalogRecord> for proto::CheckpointInfo {
+    fn from(record: CustomerCatalogRecord) -> Self {
+        debug_assert_eq!(record.kind, CustomerResourceKind::Checkpoint);
+        Self {
+            id: record.resource_id.to_string(),
+            name: record.name,
+            created_at: Some(catalog_timestamp_to_proto(record.created_at)),
+            volume_id: record.volume_id.to_string(),
+            state: record.state,
+            branch_id: record.parent_id.map(|id| id.to_string()),
+            observed_generation: record.observed_generation,
+            updated_at: Some(catalog_timestamp_to_proto(record.updated_at)),
+            deleted_at: record.deleted_at.map(catalog_timestamp_to_proto),
+            customer_metadata_json: Value::Object(record.customer_metadata).to_string(),
+        }
+    }
+}
+
+pub(crate) fn customer_checkpoint_from_proto(
+    record: proto::CheckpointInfo,
+) -> anyhow::Result<CustomerCatalogRecord> {
+    let metadata = serde_json::from_str::<Value>(&record.customer_metadata_json)
+        .map_err(|error| anyhow::anyhow!("invalid customer metadata JSON: {error}"))?;
+    let Value::Object(customer_metadata) = metadata else {
+        anyhow::bail!("customer metadata JSON is not an object");
+    };
+    Ok(CustomerCatalogRecord {
+        volume_id: Uuid::parse_str(&record.volume_id)?,
+        resource_id: Uuid::parse_str(&record.id)?,
+        kind: CustomerResourceKind::Checkpoint,
+        name: record.name,
+        state: record.state,
+        parent_id: record
+            .branch_id
+            .map(|id| Uuid::parse_str(&id))
+            .transpose()?,
+        origin_checkpoint_id: None,
+        observed_generation: record.observed_generation,
+        created_at: catalog_timestamp_from_proto(record.created_at, "created_at")?,
+        updated_at: catalog_timestamp_from_proto(record.updated_at, "updated_at")?,
+        deleted_at: record
+            .deleted_at
+            .map(|timestamp| catalog_timestamp_from_proto(Some(timestamp), "deleted_at"))
+            .transpose()?,
+        customer_metadata,
+    })
 }
 
 impl TryFrom<proto::CheckpointInfo> for CheckpointInfo {
@@ -388,6 +443,7 @@ mod tests {
             id: "not-a-uuid".to_string(),
             name: "x".to_string(),
             created_at: None,
+            ..Default::default()
         };
         assert!(CheckpointInfo::try_from(p).is_err());
     }
@@ -398,6 +454,7 @@ mod tests {
             id: Uuid::nil().to_string(),
             name: "x".to_string(),
             created_at: None,
+            ..Default::default()
         };
         assert_eq!(CheckpointInfo::try_from(p).unwrap().created_at, 0);
     }
@@ -444,6 +501,52 @@ mod tests {
             customer_metadata_json: "[]".to_string(),
         };
         assert!(CustomerCatalogRecord::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn customer_checkpoint_info_round_trips_without_storage_fields() {
+        let now = zerofs::catalog::catalog_timestamp(chrono::Utc::now());
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "retention".to_string(),
+            Value::String("customer".to_string()),
+        );
+        let record = CustomerCatalogRecord {
+            volume_id: Uuid::new_v4(),
+            resource_id: Uuid::new_v4(),
+            kind: CustomerResourceKind::Checkpoint,
+            name: "snapshot".to_string(),
+            state: "ready".to_string(),
+            parent_id: Some(Uuid::new_v4()),
+            origin_checkpoint_id: None,
+            observed_generation: 9,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            customer_metadata: metadata,
+        };
+
+        let proto = proto::CheckpointInfo::from(record.clone());
+        assert!(!format!("{proto:?}").contains("root"));
+        assert_eq!(customer_checkpoint_from_proto(proto).unwrap(), record);
+    }
+
+    #[test]
+    fn customer_checkpoint_info_rejects_non_object_metadata() {
+        let now = catalog_timestamp_to_proto(chrono::Utc::now());
+        let proto = proto::CheckpointInfo {
+            id: Uuid::new_v4().to_string(),
+            name: "snapshot".to_string(),
+            created_at: Some(now),
+            volume_id: Uuid::new_v4().to_string(),
+            state: "ready".to_string(),
+            branch_id: Some(Uuid::new_v4().to_string()),
+            observed_generation: 1,
+            updated_at: Some(now),
+            deleted_at: None,
+            customer_metadata_json: "[]".to_string(),
+        };
+        assert!(customer_checkpoint_from_proto(proto).is_err());
     }
 
     fn proto_event(operation: FileOperation) -> proto::FileAccessEvent {

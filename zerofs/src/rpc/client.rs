@@ -13,8 +13,40 @@ use tower::service_fn;
 use uuid::Uuid;
 use zerofs::catalog::{CustomerCatalogPage, CustomerCatalogRecord};
 
+#[derive(Debug, Clone)]
+pub enum CheckpointView {
+    Legacy(CheckpointInfo),
+    Catalog(CustomerCatalogRecord),
+}
+
+impl CheckpointView {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Legacy(info) => info.id,
+            Self::Catalog(record) => record.resource_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointPage {
+    pub records: Vec<CheckpointView>,
+    pub next_after: Option<Uuid>,
+}
+
 pub struct RpcClient {
     client: AdminServiceClient<Channel>,
+}
+
+fn checkpoint_view_from_proto(info: proto::CheckpointInfo) -> Result<CheckpointView> {
+    if info.volume_id.is_empty() {
+        return CheckpointInfo::try_from(info)
+            .map(CheckpointView::Legacy)
+            .map_err(|error| anyhow!("Invalid checkpoint UUID: {error}"));
+    }
+    crate::rpc::convert::customer_checkpoint_from_proto(info)
+        .map(CheckpointView::Catalog)
+        .context("Invalid customer checkpoint record")
 }
 
 impl RpcClient {
@@ -99,8 +131,16 @@ impl RpcClient {
             .map_err(|e| anyhow!("Invalid UUID: {}", e))
     }
 
-    pub async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>> {
-        let request = proto::ListCheckpointsRequest {};
+    pub async fn list_checkpoints(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<CheckpointPage> {
+        let limit = u32::try_from(limit).context("Checkpoint list limit exceeds u32")?;
+        let request = proto::ListCheckpointsRequest {
+            after: after.map(|id| id.to_string()),
+            limit,
+        };
 
         let response = self
             .client
@@ -110,11 +150,20 @@ impl RpcClient {
             .map_err(|s| anyhow!("{}", s.message()))?
             .into_inner();
 
-        response
+        let records = response
             .checkpoints
             .into_iter()
-            .map(|c| c.try_into().map_err(|e| anyhow!("Invalid UUID: {}", e)))
-            .collect()
+            .map(checkpoint_view_from_proto)
+            .collect::<Result<Vec<_>>>()?;
+        let next_after = response
+            .next_after
+            .map(|id| Uuid::parse_str(&id))
+            .transpose()
+            .context("Server returned an invalid checkpoint cursor UUID")?;
+        Ok(CheckpointPage {
+            records,
+            next_after,
+        })
     }
 
     pub async fn delete_checkpoint(&self, checkpoint_id: Uuid, name: &str) -> Result<()> {
@@ -132,9 +181,14 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn get_checkpoint_info(&self, name: &str) -> Result<Option<CheckpointInfo>> {
+    pub async fn get_checkpoint_info(
+        &self,
+        name: &str,
+        checkpoint_id: Option<Uuid>,
+    ) -> Result<Option<CheckpointView>> {
         let request = proto::GetCheckpointInfoRequest {
             name: name.to_string(),
+            checkpoint_id: checkpoint_id.map_or_else(String::new, |id| id.to_string()),
         };
 
         let result = self.client.clone().get_checkpoint_info(request).await;
@@ -145,10 +199,7 @@ impl RpcClient {
                     .into_inner()
                     .checkpoint
                     .ok_or_else(|| anyhow!("Empty response from server"))?;
-                Ok(Some(
-                    info.try_into()
-                        .map_err(|e| anyhow!("Invalid UUID: {}", e))?,
-                ))
+                Ok(Some(checkpoint_view_from_proto(info)?))
             }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
