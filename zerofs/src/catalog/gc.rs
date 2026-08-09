@@ -1337,7 +1337,8 @@ fn classify_catalog_error(error: &CatalogError) -> GcBlockerKind {
         CatalogError::WriterLeaseActive(_) => GcBlockerKind::LeaseUncertainty,
         CatalogError::OperationConflict(_)
         | CatalogError::RevisionConflict { .. }
-        | CatalogError::AlreadyExists(_) => GcBlockerKind::GenerationChanged,
+        | CatalogError::AlreadyExists(_)
+        | CatalogError::Capacity { .. } => GcBlockerKind::GenerationChanged,
         CatalogError::NotFound(_) => GcBlockerKind::MissingRoot,
         CatalogError::Invalid(_) | CatalogError::Corrupt(_) | CatalogError::Json(_) => {
             GcBlockerKind::CorruptMetadata

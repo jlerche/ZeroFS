@@ -56,11 +56,21 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 17;
+pub const CATALOG_SCHEMA_VERSION: u32 = 18;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
 pub const MAX_CUSTOMER_METADATA_BYTES: usize = 64 * 1024;
+/// Maximum live catalog branch records, including creating and deleting
+/// incarnations. Tombstones and permanently retired UUID reservations do not
+/// consume this admission budget.
+pub const MAX_LIVE_BRANCHES: usize = 4_096;
+/// Maximum named checkpoints retained by one branch.
+pub const MAX_CHECKPOINTS_PER_BRANCH: usize = 256;
+/// Maximum active branch and checkpoint leases attributed to one branch.
+pub const MAX_ACTIVE_LEASES_PER_BRANCH: usize = 64;
+/// Maximum retained historical parent edges admitted for a new branch.
+pub const MAX_BRANCH_LINEAGE_DEPTH: usize = 64;
 
 pub type CustomerMetadata = Map<String, Value>;
 
@@ -2115,6 +2125,11 @@ pub struct CustomerCatalogRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("catalog {resource} capacity of {limit} has been reached")]
+    Capacity {
+        resource: &'static str,
+        limit: usize,
+    },
     #[error("branch {0} still has an active writer lease")]
     WriterLeaseActive(Uuid),
     #[error("branch operation conflicts with its immutable request or phase: {0}")]

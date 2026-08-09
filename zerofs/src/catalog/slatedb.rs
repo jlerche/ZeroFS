@@ -6,6 +6,7 @@ use super::{
     GcMarkShard, GcMarkStats, GcQuarantinePublication, GcReportPublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
     LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
+    MAX_ACTIVE_LEASES_PER_BRANCH, MAX_BRANCH_LINEAGE_DEPTH, MAX_LIVE_BRANCHES,
     MAX_TOMBSTONE_CLEANUP_SCAN, PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView,
     PrivateGcOwnerView, RetiredCatalogId, RetiredCatalogKind, TombstoneCleanupPolicy,
     TombstoneCleanupReport, TombstoneKind, TombstoneRecord, validate_name, validate_root,
@@ -44,6 +45,7 @@ const LOCAL_GC_PROGRESS_PREFIX: &[u8] = b"catalog/local-gc-progress/";
 const PRIVATE_GC_BRANCH_BLOCKER_PREFIX: &[u8] = b"catalog/private-gc-branch-blocker/";
 const PRIVATE_GC_GLOBAL_BLOCKER_KEY: &[u8] = b"catalog/private-gc-global-blocker";
 const RETIRED_CATALOG_ID_PREFIX: &[u8] = b"catalog/retired-id/";
+const BRANCH_LINEAGE_DEPTH_PREFIX: &[u8] = b"catalog/private-branch-lineage-depth/";
 #[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
 const TOMBSTONE_CLEANUP_CURSOR_KEY: &[u8] = b"catalog/tombstone-cleanup-cursor";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -62,11 +64,29 @@ const LOCAL_GC_GUARD_SCHEMA_VERSION: u32 = 13;
 const TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION: u32 = 14;
 const PRIVATE_GC_BLOCKER_SCHEMA_VERSION: u32 = 15;
 const TOMBSTONE_CLEANUP_SCHEMA_VERSION: u32 = 16;
+const SERVER_CATALOG_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
     schema_version: u32,
     generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BranchLineageDepth {
+    branch_id: Uuid,
+    depth: u16,
+}
+
+impl BranchLineageDepth {
+    fn validate(&self) -> Result<(), CatalogError> {
+        if self.branch_id.is_nil() || self.depth as usize > MAX_BRANCH_LINEAGE_DEPTH {
+            return Err(CatalogError::Corrupt(
+                "private branch lineage depth is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -222,6 +242,7 @@ impl SlateDbCatalog {
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
+            SERVER_CATALOG_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -281,6 +302,22 @@ impl SlateDbCatalog {
             .map_err(|error| {
                 CatalogError::Invalid(format!(
                     "SlateDB catalog v{} cannot migrate to v{CATALOG_SCHEMA_VERSION}: {error}",
+                    state.schema_version
+                ))
+            })?;
+        self.validate_production_capacity_unlocked()
+            .await
+            .map_err(|error| {
+                CatalogError::Invalid(format!(
+                    "SlateDB catalog v{} cannot apply v{CATALOG_SCHEMA_VERSION} production limits: {error}",
+                    state.schema_version
+                ))
+            })?;
+        self.rebuild_branch_lineage_depths_unlocked()
+            .await
+            .map_err(|error| {
+                CatalogError::Invalid(format!(
+                    "SlateDB catalog v{} cannot establish production lineage limits for v{CATALOG_SCHEMA_VERSION}: {error}",
                     state.schema_version
                 ))
             })?;
@@ -561,6 +598,163 @@ impl SlateDbCatalog {
         .ok_or_else(|| {
             CatalogError::Corrupt("private GC global blocker record is missing".to_string())
         })
+    }
+
+    async fn ensure_live_branch_capacity_unlocked(&self) -> Result<(), CatalogError> {
+        let mut iterator = self.db.scan_prefix(BRANCH_PREFIX, ..).await?;
+        for _ in 0..MAX_LIVE_BRANCHES {
+            if iterator.next().await?.is_none() {
+                return Ok(());
+            }
+        }
+        Err(CatalogError::Capacity {
+            resource: "live branch",
+            limit: MAX_LIVE_BRANCHES,
+        })
+    }
+
+    async fn validate_production_capacity_unlocked(&self) -> Result<(), CatalogError> {
+        let mut branches = self.db.scan_prefix(BRANCH_PREFIX, ..).await?;
+        let mut branch_count = 0usize;
+        while branches.next().await?.is_some() {
+            branch_count = branch_count
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::Corrupt("live branch count overflow".to_string()))?;
+            if branch_count > MAX_LIVE_BRANCHES {
+                return Err(CatalogError::Capacity {
+                    resource: "live branch",
+                    limit: MAX_LIVE_BRANCHES,
+                });
+            }
+        }
+        let mut blockers = self
+            .db
+            .scan_prefix(PRIVATE_GC_BRANCH_BLOCKER_PREFIX, ..)
+            .await?;
+        while let Some(entry) = blockers.next().await? {
+            let blocker = serde_json::from_slice::<PrivateGcBranchBlockers>(&entry.value)?;
+            blocker.validate()?;
+            if entry.key != private_gc_branch_blocker_key(blocker.branch_id) {
+                return Err(CatalogError::Corrupt(format!(
+                    "private GC blocker key disagrees with branch {}",
+                    blocker.branch_id
+                )));
+            }
+            if blocker.checkpoints > super::MAX_CHECKPOINTS_PER_BRANCH as u64 {
+                return Err(CatalogError::Capacity {
+                    resource: "checkpoint per branch",
+                    limit: super::MAX_CHECKPOINTS_PER_BRANCH,
+                });
+            }
+            if blocker.leases > MAX_ACTIVE_LEASES_PER_BRANCH as u64 {
+                return Err(CatalogError::Capacity {
+                    resource: "active lease per branch",
+                    limit: MAX_ACTIVE_LEASES_PER_BRANCH,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn next_lineage_depth_unlocked(
+        &self,
+        parent_id: Option<Uuid>,
+    ) -> Result<u16, CatalogError> {
+        let Some(parent_id) = parent_id else {
+            return Ok(0);
+        };
+        let parent = self
+            .get_record::<BranchLineageDepth>(branch_lineage_depth_key(parent_id))
+            .await?
+            .ok_or_else(|| {
+                CatalogError::Corrupt(format!(
+                    "branch lineage depth for parent {parent_id} is missing"
+                ))
+            })?;
+        parent.validate()?;
+        if parent.branch_id != parent_id {
+            return Err(CatalogError::Corrupt(format!(
+                "branch lineage depth key {parent_id} contains {}",
+                parent.branch_id
+            )));
+        }
+        let depth = parent.depth as usize + 1;
+        if depth > MAX_BRANCH_LINEAGE_DEPTH {
+            return Err(CatalogError::Capacity {
+                resource: "branch lineage depth",
+                limit: MAX_BRANCH_LINEAGE_DEPTH,
+            });
+        }
+        Ok(depth as u16)
+    }
+
+    async fn rebuild_branch_lineage_depths_unlocked(&self) -> Result<(), CatalogError> {
+        let mut parents = BTreeMap::new();
+        for branch in self.scan_records::<BranchRecord>(BRANCH_PREFIX).await? {
+            branch.validate()?;
+            parents.insert(branch.id, branch.parent_id);
+        }
+        for tombstone in self
+            .scan_records::<TombstoneRecord>(TOMBSTONE_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|record| record.kind == TombstoneKind::Branch)
+        {
+            tombstone.validate()?;
+            parents.insert(tombstone.id, tombstone.parent_id);
+        }
+        let mut depths = BTreeMap::new();
+        for id in parents.keys().copied() {
+            let mut path = Vec::new();
+            let mut current = id;
+            let base = loop {
+                if let Some(depth) = depths.get(&current).copied() {
+                    break depth;
+                }
+                if path.contains(&current) {
+                    return Err(CatalogError::Corrupt(format!(
+                        "branch lineage contains a cycle at {current}"
+                    )));
+                }
+                path.push(current);
+                match parents.get(&current).copied().flatten() {
+                    Some(parent) if parents.contains_key(&parent) => current = parent,
+                    Some(parent) => {
+                        return Err(CatalogError::Corrupt(format!(
+                            "branch lineage parent {parent} was compacted before its depth was recorded"
+                        )));
+                    }
+                    None => break 0u16,
+                }
+            };
+            let mut depth = base;
+            while let Some(branch_id) = path.pop() {
+                if parents[&branch_id].is_some() {
+                    depth = depth.checked_add(1).ok_or_else(|| {
+                        CatalogError::Corrupt("branch lineage depth overflow".to_string())
+                    })?;
+                }
+                if depth as usize > MAX_BRANCH_LINEAGE_DEPTH {
+                    return Err(CatalogError::Capacity {
+                        resource: "branch lineage depth",
+                        limit: MAX_BRANCH_LINEAGE_DEPTH,
+                    });
+                }
+                depths.insert(branch_id, depth);
+            }
+        }
+        let mut batch = WriteBatch::new();
+        for (branch_id, depth) in depths {
+            put_json(
+                &mut batch,
+                branch_lineage_depth_key(branch_id),
+                &BranchLineageDepth { branch_id, depth },
+            )?;
+        }
+        self.db
+            .write_with_options(batch, &durable_write_options())
+            .await?;
+        Ok(())
     }
 
     async fn rebuild_private_gc_blockers_unlocked(&self) -> Result<(), CatalogError> {
@@ -1300,6 +1494,12 @@ impl SlateDbCatalog {
                 let mut blockers = self
                     .private_gc_branch_blockers_unlocked(lease_branch_id)
                     .await?;
+                if blockers.leases >= MAX_ACTIVE_LEASES_PER_BRANCH as u64 {
+                    return Err(CatalogError::Capacity {
+                        resource: "active lease per branch",
+                        limit: MAX_ACTIVE_LEASES_PER_BRANCH,
+                    });
+                }
                 increment_blocker(&mut blockers.leases, "lease blocker")?;
                 put_json(&mut batch, lease_key(lease.id), &lease)?;
                 put_json(
@@ -1532,7 +1732,19 @@ impl SlateDbCatalog {
                         &parent_blockers,
                     )?;
                 }
+                let lineage_depth = self
+                    .next_lineage_depth_unlocked(operation.parent_id)
+                    .await?;
+                self.ensure_live_branch_capacity_unlocked().await?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
+                put_json(
+                    &mut batch,
+                    branch_lineage_depth_key(branch.id),
+                    &BranchLineageDepth {
+                        branch_id: branch.id,
+                        depth: lineage_depth,
+                    },
+                )?;
                 batch.put(branch_name_key(&branch.name), branch.id.to_string());
                 put_json(
                     &mut batch,
@@ -1696,7 +1908,17 @@ impl SlateDbCatalog {
                     &record.name,
                 )
                 .await?;
+                let lineage_depth = self.next_lineage_depth_unlocked(record.parent_id).await?;
+                self.ensure_live_branch_capacity_unlocked().await?;
                 put_json(&mut batch, branch_key(record.id), &record)?;
+                put_json(
+                    &mut batch,
+                    branch_lineage_depth_key(record.id),
+                    &BranchLineageDepth {
+                        branch_id: record.id,
+                        depth: lineage_depth,
+                    },
+                )?;
                 batch.put(branch_name_key(&record.name), record.id.to_string());
                 put_json(
                     &mut batch,
@@ -1780,6 +2002,12 @@ impl SlateDbCatalog {
                 let mut blockers = self
                     .private_gc_branch_blockers_unlocked(record.branch_id)
                     .await?;
+                if blockers.checkpoints >= super::MAX_CHECKPOINTS_PER_BRANCH as u64 {
+                    return Err(CatalogError::Capacity {
+                        resource: "checkpoint per branch",
+                        limit: super::MAX_CHECKPOINTS_PER_BRANCH,
+                    });
+                }
                 increment_blocker(&mut blockers.checkpoints, "checkpoint blocker")?;
                 put_json(&mut batch, checkpoint_key(record.id), &record)?;
                 batch.put(
@@ -2933,6 +3161,10 @@ fn branch_name_key(name: &str) -> Bytes {
     joined_key(BRANCH_NAME_PREFIX, name.as_bytes())
 }
 
+fn branch_lineage_depth_key(id: Uuid) -> Bytes {
+    joined_key(BRANCH_LINEAGE_DEPTH_PREFIX, id.to_string().as_bytes())
+}
+
 fn checkpoint_key(id: Uuid) -> Bytes {
     joined_key(CHECKPOINT_PREFIX, id.to_string().as_bytes())
 }
@@ -3062,6 +3294,7 @@ async fn ensure_absent(db: &Db, key: Bytes, label: &str) -> Result<(), CatalogEr
 async fn ensure_resource_id_available(db: &Db, id: Uuid) -> Result<(), CatalogError> {
     for key in [
         branch_key(id),
+        branch_lineage_depth_key(id),
         checkpoint_key(id),
         tombstone_key(id),
         branch_create_operation_key(id),
@@ -3301,6 +3534,61 @@ mod tests {
         (branch, operation)
     }
 
+    async fn v17_capacity_fixture(
+        path: &str,
+        branch_count: usize,
+        checkpoint_count: usize,
+        lease_count: usize,
+    ) -> SlateDbCatalog {
+        assert!(branch_count > 0);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from(path), store).await.unwrap();
+        let now = catalog_timestamp(Utc::now());
+        let mut owner = branch("migration-capacity-owner");
+        owner.id = Uuid::from_u128(1);
+        let mut batch = WriteBatch::new();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                schema_version: SERVER_CATALOG_SCHEMA_VERSION,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        put_json(&mut batch, branch_key(owner.id), &owner).unwrap();
+        batch.put(branch_name_key(&owner.name), owner.id.to_string());
+        for sequence in 1..branch_count {
+            let mut record = branch(&format!("migration-branch-{sequence:04}"));
+            record.id = Uuid::from_u128(1 + sequence as u128);
+            put_json(&mut batch, branch_key(record.id), &record).unwrap();
+            batch.put(branch_name_key(&record.name), record.id.to_string());
+        }
+        for sequence in 0..checkpoint_count {
+            let record = checkpoint(
+                Uuid::from_u128(100_000 + sequence as u128),
+                owner.id,
+                &format!("migration-checkpoint-{sequence:03}"),
+            );
+            put_json(&mut batch, checkpoint_key(record.id), &record).unwrap();
+            batch.put(
+                checkpoint_name_key(owner.id, &record.name),
+                record.id.to_string(),
+            );
+        }
+        for sequence in 0..lease_count {
+            let mut record = branch_lease(&owner, now);
+            record.id = Uuid::from_u128(200_000 + sequence as u128);
+            put_json(&mut batch, lease_key(record.id), &record).unwrap();
+        }
+        catalog
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        catalog
+    }
+
     #[tokio::test]
     async fn records_are_independent_and_deletion_is_atomic_with_tombstone() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3461,6 +3749,191 @@ mod tests {
             6
         );
         catalog.snapshot().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_branch_and_lineage_capacity_is_enforced_before_publication() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("branch-capacity"), store)
+            .await
+            .unwrap();
+        let mut parent = branch("lineage-000");
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent.clone()))
+            .await
+            .unwrap();
+        let root = parent.clone();
+        for depth in 1..=MAX_BRANCH_LINEAGE_DEPTH {
+            let mut child = branch(&format!("lineage-{depth:03}"));
+            child.parent_id = Some(parent.id);
+            catalog
+                .apply(CatalogMutation::CreateBranch(child.clone()))
+                .await
+                .unwrap();
+            parent = child;
+        }
+        let mut too_deep = branch("lineage-too-deep");
+        too_deep.parent_id = Some(parent.id);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::CreateBranch(too_deep.clone()))
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "branch lineage depth",
+                limit: MAX_BRANCH_LINEAGE_DEPTH,
+            })
+        ));
+        assert!(catalog.branch(too_deep.id).await.unwrap().is_none());
+
+        let deep_source = checkpoint(Uuid::new_v4(), parent.id, "deep-source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(deep_source.clone()))
+            .await
+            .unwrap();
+        delete_branch(&catalog, &parent).await;
+        let cleanup = catalog
+            .cleanup_tombstones(TombstoneCleanupPolicy {
+                retain_after: catalog_timestamp(Utc::now()) + chrono::Duration::seconds(1),
+                scan_limit: 1,
+                compact_limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleanup.compacted, 1);
+        let (after_compaction, operation) =
+            reserved_create(&deep_source, "lineage-after-compaction");
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch: after_compaction,
+                    operation: Box::new(operation),
+                })
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "branch lineage depth",
+                limit: MAX_BRANCH_LINEAGE_DEPTH,
+            })
+        ));
+
+        let source = checkpoint(Uuid::new_v4(), root.id, "capacity-source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let existing = MAX_BRANCH_LINEAGE_DEPTH;
+        let mut batch = WriteBatch::new();
+        for sequence in existing..(MAX_LIVE_BRANCHES - 1) {
+            batch.put(
+                branch_key(Uuid::from_u128(1_000_000 + sequence as u128)),
+                Bytes::from_static(b"capacity-placeholder"),
+            );
+        }
+        catalog
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+        catalog
+            .ensure_live_branch_capacity_unlocked()
+            .await
+            .unwrap();
+        let boundary = branch("branch-at-capacity");
+        catalog
+            .apply(CatalogMutation::CreateBranch(boundary))
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.ensure_live_branch_capacity_unlocked().await,
+            Err(CatalogError::Capacity {
+                resource: "live branch",
+                limit: MAX_LIVE_BRANCHES,
+            })
+        ));
+        let generation = catalog.state_unlocked().await.unwrap().generation;
+        let (creating, operation) = reserved_create(&source, "over-branch-capacity");
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::ReserveBranchCreate {
+                    branch: creating.clone(),
+                    operation: Box::new(operation),
+                })
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "live branch",
+                limit: MAX_LIVE_BRANCHES,
+            })
+        ));
+        assert_eq!(
+            catalog.state_unlocked().await.unwrap().generation,
+            generation
+        );
+        assert!(catalog.branch(creating.id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_lease_capacity_reuse_atomic_branch_counters() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("root-capacity"), store)
+            .await
+            .unwrap();
+        let owner = branch("capacity-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(owner.clone()))
+            .await
+            .unwrap();
+
+        let mut blockers = PrivateGcBranchBlockers::empty(owner.id);
+        blockers.checkpoints = crate::catalog::MAX_CHECKPOINTS_PER_BRANCH as u64;
+        catalog
+            .db
+            .put_with_options(
+                private_gc_branch_blocker_key(owner.id),
+                serde_json::to_vec(&blockers).unwrap(),
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await
+            .unwrap();
+        let checkpoint = checkpoint(Uuid::new_v4(), owner.id, "over-capacity");
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::CreateCheckpoint(checkpoint.clone()))
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "checkpoint per branch",
+                limit: crate::catalog::MAX_CHECKPOINTS_PER_BRANCH,
+            })
+        ));
+        assert!(catalog.checkpoint(checkpoint.id).await.unwrap().is_none());
+
+        blockers.checkpoints = 0;
+        blockers.leases = MAX_ACTIVE_LEASES_PER_BRANCH as u64;
+        catalog
+            .db
+            .put_with_options(
+                private_gc_branch_blocker_key(owner.id),
+                serde_json::to_vec(&blockers).unwrap(),
+                &slatedb::config::PutOptions::default(),
+                &durable_write_options(),
+            )
+            .await
+            .unwrap();
+        let lease = branch_lease(&owner, catalog_timestamp(Utc::now()));
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::AcquireLease {
+                    expected_subject_revision: owner.revision,
+                    lease: lease.clone(),
+                })
+                .await,
+            Err(CatalogError::Capacity {
+                resource: "active lease per branch",
+                limit: MAX_ACTIVE_LEASES_PER_BRANCH,
+            })
+        ));
+        assert!(catalog.lease(lease.id).await.unwrap().is_none());
         catalog.close().await.unwrap();
     }
 
@@ -4985,7 +5458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v16_catalogs_to_shadow_reporting_schema() {
+    async fn migrates_v2_through_v17_catalogs_to_production_limits_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -5002,9 +5475,10 @@ mod tests {
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
             TOMBSTONE_CLEANUP_SCHEMA_VERSION,
+            SERVER_CATALOG_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v17"));
+            let path = Path::from(format!("migration-v{prior_version}-v18"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -5037,6 +5511,16 @@ mod tests {
             let catalog = SlateDbCatalog::open(path, store).await.unwrap();
             let snapshot = catalog.snapshot().await.unwrap();
             assert_eq!(snapshot.schema_version, CATALOG_SCHEMA_VERSION);
+            assert_eq!(
+                catalog
+                    .get_record::<BranchLineageDepth>(branch_lineage_depth_key(existing.id))
+                    .await
+                    .unwrap(),
+                Some(BranchLineageDepth {
+                    branch_id: existing.id,
+                    depth: 0,
+                })
+            );
             assert_eq!(snapshot.branches[&existing.id], existing);
             assert_eq!(
                 snapshot.checkpoints[&existing_checkpoint.id],
@@ -5061,6 +5545,62 @@ mod tests {
                 catalog.private_gc_global_blockers_unlocked().await.unwrap(),
                 PrivateGcGlobalBlockers::empty()
             );
+            catalog.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn v18_migration_accepts_exact_caps_and_rejects_cap_plus_one_on_every_retry() {
+        let exact = v17_capacity_fixture(
+            "migration-v17-exact-production-capacity",
+            MAX_LIVE_BRANCHES,
+            crate::catalog::MAX_CHECKPOINTS_PER_BRANCH,
+            MAX_ACTIVE_LEASES_PER_BRANCH,
+        )
+        .await;
+        exact.migrate_unlocked().await.unwrap();
+        assert_eq!(
+            exact.state_unlocked().await.unwrap().schema_version,
+            CATALOG_SCHEMA_VERSION
+        );
+        exact.close().await.unwrap();
+
+        for (path, branches, checkpoints, leases, resource) in [
+            (
+                "migration-v17-over-branch-capacity",
+                MAX_LIVE_BRANCHES + 1,
+                0,
+                0,
+                "live branch",
+            ),
+            (
+                "migration-v17-over-checkpoint-capacity",
+                1,
+                crate::catalog::MAX_CHECKPOINTS_PER_BRANCH + 1,
+                0,
+                "checkpoint per branch",
+            ),
+            (
+                "migration-v17-over-lease-capacity",
+                1,
+                0,
+                MAX_ACTIVE_LEASES_PER_BRANCH + 1,
+                "active lease per branch",
+            ),
+        ] {
+            let catalog = v17_capacity_fixture(path, branches, checkpoints, leases).await;
+            for _ in 0..2 {
+                assert!(matches!(
+                    catalog.migrate_unlocked().await,
+                    Err(CatalogError::Invalid(message))
+                        if message.contains("cannot apply") && message.contains(resource)
+                ));
+                let state = serde_json::from_slice::<CatalogState>(
+                    &catalog.db.get(STATE_KEY).await.unwrap().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(state.schema_version, SERVER_CATALOG_SCHEMA_VERSION);
+            }
             catalog.close().await.unwrap();
         }
     }

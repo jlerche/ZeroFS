@@ -806,6 +806,32 @@ bounded to a cursor, immutable batch size, timestamps, and aggregate object/byte
 counts; it never stores an unbounded per-object receipt list. Interrupted work
 resumes exactly or aborts and leaks storage. Delete retries are idempotent.
 
+### Production scale limits
+
+SlateDB admission enforces 4,096 simultaneous live branch records (including
+`Creating` and `Deleting`), 256 named checkpoints per branch, 64 active branch
+or checkpoint leases attributed to one branch, and 64 historical parent edges.
+Exact retries are reconciled before capacity checks, so reaching a ceiling does
+not break idempotency. Logical deletion frees branch/checkpoint/lease capacity;
+root-free tombstones and permanent UUID reservations do not consume live-branch
+capacity. Schema migration accepts state exactly at each ceiling and repeatedly
+fails without advancing the schema marker when prior state is over any ceiling.
+
+Lineage depth is a small SlateDB-only record retained with each branch UUID. It
+survives tombstone compaction and is checked atomically with branch reservation;
+it is neither a GC root nor copied to PostgreSQL/JSON. Migration rejects cycles,
+missing compacted ancestry, or an already over-limit lineage rather than
+guessing a smaller depth.
+
+Segment inventory has no object-count admission ceiling: counts and cursors are
+`u64`, the pool is partitioned into 256 shards, and mark/inventory sorting holds
+at most 8,192 records plus logarithmically many spill paths at once. Operators
+therefore size the collection interval and artifact retention for their object
+store rather than increasing an in-memory catalog limit. Performance
+qualification at the supported branch/root envelope is a separate release gate;
+exceeding an operator's time budget delays reclamation and must never authorize
+partial deletion.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

@@ -288,7 +288,7 @@
 
 ### Epic 5.3: Validate scale and operability
 
-- [ ] Establish supported production limits for branches, checkpoints, lineage depth, leases, and segment inventory.
+- [x] Establish supported production limits for branches, checkpoints, lineage depth, leases, and segment inventory.
 - [ ] Benchmark root capture and mark generation at those limits.
 - [x] Verify memory use is bounded by run/shard size rather than total storage size.
 - [ ] Verify external work scales linearly with roots, references, and inventory.
@@ -721,3 +721,10 @@
 - Serving assembly opens the authoritative SlateDB catalog against the same object store, requires pairwise-disjoint live database/catalog/private branch/shared-pool namespaces, reconciles the selected projection from one validated snapshot, and retains the lifecycle for the serving process. Projection open/reconciliation errors are warnings and do not invalidate storage authority. Focused startup coverage proves an unreadable JSON projection leaves authoritative list/inspection available; lifecycle coverage proves a nonempty snapshot rebuilds the root-free JSON contract.
 - This closes the single-node server ownership gap for configuration and projection reconstruction without copying roots, leases, controls, private epochs, or GC state into PostgreSQL/JSON. Lifecycle release and mount rows remain open until customer APIs and the stable mount grant/renewal/release data-plane path consume the retained runtime.
 - Catalog open and projection reconciliation are the final fallible serving-assembly step; read-only/checkpoint processes skip them, orderly shutdown explicitly closes the catalog, and process-signal registration precedes database initialization. Configuration continues to reject `[catalog]` with `[replication]`: an independent SlateDB catalog writer cannot safely inherit data-plane HA ownership because a stale late open could fence the promoted writer. HA catalog support remains open until catalog mutations share the replicated writer authority domain.
+
+### 2026-08-08: production catalog admission limits
+
+- Catalog schema v18 enforces 4,096 simultaneous live branch records, 256 named checkpoints per branch, 64 active leases attributed to one branch, and 64 retained historical parent edges. Exact mutation retries reconcile before admission, while rejected requests publish neither records nor a generation change. Migration accepts exact-cap state and repeatedly fails closed at cap-plus-one without advancing the prior schema marker.
+- Branch creation performs a bounded live-key count rather than rewriting global state. Existing atomic per-branch private-GC counters also provide checkpoint and lease admission, so these limits add no new customer projection fields or catalog-wide CAS object. Logical deletion returns live capacity; tombstones and permanent UUID reservations remain outside the live-branch budget.
+- A SlateDB-only per-UUID lineage-depth record survives tombstone cleanup and keeps the limit exact without making ancestry a liveness dependency. Migration reconstructs it from authoritative live/tombstoned history and fails closed on cycles, missing compacted ancestry, or an over-limit existing chain. PostgreSQL and JSON remain identical and do not receive this private authority record.
+- Segment inventory deliberately has no object-cardinality admission ceiling: `u64` counts/cursors, 256 fixed shards, 8,192-record buffers, and logarithmic spill-path state bound memory independently of pool size. The adjacent root/mark benchmark, external-I/O linearity, and foreground-latency rows remain open until measured at the declared catalog/root envelope.
