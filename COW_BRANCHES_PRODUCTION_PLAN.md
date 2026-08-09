@@ -138,9 +138,9 @@
   - [ ] Create a temporary internal checkpoint with a stable identity.
   - [ ] Clone from that checkpoint.
   - [ ] Remove the temporary public dependency after the destination root is independently pinned.
-- [ ] Keep the recovery record minimal.
+- [x] Keep the recovery record minimal.
   - [x] Persist an operation ID and immutable source/destination identities.
-  - [ ] Resume or safely roll back an incomplete create.
+  - [x] Resume or safely roll back an incomplete create.
   - [x] Avoid per-step receipts when the operation can be reconciled from authoritative state.
 
 ### Epic 2.3: Implement leases
@@ -658,3 +658,8 @@
 - `BranchLifecycle` now lists live branches deterministically by name and stable UUID and inspects either a current name or an exact never-reused UUID. Exact-ID inspection preserves the distinction between a live record, a full tombstone, a compact permanent retirement marker, and an unknown resource; resolving a reused name returns only the current live incarnation.
 - Live inspection reports the authoritative branch record, including lifecycle state and current durable root, plus independently classified historical parent and origin-checkpoint references. Each historical reference is explicitly `live`, `tombstoned`, `retired`, or `missing`, so deleted ancestry remains explanatory metadata and cannot be mistaken for a storage-liveness dependency.
 - The inspection is built from one lock-consistent SlateDB snapshot. Durable roots remain SlateDB-only authority and are never copied into the identical PostgreSQL/JSON customer projections; customer metadata can be composed with this authoritative view at a later API boundary. Focused tests prove deterministic ordering, name/UUID lookup parity, and live/tombstoned/retired/missing lineage classification.
+
+### 2026-08-08: minimal create-recovery record closure
+
+- The authoritative create operation retains only its operation/destination/source UUIDs, immutable source root, optional historical parent UUID, one `reserved`/`root_created`/`published` phase, the independently authenticated destination root once available, and revision/timestamps. It has no per-step receipt log, takeover generation, expiry bucket, or recovery sweep state.
+- The persisted-boundary restart matrix closes and reopens the SlateDB catalog before reservation, after atomic reservation, after destination storage but before root publication, after root publication, and after ready publication. Reissuing the exact immutable request converges on the same authenticated ready branch at every boundary; conflicting inputs fail rather than retargeting recovery.
