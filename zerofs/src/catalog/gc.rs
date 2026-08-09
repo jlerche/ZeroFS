@@ -1008,6 +1008,28 @@ mod tests {
     use slatedb::object_store::path::Path;
     use slatedb::{Db, WriteBatch};
 
+    async fn reopen_gc_lifecycle(
+        catalog: Arc<SlateDbCatalog>,
+        store: Arc<dyn ObjectStore>,
+        catalog_path: &Path,
+        branch_root: &Path,
+        segment_pool: &Path,
+    ) -> (Arc<SlateDbCatalog>, RootCaptureLifecycle) {
+        catalog.close().await.unwrap();
+        drop(catalog);
+        let catalog = Arc::new(
+            SlateDbCatalog::open(catalog_path.clone(), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, branch_root.clone())
+                .with_segment_pool_root(segment_pool.clone()),
+        );
+        (catalog, lifecycle)
+    }
+
     #[test]
     fn root_list_is_typed_canonical_and_deduplicated() {
         let now = catalog_timestamp(Utc::now());
@@ -1173,6 +1195,202 @@ mod tests {
             Err(CatalogError::Invalid(_))
         ));
         assert!(catalog.gc_run(bad_id).await.unwrap().is_none());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_reopens_and_resumes_from_every_persisted_phase() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog_path = Path::from("gc-phase-restart/catalog");
+        let branch_root = Path::from("gc-phase-restart/branches");
+        let segment_pool = Path::from("gc-phase-restart/pool");
+        let candidate = Segid::new(41, 0);
+        let candidate_path = Path::from(format!("{segment_pool}/{}", candidate.object_key()));
+        store
+            .put(
+                &candidate_path,
+                bytes::Bytes::from_static(b"candidate").into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let mut catalog = Arc::new(
+            SlateDbCatalog::open(catalog_path.clone(), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let mut lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(Arc::clone(&store), branch_root.clone())
+                .with_segment_pool_root(segment_pool.clone()),
+        );
+        let run_id = Uuid::new_v4();
+
+        let captured = lifecycle.begin(run_id).await.unwrap();
+        assert_eq!(captured.phase, GcRunPhase::Captured);
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+        assert_eq!(lifecycle.begin(run_id).await.unwrap(), captured);
+
+        let marking = lifecycle.mark(run_id).await.unwrap();
+        assert_eq!(marking.phase, GcRunPhase::Marking);
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+        assert_eq!(lifecycle.mark(run_id).await.unwrap(), marking);
+
+        let quarantined = lifecycle.quarantine(run_id).await.unwrap();
+        assert_eq!(quarantined.phase, GcRunPhase::Quarantined);
+        assert_eq!(
+            quarantined
+                .inventory_stats
+                .as_ref()
+                .unwrap()
+                .candidate_objects,
+            1
+        );
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+        assert_eq!(lifecycle.quarantine(run_id).await.unwrap(), quarantined);
+
+        let grace = Duration::seconds(MIN_REVALIDATION_GRACE_SECONDS as i64);
+        let not_before = quarantined.quarantine_at.unwrap() + grace;
+        let observation = GcRevalidationRecord {
+            id: Uuid::new_v4(),
+            catalog_generation: quarantined.catalog_generation,
+            grace_seconds: MIN_REVALIDATION_GRACE_SECONDS,
+            not_before,
+            inventory_cutoff: not_before,
+            roots: Vec::new(),
+            root_digest: gc_root_digest(&[]).unwrap(),
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            candidate_shards: Vec::new(),
+            stats: None,
+            captured_at: not_before,
+            completed_at: None,
+        };
+        let revalidating = catalog
+            .begin_gc_revalidation(GcRevalidationCapture {
+                run_id,
+                expected_revision: quarantined.revision,
+                expected_generation: quarantined.catalog_generation,
+                observation,
+                updated_at: not_before,
+            })
+            .await
+            .unwrap();
+        assert_eq!(revalidating.phase, GcRunPhase::Revalidating);
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+
+        let validated = lifecycle
+            .revalidate_at(run_id, grace, not_before)
+            .await
+            .unwrap();
+        assert_eq!(validated.phase, GcRunPhase::Validated);
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+        assert_eq!(
+            lifecycle
+                .revalidate_at(run_id, grace, not_before)
+                .await
+                .unwrap(),
+            validated
+        );
+
+        let started_at = catalog_timestamp(Utc::now()).max(validated.updated_at);
+        let deleting = catalog
+            .publish_gc_deletion(GcDeletionPublication {
+                run_id,
+                expected_revision: validated.revision,
+                expected_generation: validated.catalog_generation,
+                progress: GcDeletionProgress {
+                    batch_size: 1,
+                    next_shard: 0,
+                    next_record: 0,
+                    deleted_objects: 0,
+                    deleted_bytes: 0,
+                    already_absent: 0,
+                    started_at,
+                    completed_at: None,
+                },
+                updated_at: started_at,
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleting.phase, GcRunPhase::Deleting);
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+
+        let policy = GcDeletionPolicy {
+            enabled: true,
+            batch_size: 1,
+        };
+        let completed = lifecycle.delete_batch(run_id, policy).await.unwrap();
+        assert_eq!(completed.phase, GcRunPhase::Completed);
+        assert_eq!(completed.deletion.as_ref().unwrap().deleted_objects, 1);
+        assert!(matches!(
+            store.head(&candidate_path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        drop(lifecycle);
+        (catalog, lifecycle) = reopen_gc_lifecycle(
+            catalog,
+            Arc::clone(&store),
+            &catalog_path,
+            &branch_root,
+            &segment_pool,
+        )
+        .await;
+        assert_eq!(
+            lifecycle.delete_batch(run_id, policy).await.unwrap(),
+            completed
+        );
+
+        drop(lifecycle);
         catalog.close().await.unwrap();
     }
 

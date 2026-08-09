@@ -280,7 +280,7 @@
 - [x] Test deletion of parents and source checkpoints with surviving descendants.
 - [x] Test active, expired, renewed, and corrupted leases.
 - [x] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
-- [ ] Test collector crashes and restarts in every persisted phase.
+- [x] Test collector crashes and restarts in every persisted phase.
 - [x] Test partial and ambiguous object-store deletes.
 - [x] Assert that uncertainty always retains data.
 - [x] Assert eventual reclamation once an object is stably unreachable.
@@ -636,3 +636,9 @@
 - The reusable fault-injecting object store now distinguishes deletes that fail before application from deletes that are applied but lose their response, and counts every attempted delete. This gives lifecycle and collector tests the same deterministic ambiguity model already used for immutable puts.
 - Every GC candidate deletion is followed by an authoritative absence check even when the delete response is an error. Confirmed absence advances the bounded cursor as an already-absent reconciliation; a failed delete whose object remains returns the original error, while an inconclusive absence check returns its verification error and retains the candidate.
 - Executable proof starts a two-candidate bounded batch, deletes its first candidate, then injects a before-apply failure on the second and proves that object remains. Retrying from the unchanged batch cursor classifies the first as already absent without another delete, reconciles an after-apply lost response for the second, advances to completion, and remains idempotent on replay.
+
+### 2026-08-08: persisted-phase GC restart matrix
+
+- One collector run now closes its authoritative SlateDB catalog, drops the lifecycle object, reopens the same local catalog path, and resumes after each durable phase: `Captured`, `Marking`, `Quarantined`, `Revalidating`, `Validated`, `Deleting`, and `Completed`. Artifacts and the segment pool remain in the same object store while every coordinator instance is reconstructed.
+- The normally transient `Revalidating` and initial `Deleting` states are published through their exact catalog transitions before shutdown. After reopen, the public revalidation and bounded-deletion entry points consume those records, verify their immutable artifacts, and advance without rebuilding or skipping authority.
+- Exact retry is asserted for the already-published capture, marks, quarantine, validation, and completion records. The deleting restart physically removes the sole stably unreachable candidate, durably completes its cursor and audit, and a final completed-state reopen performs no additional deletion.
