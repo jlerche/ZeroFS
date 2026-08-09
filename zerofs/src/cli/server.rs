@@ -235,12 +235,17 @@ async fn start_nbd_servers(
     handles
 }
 
+struct RpcCatalogCapabilities {
+    checkpoint_catalog: Option<Arc<dyn crate::rpc::server::CheckpointCatalogAuthority>>,
+    branch_catalog: Option<Arc<dyn crate::rpc::server::BranchCatalogAuthority>>,
+    catalog_configured: bool,
+    customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
+}
+
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
-    checkpoint_catalog: Option<Arc<dyn crate::rpc::server::CheckpointCatalogAuthority>>,
-    catalog_configured: bool,
-    customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
+    catalogs: RpcCatalogCapabilities,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
@@ -251,9 +256,10 @@ async fn start_rpc_servers(
 
     let service = crate::rpc::server::AdminRpcServer::new_with_catalog(
         checkpoint_manager,
-        checkpoint_catalog,
-        catalog_configured,
-        customer_catalog,
+        catalogs.checkpoint_catalog,
+        catalogs.branch_catalog,
+        catalogs.catalog_configured,
+        catalogs.customer_catalog,
         fs,
         shutdown.clone(),
     );
@@ -1419,16 +1425,24 @@ pub async fn run_server(
             })
     });
     let catalog_configured = settings.catalog.is_some();
+    let branch_catalog = catalog_runtime.as_ref().map(|runtime| {
+        Arc::new(runtime.clone()) as Arc<dyn crate::rpc::server::BranchCatalogAuthority>
+    });
     #[cfg(feature = "webui")]
     let checkpoint_catalog_for_webui = checkpoint_catalog.clone();
+    #[cfg(feature = "webui")]
+    let branch_catalog_for_webui = branch_catalog.clone();
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
-        checkpoint_catalog,
-        catalog_configured,
-        catalog_runtime
-            .as_ref()
-            .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
+        RpcCatalogCapabilities {
+            checkpoint_catalog,
+            branch_catalog,
+            catalog_configured,
+            customer_catalog: catalog_runtime
+                .as_ref()
+                .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
+        },
         Arc::clone(&fs),
         shutdown.clone(),
     )
@@ -1496,6 +1510,7 @@ pub async fn run_server(
         let webui_rpc_service = crate::rpc::server::AdminRpcServer::new_with_catalog(
             checkpoint_manager_for_webui,
             checkpoint_catalog_for_webui,
+            branch_catalog_for_webui,
             catalog_configured,
             catalog_runtime
                 .as_ref()

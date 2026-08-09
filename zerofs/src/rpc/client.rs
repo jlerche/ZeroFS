@@ -34,6 +34,25 @@ pub struct CheckpointPage {
     pub next_after: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMutationResult {
+    pub operation_id: Uuid,
+    pub branch_id: Uuid,
+    pub name: String,
+    pub state: String,
+}
+
+fn branch_mutation_from_proto(info: proto::BranchMutationInfo) -> Result<BranchMutationResult> {
+    Ok(BranchMutationResult {
+        operation_id: Uuid::parse_str(&info.operation_id)
+            .context("Server returned an invalid branch operation UUID")?,
+        branch_id: Uuid::parse_str(&info.branch_id)
+            .context("Server returned an invalid branch UUID")?,
+        name: info.name,
+        state: info.state,
+    })
+}
+
 pub struct RpcClient {
     client: AdminServiceClient<Channel>,
 }
@@ -253,6 +272,54 @@ impl RpcClient {
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
         }
+    }
+
+    pub async fn create_branch(
+        &self,
+        operation_id: Uuid,
+        branch_id: Uuid,
+        name: &str,
+        source_branch_id: Uuid,
+        source_checkpoint_name: &str,
+    ) -> Result<BranchMutationResult> {
+        let response = self
+            .client
+            .clone()
+            .create_branch(proto::CreateBranchRequest {
+                operation_id: operation_id.to_string(),
+                branch_id: branch_id.to_string(),
+                name: name.to_string(),
+                source_branch_id: source_branch_id.to_string(),
+                source_checkpoint_name: source_checkpoint_name.to_string(),
+            })
+            .await
+            .map_err(|status| anyhow!("RPC call failed: {}", status.message()))?
+            .into_inner()
+            .branch
+            .ok_or_else(|| anyhow!("Empty response from server"))?;
+        branch_mutation_from_proto(response)
+    }
+
+    pub async fn delete_branch(
+        &self,
+        operation_id: Uuid,
+        branch_id: Uuid,
+        name: &str,
+    ) -> Result<BranchMutationResult> {
+        let response = self
+            .client
+            .clone()
+            .delete_branch(proto::DeleteBranchRequest {
+                operation_id: operation_id.to_string(),
+                branch_id: branch_id.to_string(),
+                name: name.to_string(),
+            })
+            .await
+            .map_err(|status| anyhow!("RPC call failed: {}", status.message()))?
+            .into_inner()
+            .branch
+            .ok_or_else(|| anyhow!("Empty response from server"))?;
+        branch_mutation_from_proto(response)
     }
 
     pub async fn watch_file_access(&self) -> Result<Streaming<proto::FileAccessEvent>> {

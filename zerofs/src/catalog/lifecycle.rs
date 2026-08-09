@@ -709,6 +709,94 @@ impl BranchLifecycle {
         .await
     }
 
+    /// Server-facing exact retry boundary. The first attempt assigns server
+    /// time; retries recover that immutable timestamp from the operation UUID
+    /// instead of requiring clients to reproduce it.
+    pub async fn create_from_checkpoint_name_by_identity(
+        &self,
+        operation_id: Uuid,
+        destination_id: Uuid,
+        destination_name: String,
+        source_branch_id: Uuid,
+        source_checkpoint_name: String,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
+        let created_at = self
+            .catalog
+            .branch_create_operation(operation_id)
+            .await?
+            .map_or_else(
+                || catalog_timestamp(Utc::now()),
+                |operation| operation.created_at,
+            );
+        let request = BranchCreateFromCheckpointNameRequest {
+            operation_id,
+            destination_id,
+            destination_name,
+            source_branch_id,
+            source_checkpoint_name,
+            created_at,
+        };
+        match self.create_from_checkpoint_name(request.clone()).await {
+            Ok(branch) => Ok(branch),
+            Err(first_error) => {
+                let Some(operation) = self.catalog.branch_create_operation(operation_id).await?
+                else {
+                    return Err(first_error);
+                };
+                self.create_from_checkpoint_name(BranchCreateFromCheckpointNameRequest {
+                    created_at: operation.created_at,
+                    ..request
+                })
+                .await
+            }
+        }
+    }
+
+    /// Delete one exact branch incarnation while deriving its revision from
+    /// authoritative live state or the permanent deletion operation. A reused
+    /// name can never retarget this operation UUID/branch UUID pair.
+    pub async fn delete_branch_by_identity(
+        &self,
+        operation_id: Uuid,
+        branch_id: Uuid,
+        name: String,
+    ) -> Result<super::BranchDeleteResult, super::DeletionLifecycleError> {
+        let expected_revision =
+            if let Some(operation) = self.catalog.branch_delete_operation(operation_id).await? {
+                if operation.branch_id != branch_id || operation.branch_name != name {
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()).into());
+                }
+                operation.expected_branch_revision
+            } else if let Some(branch) = self.catalog.branch(branch_id).await? {
+                if branch.name != name {
+                    return Err(CatalogError::NotFound(format!("{name} ({branch_id})")).into());
+                }
+                branch.revision
+            } else if let Some(tombstone) = self.catalog.tombstone(branch_id).await? {
+                if tombstone.kind != TombstoneKind::Branch
+                    || tombstone.name != name
+                    || tombstone.deletion_operation_id != Some(operation_id)
+                {
+                    return Err(CatalogError::NotFound(format!("{name} ({branch_id})")).into());
+                }
+                tombstone.deleted_revision.ok_or_else(|| {
+                    CatalogError::OperationConflict(format!(
+                        "branch {branch_id} tombstone predates exact retry metadata"
+                    ))
+                })?
+            } else {
+                return Err(CatalogError::NotFound(branch_id.to_string()).into());
+            };
+        self.deletions()
+            .delete_branch(super::BranchDeleteRequest {
+                operation_id,
+                branch_id,
+                expected_revision,
+                name,
+            })
+            .await
+    }
+
     /// Create or resume one exact checkpoint-based branch operation.
     ///
     /// The catalog reserves the source before clone I/O. The resulting root is
@@ -1585,17 +1673,21 @@ mod tests {
         let lifecycle = BranchLifecycle::new(catalog.clone(), root_store.clone());
         let operation_id = Uuid::new_v4();
         let destination_id = Uuid::new_v4();
-        let named_request = BranchCreateFromCheckpointNameRequest {
-            operation_id,
-            destination_id,
-            destination_name: "child".to_string(),
-            source_branch_id: parent.id,
-            source_checkpoint_name: source_record.name.clone(),
-            created_at: now,
-        };
         let (left, right) = tokio::join!(
-            lifecycle.create_from_checkpoint_name(named_request.clone()),
-            lifecycle.create_from_checkpoint_name(named_request.clone())
+            lifecycle.create_from_checkpoint_name_by_identity(
+                operation_id,
+                destination_id,
+                "child".to_string(),
+                parent.id,
+                source_record.name.clone(),
+            ),
+            lifecycle.create_from_checkpoint_name_by_identity(
+                operation_id,
+                destination_id,
+                "child".to_string(),
+                parent.id,
+                source_record.name.clone(),
+            )
         );
         let left = left.unwrap();
         let right = right.unwrap();
@@ -1700,7 +1792,13 @@ mod tests {
             .expect("an exact checkpoint deletion retry must ignore name reuse");
         assert_eq!(
             lifecycle
-                .create_from_checkpoint_name(named_request)
+                .create_from_checkpoint_name_by_identity(
+                    operation_id,
+                    destination_id,
+                    "child".to_string(),
+                    parent.id,
+                    "reused-source-name-is-resolution-only".to_string(),
+                )
                 .await
                 .expect("a published named retry must ignore source deletion and name reuse"),
             left
@@ -1908,18 +2006,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let current = catalog.branch(left.id).await.unwrap().unwrap();
+        let delete_operation_id = Uuid::new_v4();
+        let deleted = BranchLifecycle::new(catalog.clone(), root_store.clone())
+            .delete_branch_by_identity(delete_operation_id, left.id, left.name.clone())
+            .await
+            .unwrap();
         assert!(matches!(
-            BranchLifecycle::new(catalog.clone(), root_store.clone())
-                .deletions()
-                .delete_branch(crate::catalog::BranchDeleteRequest {
-                    operation_id: Uuid::new_v4(),
-                    branch_id: left.id,
-                    expected_revision: current.revision,
-                    name: left.name.clone(),
-                })
-                .await
-                .unwrap(),
+            &deleted,
             crate::catalog::BranchDeleteResult::Deleted(_)
         ));
         catalog
@@ -1939,6 +2032,13 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_eq!(
+            BranchLifecycle::new(catalog.clone(), root_store.clone())
+                .delete_branch_by_identity(delete_operation_id, left.id, left.name.clone())
+                .await
+                .expect("an exact branch deletion retry must ignore name reuse"),
+            deleted
+        );
         assert_eq!(
             leases
                 .acquire_branch_by_name(&left.name, retained_request)

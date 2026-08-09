@@ -153,6 +153,17 @@ allowed state transitions are:
 No other transition is valid. `Ready` is monotonic: a branch never returns to
 `Creating`. A tombstoned UUID never becomes live again.
 
+The branch mutation RPC carries a permanent operation UUID and destination or
+subject branch UUID. Creation also carries the exact source branch UUID and a
+checkpoint name that SlateDB resolves once to its immutable checkpoint UUID and
+root. Server time is persisted with the first reservation; retries recover that
+timestamp from the operation record, including overlapping first attempts, so
+clients need retain only the two UUIDs. Deletion derives the consumed branch
+revision from the live record or matching permanent delete operation. The CLI
+prints the exact `--id`/`--operation-id` retry values before issuing a mutation.
+Both mutations commit through authoritative SlateDB before best-effort
+PostgreSQL/JSON reconciliation; their response contains no storage root.
+
 ### Create and retry contract
 
 A create request contains `operation_id`, destination UUID/name, exact source

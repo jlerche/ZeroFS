@@ -10,7 +10,7 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
-pub(crate) use init::CheckpointCatalogRuntime;
+pub(crate) use init::{CatalogRuntime, CheckpointCatalogRuntime};
 pub mod monitor;
 pub mod otrace;
 pub mod password;
@@ -190,6 +190,22 @@ pub enum CheckpointCommands {
 
 #[derive(Subcommand)]
 pub enum BranchCommands {
+    /// Create a branch from one named checkpoint on an exact source branch
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        name: String,
+        #[arg(long)]
+        source_branch_id: uuid::Uuid,
+        #[arg(long)]
+        source_checkpoint: String,
+        /// Stable destination UUID for an exact retry
+        #[arg(long)]
+        id: Option<uuid::Uuid>,
+        /// Stable operation UUID for an exact retry
+        #[arg(long)]
+        operation_id: Option<uuid::Uuid>,
+    },
     /// List a bounded UUID-ordered page of branch records
     List {
         #[arg(short, long)]
@@ -206,6 +222,16 @@ pub enum BranchCommands {
         #[arg(short, long)]
         config: PathBuf,
         id: uuid::Uuid,
+    },
+    /// Logically delete one exact branch incarnation
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        id: uuid::Uuid,
+        name: String,
+        /// Stable operation UUID for an exact retry
+        #[arg(long)]
+        operation_id: Option<uuid::Uuid>,
     },
 }
 

@@ -113,6 +113,57 @@ impl CatalogRuntime {
         }
     }
 
+    pub(crate) async fn create_branch(
+        &self,
+        operation_id: uuid::Uuid,
+        destination_id: uuid::Uuid,
+        destination_name: String,
+        source_branch_id: uuid::Uuid,
+        source_checkpoint_name: String,
+    ) -> Result<zerofs::catalog::BranchRecord> {
+        let branch = self
+            .lifecycle
+            .create_from_checkpoint_name_by_identity(
+                operation_id,
+                destination_id,
+                destination_name,
+                source_branch_id,
+                source_checkpoint_name,
+            )
+            .await
+            .context("Failed to create authoritative branch")?;
+        self.reconcile_projection("branch creation").await;
+        Ok(branch)
+    }
+
+    pub(crate) async fn delete_branch(
+        &self,
+        operation_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        name: String,
+    ) -> Result<zerofs::catalog::BranchDeleteResult> {
+        let result = self
+            .lifecycle
+            .delete_branch_by_identity(operation_id, branch_id, name)
+            .await
+            .context("Failed to delete authoritative branch")?;
+        self.reconcile_projection("branch deletion").await;
+        Ok(result)
+    }
+
+    async fn reconcile_projection(&self, operation: &str) {
+        if let Some(projection) = &self.projection
+            && let Err(error) = self
+                .lifecycle
+                .reconcile_projection(self.volume_id, projection.as_ref())
+                .await
+        {
+            tracing::warn!(
+                "Customer catalog projection reconciliation after {operation} failed; authoritative SlateDB remains current: {error}"
+            );
+        }
+    }
+
     pub(crate) async fn prepare_writer_mount(
         &self,
         config: &crate::config::ServerBranchMountConfig,

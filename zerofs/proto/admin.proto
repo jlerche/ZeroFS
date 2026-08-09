@@ -17,6 +17,10 @@ service AdminService {
 
     rpc GetBranchInfo(GetBranchInfoRequest) returns (GetBranchInfoResponse);
 
+    rpc CreateBranch(CreateBranchRequest) returns (CreateBranchResponse);
+
+    rpc DeleteBranch(DeleteBranchRequest) returns (DeleteBranchResponse);
+
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
     rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
@@ -142,6 +146,38 @@ message GetBranchInfoRequest {
 
 message GetBranchInfoResponse {
     BranchInfo branch = 1;
+}
+
+message BranchMutationInfo {
+    string operation_id = 1;
+    string branch_id = 2;
+    string name = 3;
+    string state = 4;
+}
+
+message CreateBranchRequest {
+    // Permanent exact-retry identities. Clients generate both once and retain
+    // them across ambiguous responses.
+    string operation_id = 1;
+    string branch_id = 2;
+    string name = 3;
+    string source_branch_id = 4;
+    string source_checkpoint_name = 5;
+}
+
+message CreateBranchResponse {
+    BranchMutationInfo branch = 1;
+}
+
+message DeleteBranchRequest {
+    // A fresh permanent operation UUID plus the exact branch incarnation.
+    string operation_id = 1;
+    string branch_id = 2;
+    string name = 3;
+}
+
+message DeleteBranchResponse {
+    BranchMutationInfo branch = 1;
 }
 
 message WatchFileAccessRequest {}

@@ -31,6 +31,25 @@ fn customer_catalog_status(error: CatalogError) -> Status {
     }
 }
 
+fn parse_non_nil_uuid(value: &str, field: &str) -> Result<uuid::Uuid, Status> {
+    let id = uuid::Uuid::parse_str(value)
+        .map_err(|_| Status::invalid_argument(format!("{field} must be a valid non-nil UUID")))?;
+    if id.is_nil() {
+        return Err(Status::invalid_argument(format!(
+            "{field} must be a valid non-nil UUID"
+        )));
+    }
+    Ok(id)
+}
+
+fn branch_state_str(state: zerofs::catalog::BranchState) -> &'static str {
+    match state {
+        zerofs::catalog::BranchState::Creating => "creating",
+        zerofs::catalog::BranchState::Ready => "ready",
+        zerofs::catalog::BranchState::Deleting => "deleting",
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait CheckpointCatalogAuthority: Send + Sync {
     fn branch_id(&self) -> uuid::Uuid;
@@ -64,6 +83,54 @@ impl CheckpointCatalogAuthority for crate::cli::CheckpointCatalogRuntime {
         name: String,
     ) -> anyhow::Result<zerofs::catalog::TombstoneRecord> {
         self.delete(checkpoint_id, name).await
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait BranchCatalogAuthority: Send + Sync {
+    async fn create(
+        &self,
+        operation_id: uuid::Uuid,
+        destination_id: uuid::Uuid,
+        destination_name: String,
+        source_branch_id: uuid::Uuid,
+        source_checkpoint_name: String,
+    ) -> anyhow::Result<zerofs::catalog::BranchRecord>;
+    async fn delete(
+        &self,
+        operation_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        name: String,
+    ) -> anyhow::Result<zerofs::catalog::BranchDeleteResult>;
+}
+
+#[async_trait::async_trait]
+impl BranchCatalogAuthority for crate::cli::CatalogRuntime {
+    async fn create(
+        &self,
+        operation_id: uuid::Uuid,
+        destination_id: uuid::Uuid,
+        destination_name: String,
+        source_branch_id: uuid::Uuid,
+        source_checkpoint_name: String,
+    ) -> anyhow::Result<zerofs::catalog::BranchRecord> {
+        self.create_branch(
+            operation_id,
+            destination_id,
+            destination_name,
+            source_branch_id,
+            source_checkpoint_name,
+        )
+        .await
+    }
+
+    async fn delete(
+        &self,
+        operation_id: uuid::Uuid,
+        branch_id: uuid::Uuid,
+        name: String,
+    ) -> anyhow::Result<zerofs::catalog::BranchDeleteResult> {
+        self.delete_branch(operation_id, branch_id, name).await
     }
 }
 
@@ -196,6 +263,7 @@ fn trash_sweep_lock() -> Arc<tokio::sync::Mutex<()>> {
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
     checkpoint_catalog: Option<Arc<dyn CheckpointCatalogAuthority>>,
+    branch_catalog: Option<Arc<dyn BranchCatalogAuthority>>,
     catalog_configured: bool,
     customer_catalog: Option<CustomerCatalog>,
     fs: Arc<ZeroFS>,
@@ -212,6 +280,7 @@ impl AdminRpcServer {
         let server = Self {
             checkpoint_manager,
             checkpoint_catalog: None,
+            branch_catalog: None,
             catalog_configured: false,
             customer_catalog,
             fs,
@@ -227,6 +296,7 @@ impl AdminRpcServer {
     pub(crate) fn new_with_catalog(
         checkpoint_manager: Arc<CheckpointManager>,
         checkpoint_catalog: Option<Arc<dyn CheckpointCatalogAuthority>>,
+        branch_catalog: Option<Arc<dyn BranchCatalogAuthority>>,
         catalog_configured: bool,
         customer_catalog: Option<CustomerCatalog>,
         fs: Arc<ZeroFS>,
@@ -234,8 +304,15 @@ impl AdminRpcServer {
     ) -> Self {
         let mut server = Self::new(checkpoint_manager, customer_catalog, fs, shutdown);
         server.checkpoint_catalog = checkpoint_catalog;
+        server.branch_catalog = branch_catalog;
         server.catalog_configured = catalog_configured;
         server
+    }
+
+    fn branch_catalog(&self) -> Result<&dyn BranchCatalogAuthority, Status> {
+        self.branch_catalog.as_deref().ok_or_else(|| {
+            Status::failed_precondition("authoritative branch catalog is not configured")
+        })
     }
 
     fn checkpoint_catalog(&self) -> Result<Option<&dyn CheckpointCatalogAuthority>, Status> {
@@ -644,6 +721,72 @@ impl AdminService for AdminRpcServer {
         })
     }
 
+    async fn create_branch(
+        &self,
+        request: Request<proto::CreateBranchRequest>,
+    ) -> Result<Response<proto::CreateBranchResponse>, Status> {
+        let request = request.into_inner();
+        let operation_id = parse_non_nil_uuid(&request.operation_id, "operation id")?;
+        let branch_id = parse_non_nil_uuid(&request.branch_id, "branch id")?;
+        let source_branch_id = parse_non_nil_uuid(&request.source_branch_id, "source branch id")?;
+        let branch = self
+            .branch_catalog()?
+            .create(
+                operation_id,
+                branch_id,
+                request.name,
+                source_branch_id,
+                request.source_checkpoint_name,
+            )
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "Failed to create authoritative branch: {error:#}"
+                ))
+            })?;
+        self.success_response(proto::CreateBranchResponse {
+            branch: Some(proto::BranchMutationInfo {
+                operation_id: operation_id.to_string(),
+                branch_id: branch.id.to_string(),
+                name: branch.name,
+                state: branch_state_str(branch.state).to_string(),
+            }),
+        })
+    }
+
+    async fn delete_branch(
+        &self,
+        request: Request<proto::DeleteBranchRequest>,
+    ) -> Result<Response<proto::DeleteBranchResponse>, Status> {
+        let request = request.into_inner();
+        let operation_id = parse_non_nil_uuid(&request.operation_id, "operation id")?;
+        let branch_id = parse_non_nil_uuid(&request.branch_id, "branch id")?;
+        let (name, state) = match self
+            .branch_catalog()?
+            .delete(operation_id, branch_id, request.name)
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "Failed to delete authoritative branch: {error:#}"
+                ))
+            })? {
+            zerofs::catalog::BranchDeleteResult::Draining(branch) => {
+                (branch.name, branch_state_str(branch.state).to_string())
+            }
+            zerofs::catalog::BranchDeleteResult::Deleted(tombstone) => {
+                (tombstone.name, "deleted".to_string())
+            }
+        };
+        self.success_response(proto::DeleteBranchResponse {
+            branch: Some(proto::BranchMutationInfo {
+                operation_id: operation_id.to_string(),
+                branch_id: branch_id.to_string(),
+                name,
+                state,
+            }),
+        })
+    }
+
     async fn watch_file_access(
         &self,
         _request: Request<proto::WatchFileAccessRequest>,
@@ -1017,6 +1160,76 @@ mod tests {
         deletions: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
     }
 
+    type BranchCreateCall = (uuid::Uuid, uuid::Uuid, String, uuid::Uuid, String);
+
+    #[derive(Default)]
+    struct RecordingBranchCatalog {
+        creations: std::sync::Mutex<Vec<BranchCreateCall>>,
+        deletions: std::sync::Mutex<Vec<(uuid::Uuid, uuid::Uuid, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BranchCatalogAuthority for RecordingBranchCatalog {
+        async fn create(
+            &self,
+            operation_id: uuid::Uuid,
+            destination_id: uuid::Uuid,
+            destination_name: String,
+            source_branch_id: uuid::Uuid,
+            source_checkpoint_name: String,
+        ) -> anyhow::Result<zerofs::catalog::BranchRecord> {
+            self.creations.lock().unwrap().push((
+                operation_id,
+                destination_id,
+                destination_name.clone(),
+                source_branch_id,
+                source_checkpoint_name,
+            ));
+            let now = zerofs::catalog::catalog_timestamp(chrono::Utc::now());
+            Ok(zerofs::catalog::BranchRecord {
+                id: destination_id,
+                revision: 1,
+                name: destination_name,
+                state: zerofs::catalog::BranchState::Ready,
+                root: Some(zerofs::catalog::DurableRoot {
+                    identity: "never-on-wire".to_string(),
+                    manifest_id: "never-on-wire-manifest".to_string(),
+                }),
+                parent_id: Some(source_branch_id),
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            })
+        }
+
+        async fn delete(
+            &self,
+            operation_id: uuid::Uuid,
+            branch_id: uuid::Uuid,
+            name: String,
+        ) -> anyhow::Result<zerofs::catalog::BranchDeleteResult> {
+            self.deletions
+                .lock()
+                .unwrap()
+                .push((operation_id, branch_id, name.clone()));
+            let now = zerofs::catalog::catalog_timestamp(chrono::Utc::now());
+            Ok(zerofs::catalog::BranchDeleteResult::Deleted(
+                zerofs::catalog::TombstoneRecord {
+                    id: branch_id,
+                    kind: zerofs::catalog::TombstoneKind::Branch,
+                    name,
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: now,
+                    deleted_revision: Some(1),
+                    deletion_operation_id: Some(operation_id),
+                    deleted_generation: 1,
+                    deleted_at: now,
+                },
+            ))
+        }
+    }
+
     #[async_trait::async_trait]
     impl CheckpointCatalogAuthority for RecordingCheckpointCatalog {
         fn branch_id(&self) -> uuid::Uuid {
@@ -1179,6 +1392,7 @@ mod tests {
         let service = AdminRpcServer::new_with_catalog(
             Arc::clone(&checkpoint_manager),
             Some(authority.clone()),
+            None,
             true,
             None,
             fs,
@@ -1245,6 +1459,7 @@ mod tests {
         let (fs, checkpoint_manager) = make_fs().await;
         let service = AdminRpcServer::new_with_catalog(
             Arc::clone(&checkpoint_manager),
+            None,
             None,
             true,
             None,
@@ -1383,6 +1598,7 @@ mod tests {
         let service = AdminRpcServer::new_with_catalog(
             checkpoint_manager,
             Some(authority),
+            None,
             true,
             Some(customer_catalog),
             fs,
@@ -1561,6 +1777,7 @@ mod tests {
         let service = AdminRpcServer::new_with_catalog(
             checkpoint_manager,
             Some(authority),
+            None,
             true,
             Some(customer_catalog),
             fs,
@@ -1600,6 +1817,65 @@ mod tests {
             panic!("exact customer checkpoint info was unavailable")
         };
         assert_eq!(info.resource_id, checkpoint_id);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn branch_mutation_client_preserves_exact_retry_identities_over_unix_socket() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let authority = Arc::new(RecordingBranchCatalog::default());
+        let branch_catalog: Arc<dyn BranchCatalogAuthority> = authority.clone();
+        let shutdown = CancellationToken::new();
+        let service = AdminRpcServer::new_with_catalog(
+            checkpoint_manager,
+            None,
+            Some(branch_catalog),
+            true,
+            None,
+            fs,
+            shutdown.clone(),
+        );
+        let socket_directory = tempfile::tempdir().unwrap();
+        let socket = socket_directory.path().join("branch-mutation-admin.sock");
+        tokio::spawn({
+            let socket = socket.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = serve_unix(socket, service, shutdown).await;
+            }
+        });
+        let client = connect_with_retry(&socket).await;
+        let operation_id = uuid::Uuid::new_v4();
+        let branch_id = uuid::Uuid::new_v4();
+        let source_branch_id = uuid::Uuid::new_v4();
+
+        for _ in 0..2 {
+            let created = client
+                .create_branch(
+                    operation_id,
+                    branch_id,
+                    "child",
+                    source_branch_id,
+                    "snapshot",
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.operation_id, operation_id);
+            assert_eq!(created.branch_id, branch_id);
+            assert_eq!(created.state, "ready");
+        }
+        let delete_operation_id = uuid::Uuid::new_v4();
+        for _ in 0..2 {
+            let deleted = client
+                .delete_branch(delete_operation_id, branch_id, "child")
+                .await
+                .unwrap();
+            assert_eq!(deleted.operation_id, delete_operation_id);
+            assert_eq!(deleted.branch_id, branch_id);
+            assert_eq!(deleted.state, "deleted");
+        }
+        assert_eq!(authority.creations.lock().unwrap().len(), 2);
+        assert_eq!(authority.deletions.lock().unwrap().len(), 2);
         shutdown.cancel();
     }
 

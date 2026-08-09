@@ -4,6 +4,53 @@ use std::path::Path;
 use uuid::Uuid;
 use zerofs::catalog::CustomerCatalogRecord;
 
+pub async fn create_branch(
+    config_path: &Path,
+    name: &str,
+    source_branch_id: Uuid,
+    source_checkpoint: &str,
+    branch_id: Option<Uuid>,
+    operation_id: Option<Uuid>,
+) -> Result<()> {
+    let branch_id = branch_id.unwrap_or_else(Uuid::new_v4);
+    let operation_id = operation_id.unwrap_or_else(Uuid::new_v4);
+    println!("Exact retry: --id {branch_id} --operation-id {operation_id}");
+    let result = connect_rpc_client(config_path)
+        .await?
+        .create_branch(
+            operation_id,
+            branch_id,
+            name,
+            source_branch_id,
+            source_checkpoint,
+        )
+        .await?;
+    println!(
+        "Branch '{}' ({}) is {} (operation {})",
+        result.name, result.branch_id, result.state, result.operation_id
+    );
+    Ok(())
+}
+
+pub async fn delete_branch(
+    config_path: &Path,
+    branch_id: Uuid,
+    name: &str,
+    operation_id: Option<Uuid>,
+) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(Uuid::new_v4);
+    println!("Exact retry: --operation-id {operation_id}");
+    let result = connect_rpc_client(config_path)
+        .await?
+        .delete_branch(operation_id, branch_id, name)
+        .await?;
+    println!(
+        "Branch '{}' ({}) is {} (operation {})",
+        result.name, result.branch_id, result.state, result.operation_id
+    );
+    Ok(())
+}
+
 pub async fn list_branches(config_path: &Path, after: Option<Uuid>, limit: usize) -> Result<()> {
     let page = connect_rpc_client(config_path)
         .await?

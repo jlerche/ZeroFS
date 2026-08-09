@@ -150,6 +150,24 @@ async fn async_main() -> Result<()> {
             }
         },
         cli::Commands::Branch { subcommand } => match subcommand {
+            cli::BranchCommands::Create {
+                config,
+                name,
+                source_branch_id,
+                source_checkpoint,
+                id,
+                operation_id,
+            } => {
+                cli::branch::create_branch(
+                    &config,
+                    &name,
+                    source_branch_id,
+                    &source_checkpoint,
+                    id,
+                    operation_id,
+                )
+                .await?;
+            }
             cli::BranchCommands::List {
                 config,
                 after,
@@ -159,6 +177,14 @@ async fn async_main() -> Result<()> {
             }
             cli::BranchCommands::Info { config, id } => {
                 cli::branch::get_branch_info(&config, id).await?;
+            }
+            cli::BranchCommands::Delete {
+                config,
+                id,
+                name,
+                operation_id,
+            } => {
+                cli::branch::delete_branch(&config, id, &name, operation_id).await?;
             }
         },
         cli::Commands::Fatrace { config } => {
