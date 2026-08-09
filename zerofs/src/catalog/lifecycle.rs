@@ -1344,6 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn mount_grant_stays_on_exact_uuid_and_root_across_name_reuse() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog_path = Path::from("branch-mount/catalog");
         let source_path = Path::from("branch-mount/source");
         let source_db = Db::open(source_path.clone(), Arc::clone(&store))
             .await
@@ -1366,7 +1367,7 @@ mod tests {
             .await
             .unwrap();
         let catalog = Arc::new(
-            SlateDbCatalog::open(Path::from("branch-mount/catalog"), Arc::clone(&store))
+            SlateDbCatalog::open(catalog_path.clone(), Arc::clone(&store))
                 .await
                 .unwrap(),
         );
@@ -1386,7 +1387,7 @@ mod tests {
             .apply(CatalogMutation::CreateBranch(branch.clone()))
             .await
             .unwrap();
-        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots.clone());
         let request = BranchMountRequest {
             branch_name: branch.name.clone(),
             lease: LeaseAcquireRequest {
@@ -1403,6 +1404,24 @@ mod tests {
             .unwrap();
         assert_eq!(original.lease.lease.subject_id, branch_id);
         assert_eq!(original.lease.lease.root, root);
+
+        // A process crash loses the in-memory lifecycle but not the grant. The
+        // replacement process recovers the same exact capability from SlateDB.
+        drop(lifecycle);
+        catalog.close().await.unwrap();
+        let catalog = Arc::new(
+            SlateDbCatalog::open(catalog_path, Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        assert_eq!(
+            lifecycle
+                .mount_branch_by_name(request.clone())
+                .await
+                .expect("an exact mount retry must survive a catalog process restart"),
+            original
+        );
 
         assert!(matches!(
             lifecycle

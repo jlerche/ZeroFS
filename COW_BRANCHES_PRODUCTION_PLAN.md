@@ -124,7 +124,7 @@
 - [x] Define catalog consistency and contention behavior.
   - [x] Avoid one CAS domain for unrelated mounts, checkpoint fences, and branch updates.
   - [x] Bound retries and return actionable contention errors.
-  - [ ] Test concurrent creates, deletes, renames if supported, mounts, and checkpoint operations.
+  - [x] Test concurrent creates, deletes, mounts, and checkpoint operations (branch rename is not supported).
 
 ### Epic 2.2: Implement durable branch roots
 
@@ -151,7 +151,7 @@
   - [x] Ensure an expired lease cannot be resurrected accidentally.
 - [x] Make active leases explicit GC roots.
 - [x] Allow logical deletion while preserving data required by unexpired leases according to documented semantics.
-- [ ] Test deletion, remount, process crash, lease expiry, and name reuse races.
+- [x] Test deletion, remount, process crash, lease expiry, and name reuse races.
 
 ## Phase 3: Implement the branch lifecycle
 
