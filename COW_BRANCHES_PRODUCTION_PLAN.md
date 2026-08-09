@@ -341,12 +341,12 @@
 
 ### Epic 7.2: GC acceptance
 
-- [ ] Every physically deleted segment was absent from all authoritative roots in two generation-fenced observations separated by the grace period.
-- [ ] Objects created after a run's cutoff cannot be deleted by that run.
-- [ ] Corrupt, missing, or unreadable metadata always prevents affected deletion.
-- [ ] Shared objects are eventually reclaimed after their final root disappears.
-- [ ] GC work is streamable and bounded and does not perform candidate-by-candidate scans across every branch and checkpoint.
-- [ ] Interrupted GC runs resume or abort without unsafe partial effects.
+- [x] Every physically deleted segment was absent from all authoritative roots in two generation-fenced observations separated by the grace period.
+- [x] Objects created after a run's cutoff cannot be deleted by that run.
+- [x] Corrupt, missing, or unreadable metadata always prevents affected deletion.
+- [x] Shared objects are eventually reclaimed after their final root disappears.
+- [x] GC work is streamable and bounded and does not perform candidate-by-candidate scans across every branch and checkpoint.
+- [x] Interrupted GC runs resume or abort without unsafe partial effects.
 
 ### Epic 7.3: Engineering acceptance
 
@@ -702,3 +702,9 @@
 - `clone_root_survives_named_source_deletion_and_retries_exactly` deletes the named physical source checkpoint, replays the exact clone operation, verifies the independent root, reads inherited data through the writable destination database, writes a child value, and confirms the source is unchanged.
 - `deep_lineage_descendant_remains_readable_and_writable_without_live_ancestors` creates 32 successive checkpoint-based descendants, logically deletes each source checkpoint and ancestor branch, physically deletes the original named checkpoint, then opens the sole surviving descendant, reads inherited data, writes independent data, reopens it, and reads that write.
 - `create_recovers_from_every_persisted_linearization_boundary`, the lost-response checkpoint deletion test, and concurrent branch deletion retries cover every persisted create boundary plus ambiguous deletion responses. The mount/name-reuse tests bind exact UUID/root/token identities across catalog restart, deletion, replacement-name publication, renewal rejection, release, and expiry. Together these executable cases satisfy the five functional acceptance rows without treating PostgreSQL or JSON as lifecycle authority.
+
+### 2026-08-08: GC acceptance audit
+
+- `collector_matches_ideal_two_observation_model_and_cutoff` computes reachability independently for both generation-fenced observations, excludes post-cutoff objects, moves a candidate into a newly pinned root before revalidation, confirms external absence, enforces the grace and policy controls, resumes bounded deletion, and compares every final physical decision with the ideal set. The test proves both safety and eventual reclamation after the final root disappears.
+- `catalog_roots_created_around_cutoff_fence_stale_inventory` and `post_quarantine_roots_enter_revalidation_and_post_validation_changes_stop_delete` prove generation changes retain the entire affected set before quarantine or deletion. Unreadable-root capture, corrupt catalog snapshots, strong-identity replacement, and missing/corrupt/truncated/duplicated/reordered shard tests all fail closed before affected deletion.
+- Mark and inventory use bounded shard buffers and streaming binary-carry merges, then perform partitioned merge joins rather than candidate-by-candidate root scans; the million-flush and integrated 9000-reference/10001-object cases assert those bounds and exact decisions. `collector_reopens_and_resumes_from_every_persisted_phase` plus partial/ambiguous object-delete recovery cover safe restart through every durable phase and cursor boundary. These satisfy GC acceptance without claiming the still-open linear external-I/O or supported-limit benchmarks.
