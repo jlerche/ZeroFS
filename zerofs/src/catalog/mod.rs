@@ -39,9 +39,11 @@ pub use lease::{
     LeaseAcquireRequest, LeaseGrant, LeaseLifecycle, LeaseLifecycleError, LeaseRenewRequest,
 };
 pub use lifecycle::{
+    AdministrativeInspectionKind, AdministrativeInspectionPage, AdministrativeInspectionRecord,
+    AdministrativeInspectionRequest, AdministrativeLeaseRecord,
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchInspection, BranchLifecycle,
     BranchLifecycleError, BranchLineageInspection, BranchMountGrant, BranchMountRequest,
-    HistoricalResource, HistoricalResourceStatus,
+    HistoricalResource, HistoricalResourceStatus, MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{

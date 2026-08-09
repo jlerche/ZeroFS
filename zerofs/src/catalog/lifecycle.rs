@@ -1,8 +1,9 @@
 use super::{
-    BranchCreateOperation, BranchCreatePhase, BranchRecord, BranchState, Catalog, CatalogError,
-    CatalogMutation, CatalogSnapshot, ImmutableCheckpoint, LeaseAcquireRequest, LeaseGrant,
-    RetiredCatalogKind, RootStoreError, SlateDbRootStore, TombstoneKind, TombstoneRecord,
-    catalog_timestamp, validate_name,
+    BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
+    BranchRecord, BranchState, Catalog, CatalogError, CatalogMutation, CatalogSnapshot,
+    ImmutableCheckpoint, LeaseAcquireRequest, LeaseGrant, LeaseRecord, RetiredCatalogKind,
+    RootStoreError, SlateDbRootStore, TombstoneKind, TombstoneRecord, catalog_timestamp,
+    validate_name,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,72 @@ pub struct BranchMountGrant {
     pub branch_name: String,
     /// The data-plane capability carries the exact UUID and authenticated root.
     pub lease: LeaseGrant,
+}
+
+pub const MAX_ADMINISTRATIVE_INSPECTION_RECORDS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdministrativeInspectionKind {
+    Branch,
+    Lease,
+    Tombstone,
+    IncompleteBranchCreate,
+    IncompleteBranchDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdministrativeInspectionRequest {
+    pub kind: AdministrativeInspectionKind,
+    pub after: Option<Uuid>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdministrativeLeaseRecord {
+    pub id: Uuid,
+    pub revision: u64,
+    pub subject_kind: super::LeaseSubjectKind,
+    pub subject_id: Uuid,
+    pub root: super::DurableRoot,
+    pub access_mode: super::LeaseAccessMode,
+    pub issued_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl From<&LeaseRecord> for AdministrativeLeaseRecord {
+    fn from(record: &LeaseRecord) -> Self {
+        Self {
+            id: record.id,
+            revision: record.revision,
+            subject_kind: record.subject_kind,
+            subject_id: record.subject_id,
+            root: record.root.clone(),
+            access_mode: record.access_mode,
+            issued_at: record.issued_at,
+            updated_at: record.updated_at,
+            expires_at: record.expires_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
+pub enum AdministrativeInspectionRecord {
+    Branch(BranchRecord),
+    Lease(AdministrativeLeaseRecord),
+    Tombstone(TombstoneRecord),
+    IncompleteBranchCreate(BranchCreateOperation),
+    IncompleteBranchDelete(BranchDeleteOperation),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdministrativeInspectionPage {
+    /// Lock-consistent authoritative SlateDB generation for this page.
+    pub generation: u64,
+    pub records: Vec<AdministrativeInspectionRecord>,
+    /// Exact UUID cursor for the next page, when more records remain.
+    pub next_after: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +233,23 @@ impl BranchLifecycle {
             .find(|branch| branch.name == name)
             .ok_or_else(|| CatalogError::NotFound(name.to_string()))?;
         Ok(inspect_live_branch(&snapshot, branch))
+    }
+
+    /// Return one bounded page of storage-sensitive administrative state from
+    /// the authoritative SlateDB catalog. These roots and lease details are
+    /// deliberately not part of the PostgreSQL/JSON customer projection.
+    pub async fn inspect_administrative_catalog(
+        &self,
+        request: AdministrativeInspectionRequest,
+    ) -> Result<AdministrativeInspectionPage, BranchLifecycleError> {
+        if request.limit == 0 || request.limit > MAX_ADMINISTRATIVE_INSPECTION_RECORDS {
+            return Err(CatalogError::Invalid(format!(
+                "administrative inspection limit must be within 1..={MAX_ADMINISTRATIVE_INSPECTION_RECORDS}"
+            ))
+            .into());
+        }
+        let snapshot = self.catalog.snapshot().await?;
+        Ok(administrative_inspection_page(&snapshot, request))
     }
 
     pub fn root_captures(&self) -> super::RootCaptureLifecycle {
@@ -498,6 +582,79 @@ fn historical_status(
         HistoricalResourceStatus::Retired
     } else {
         HistoricalResourceStatus::Missing
+    }
+}
+
+fn administrative_inspection_page(
+    snapshot: &CatalogSnapshot,
+    request: AdministrativeInspectionRequest,
+) -> AdministrativeInspectionPage {
+    let after = request.after;
+    let mut records: Vec<AdministrativeInspectionRecord> = match request.kind {
+        AdministrativeInspectionKind::Branch => snapshot
+            .branches
+            .values()
+            .filter(|record| after.is_none_or(|after| record.id > after))
+            .take(request.limit + 1)
+            .cloned()
+            .map(AdministrativeInspectionRecord::Branch)
+            .collect(),
+        AdministrativeInspectionKind::Lease => snapshot
+            .leases
+            .values()
+            .filter(|record| after.is_none_or(|after| record.id > after))
+            .take(request.limit + 1)
+            .map(AdministrativeLeaseRecord::from)
+            .map(AdministrativeInspectionRecord::Lease)
+            .collect(),
+        AdministrativeInspectionKind::Tombstone => snapshot
+            .tombstones
+            .values()
+            .filter(|record| after.is_none_or(|after| record.id > after))
+            .take(request.limit + 1)
+            .cloned()
+            .map(AdministrativeInspectionRecord::Tombstone)
+            .collect(),
+        AdministrativeInspectionKind::IncompleteBranchCreate => snapshot
+            .branch_create_operations
+            .values()
+            .filter(|record| {
+                record.phase != BranchCreatePhase::Published
+                    && after.is_none_or(|after| record.id > after)
+            })
+            .take(request.limit + 1)
+            .cloned()
+            .map(AdministrativeInspectionRecord::IncompleteBranchCreate)
+            .collect(),
+        AdministrativeInspectionKind::IncompleteBranchDelete => snapshot
+            .branch_delete_operations
+            .values()
+            .filter(|record| {
+                record.phase != BranchDeletePhase::Published
+                    && after.is_none_or(|after| record.id > after)
+            })
+            .take(request.limit + 1)
+            .cloned()
+            .map(AdministrativeInspectionRecord::IncompleteBranchDelete)
+            .collect(),
+    };
+    let next_after = (records.len() > request.limit)
+        .then(|| administrative_record_id(&records[request.limit - 1]));
+    records.truncate(request.limit);
+    AdministrativeInspectionPage {
+        generation: snapshot.generation,
+        records,
+        next_after,
+    }
+}
+
+fn administrative_record_id(record: &AdministrativeInspectionRecord) -> Uuid {
+    match record {
+        AdministrativeInspectionRecord::Branch(record) => record.id,
+        AdministrativeInspectionRecord::Lease(record) => record.id,
+        AdministrativeInspectionRecord::Tombstone(record) => record.id,
+        AdministrativeInspectionRecord::IncompleteBranchCreate(record) => record.id,
+        AdministrativeInspectionRecord::IncompleteBranchDelete(record) => record.id,
     }
 }
 
@@ -1274,6 +1431,39 @@ mod tests {
             SlateDbRootStore::new(store, Path::from("branch-inspection/branches")),
         );
 
+        let first_admin_page = lifecycle
+            .inspect_administrative_catalog(AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::Branch,
+                after: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_admin_page.records.len(), 1);
+        let cursor = first_admin_page
+            .next_after
+            .expect("a bounded first page must report the remaining branch");
+        let second_admin_page = lifecycle
+            .inspect_administrative_catalog(AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::Branch,
+                after: Some(cursor),
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second_admin_page.records.len(), 1);
+        assert_eq!(second_admin_page.next_after, None);
+        assert!(matches!(
+            lifecycle
+                .inspect_administrative_catalog(AdministrativeInspectionRequest {
+                    kind: AdministrativeInspectionKind::Branch,
+                    after: None,
+                    limit: 0,
+                })
+                .await,
+            Err(BranchLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
+
         let listed = lifecycle.list_branches().await.unwrap();
         assert_eq!(listed.len(), 2);
         assert!(matches!(
@@ -1337,6 +1527,18 @@ mod tests {
         assert!(matches!(
             lifecycle.inspect_branch_by_name("a-child").await.unwrap(),
             BranchInspection::Live { record, .. } if record.id == replacement_id
+        ));
+        let tombstones = lifecycle
+            .inspect_administrative_catalog(AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::Tombstone,
+                after: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tombstones.records.as_slice(),
+            [AdministrativeInspectionRecord::Tombstone(record)] if record.id == child_id
         ));
         catalog.close().await.unwrap();
     }
@@ -1538,6 +1740,127 @@ mod tests {
                 _ => panic!("live child must inspect as live"),
             },
             HistoricalResourceStatus::Missing
+        );
+    }
+
+    #[test]
+    fn administrative_inspection_reports_only_incomplete_operations() {
+        let now = catalog_timestamp(Utc::now());
+        let root = DurableRoot {
+            identity: "admin/branch".to_string(),
+            manifest_id: format!("{}@1", Uuid::new_v4()),
+        };
+        let mut snapshot = CatalogSnapshot {
+            generation: 42,
+            ..CatalogSnapshot::default()
+        };
+        for (value, phase) in [
+            (1, BranchCreatePhase::Reserved),
+            (2, BranchCreatePhase::RootCreated),
+            (3, BranchCreatePhase::Published),
+        ] {
+            let id = Uuid::from_u128(value);
+            snapshot.branch_create_operations.insert(
+                id,
+                BranchCreateOperation {
+                    id,
+                    revision: 1,
+                    destination_id: Uuid::new_v4(),
+                    destination_name: format!("create-{value}"),
+                    source_checkpoint_id: Uuid::new_v4(),
+                    source_root: root.clone(),
+                    parent_id: Some(Uuid::new_v4()),
+                    phase,
+                    destination_root: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        for (value, phase) in [
+            (4, BranchDeletePhase::Draining),
+            (5, BranchDeletePhase::Published),
+        ] {
+            let id = Uuid::from_u128(value);
+            snapshot.branch_delete_operations.insert(
+                id,
+                BranchDeleteOperation {
+                    id,
+                    revision: 1,
+                    branch_id: Uuid::new_v4(),
+                    branch_name: format!("delete-{value}"),
+                    expected_branch_revision: 1,
+                    root: root.clone(),
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    phase,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+
+        let creates = administrative_inspection_page(
+            &snapshot,
+            AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::IncompleteBranchCreate,
+                after: None,
+                limit: 10,
+            },
+        );
+        assert_eq!(creates.generation, 42);
+        assert_eq!(creates.records.len(), 2);
+        assert!(creates.records.iter().all(|record| matches!(
+            record,
+            AdministrativeInspectionRecord::IncompleteBranchCreate(operation)
+                if operation.phase != BranchCreatePhase::Published
+        )));
+        let deletes = administrative_inspection_page(
+            &snapshot,
+            AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::IncompleteBranchDelete,
+                after: None,
+                limit: 10,
+            },
+        );
+        assert!(matches!(
+            deletes.records.as_slice(),
+            [AdministrativeInspectionRecord::IncompleteBranchDelete(operation)]
+                if operation.phase == BranchDeletePhase::Draining
+        ));
+
+        let lease_id = Uuid::from_u128(6);
+        snapshot.leases.insert(
+            lease_id,
+            LeaseRecord {
+                id: lease_id,
+                revision: 1,
+                subject_kind: crate::catalog::LeaseSubjectKind::Branch,
+                subject_id: Uuid::new_v4(),
+                root,
+                access_mode: LeaseAccessMode::Read,
+                token_hash: "a".repeat(64),
+                issued_at: now,
+                updated_at: now,
+                expires_at: now + chrono::Duration::minutes(1),
+            },
+        );
+        let leases = administrative_inspection_page(
+            &snapshot,
+            AdministrativeInspectionRequest {
+                kind: AdministrativeInspectionKind::Lease,
+                after: None,
+                limit: 10,
+            },
+        );
+        assert!(matches!(
+            leases.records.as_slice(),
+            [AdministrativeInspectionRecord::Lease(record)] if record.id == lease_id
+        ));
+        assert!(
+            !serde_json::to_string(&leases)
+                .unwrap()
+                .contains("token_hash")
         );
     }
 }
