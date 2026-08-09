@@ -42,7 +42,9 @@ struct WriterHeadResult {
     writer_lease_id: Uuid,
     destination_path: String,
     previous_root: DurableRoot,
+    previous_writer_epoch: u64,
     root: DurableRoot,
+    writer_epoch: u64,
 }
 
 /// Exact immutable source resolved once before branch creation begins.
@@ -352,57 +354,104 @@ impl SlateDbRootStore {
                 previous_root,
                 &destination,
             )?;
+            self.verify_writer_epoch_advance(
+                &existing.previous_root,
+                existing.previous_writer_epoch,
+                &existing.root,
+                existing.writer_epoch,
+            )
+            .await?;
             self.verify(&existing.root).await?;
             return Ok(existing.root);
         }
 
         let checkpoint_name = format!("{HEAD_CHECKPOINT_PREFIX}{writer_lease_id}");
         let admin = self.admin(destination.clone());
+        let previous_writer_epoch = self.root_writer_epoch(previous_root).await?;
         let mut checkpoints = admin.list_checkpoints(Some(&checkpoint_name)).await?;
         checkpoints.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
-        let (checkpoint_id, checkpoint_manifest_id) =
-            if let Some(checkpoint) = checkpoints.into_iter().next() {
-                (checkpoint.id, checkpoint.manifest_id)
-            } else {
-                match admin
-                    .create_detached_checkpoint(&CheckpointOptions {
-                        name: Some(checkpoint_name.clone()),
-                        ..CheckpointOptions::default()
-                    })
-                    .await
-                {
-                    Ok(checkpoint) => (checkpoint.id, checkpoint.manifest_id),
-                    Err(error) => {
-                        if let Some(existing) =
-                            self.read_optional::<WriterHeadResult>(&result_path).await?
-                        {
-                            self.validate_writer_head_result(
-                                &existing,
-                                branch_id,
-                                writer_lease_id,
-                                previous_root,
-                                &destination,
-                            )?;
-                            self.verify(&existing.root).await?;
-                            return Ok(existing.root);
-                        }
-                        let mut recovered = admin.list_checkpoints(Some(&checkpoint_name)).await?;
-                        recovered.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
-                        let checkpoint = recovered.into_iter().next().ok_or(error)?;
-                        (checkpoint.id, checkpoint.manifest_id)
+        let mut advanced_checkpoint = None;
+        for checkpoint in checkpoints {
+            let writer_epoch = admin
+                .read_manifest(Some(checkpoint.manifest_id))
+                .await?
+                .ok_or_else(|| RootStoreError::MissingManifest(checkpoint.manifest_id.to_string()))?
+                .writer_epoch();
+            if writer_epoch > previous_writer_epoch {
+                advanced_checkpoint = Some(checkpoint);
+                break;
+            }
+        }
+        let (checkpoint_id, checkpoint_manifest_id) = if let Some(checkpoint) = advanced_checkpoint
+        {
+            (checkpoint.id, checkpoint.manifest_id)
+        } else {
+            match admin
+                .create_detached_checkpoint(&CheckpointOptions {
+                    name: Some(checkpoint_name.clone()),
+                    ..CheckpointOptions::default()
+                })
+                .await
+            {
+                Ok(checkpoint) => (checkpoint.id, checkpoint.manifest_id),
+                Err(error) => {
+                    if let Some(existing) =
+                        self.read_optional::<WriterHeadResult>(&result_path).await?
+                    {
+                        self.validate_writer_head_result(
+                            &existing,
+                            branch_id,
+                            writer_lease_id,
+                            previous_root,
+                            &destination,
+                        )?;
+                        self.verify_writer_epoch_advance(
+                            &existing.previous_root,
+                            existing.previous_writer_epoch,
+                            &existing.root,
+                            existing.writer_epoch,
+                        )
+                        .await?;
+                        self.verify(&existing.root).await?;
+                        return Ok(existing.root);
                     }
+                    let mut recovered = admin.list_checkpoints(Some(&checkpoint_name)).await?;
+                    recovered.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
+                    let mut advanced = None;
+                    for checkpoint in recovered {
+                        let writer_epoch = admin
+                            .read_manifest(Some(checkpoint.manifest_id))
+                            .await?
+                            .ok_or_else(|| {
+                                RootStoreError::MissingManifest(checkpoint.manifest_id.to_string())
+                            })?
+                            .writer_epoch();
+                        if writer_epoch > previous_writer_epoch {
+                            advanced = Some(checkpoint);
+                            break;
+                        }
+                    }
+                    let checkpoint = advanced.ok_or(error)?;
+                    (checkpoint.id, checkpoint.manifest_id)
                 }
-            };
+            }
+        };
+        let candidate_root = DurableRoot {
+            identity: destination.to_string(),
+            manifest_id: encode_root_checkpoint(checkpoint_id, checkpoint_manifest_id),
+        };
+        let (_, writer_epoch) = self
+            .writer_epoch_advance(previous_root, &candidate_root)
+            .await?;
         let candidate = WriterHeadResult {
             schema_version: ROOT_DESCRIPTOR_SCHEMA_VERSION,
             branch_id,
             writer_lease_id,
             destination_path: destination.to_string(),
             previous_root: previous_root.clone(),
-            root: DurableRoot {
-                identity: destination.to_string(),
-                manifest_id: encode_root_checkpoint(checkpoint_id, checkpoint_manifest_id),
-            },
+            previous_writer_epoch,
+            root: candidate_root,
+            writer_epoch,
         };
         self.verify_storage_root(&candidate.root, &checkpoint_name)
             .await?;
@@ -472,6 +521,66 @@ impl SlateDbRootStore {
             {
                 return Err(RootStoreError::NonCanonicalRoot(root.manifest_id.clone()));
             }
+            self.verify_canonical_root_identity(&head.previous_root, &owner, &initial)
+                .await?;
+            self.verify_writer_epoch_advance(
+                &head.previous_root,
+                head.previous_writer_epoch,
+                &head.root,
+                head.writer_epoch,
+            )
+            .await?;
+            name
+        };
+        self.verify_storage_root(root, &expected_name).await
+    }
+
+    async fn verify_canonical_root_identity(
+        &self,
+        root: &DurableRoot,
+        owner: &RootOwner,
+        initial: &RootResult,
+    ) -> Result<(), RootStoreError> {
+        if root.identity != owner.destination_path || initial.owner != *owner {
+            return Err(RootStoreError::OwnershipConflict(
+                owner.destination_path.clone(),
+            ));
+        }
+        let expected_name = if initial.root == *root {
+            format!("{ROOT_CHECKPOINT_PREFIX}{}", owner.operation_id)
+        } else {
+            let (checkpoint_id, _) = decode_root_checkpoint(&root.manifest_id)?;
+            let checkpoint = self
+                .admin(Path::from(root.identity.clone()))
+                .list_checkpoints(None)
+                .await?
+                .into_iter()
+                .find(|checkpoint| checkpoint.id == checkpoint_id)
+                .ok_or_else(|| RootStoreError::MissingRootCheckpoint(checkpoint_id.to_string()))?;
+            let name = checkpoint
+                .name
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            let lease_id = name
+                .strip_prefix(HEAD_CHECKPOINT_PREFIX)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            let head = self
+                .read_optional::<WriterHeadResult>(&head_result_object_path(
+                    &Path::from(root.identity.clone()),
+                    lease_id,
+                ))
+                .await?
+                .ok_or_else(|| RootStoreError::NonCanonicalRoot(root.manifest_id.clone()))?;
+            if head.schema_version != ROOT_DESCRIPTOR_SCHEMA_VERSION
+                || head.branch_id != owner.destination_id
+                || head.writer_lease_id != lease_id
+                || head.destination_path != owner.destination_path
+                || head.root != *root
+                || head.previous_root.identity != root.identity
+                || head.previous_root == head.root
+            {
+                return Err(RootStoreError::NonCanonicalRoot(root.manifest_id.clone()));
+            }
             name
         };
         self.verify_storage_root(root, &expected_name).await
@@ -496,6 +605,68 @@ impl SlateDbRootStore {
             return Err(RootStoreError::OwnershipConflict(destination.to_string()));
         }
         Ok(())
+    }
+
+    async fn writer_epoch_advance(
+        &self,
+        previous_root: &DurableRoot,
+        root: &DurableRoot,
+    ) -> Result<(u64, u64), RootStoreError> {
+        let previous_writer_epoch = self.root_writer_epoch(previous_root).await?;
+        let writer_epoch = self.root_writer_epoch(root).await?;
+        if writer_epoch <= previous_writer_epoch {
+            return Err(RootStoreError::StaleWriterIncarnation {
+                previous: previous_writer_epoch,
+                current: writer_epoch,
+            });
+        }
+        Ok((previous_writer_epoch, writer_epoch))
+    }
+
+    async fn verify_writer_epoch_advance(
+        &self,
+        previous_root: &DurableRoot,
+        expected_previous_writer_epoch: u64,
+        root: &DurableRoot,
+        expected_writer_epoch: u64,
+    ) -> Result<(), RootStoreError> {
+        let (previous_writer_epoch, writer_epoch) =
+            self.writer_epoch_advance(previous_root, root).await?;
+        if previous_writer_epoch != expected_previous_writer_epoch
+            || writer_epoch != expected_writer_epoch
+        {
+            return Err(RootStoreError::WriterIncarnationMismatch {
+                expected_previous: expected_previous_writer_epoch,
+                actual_previous: previous_writer_epoch,
+                expected_current: expected_writer_epoch,
+                actual_current: writer_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    async fn root_writer_epoch(&self, root: &DurableRoot) -> Result<u64, RootStoreError> {
+        validate_root(root).map_err(|error| RootStoreError::Invalid(error.to_string()))?;
+        let (checkpoint_id, manifest_id) = decode_root_checkpoint(&root.manifest_id)?;
+        let admin = self.admin(Path::from(root.identity.clone()));
+        let checkpoint = admin
+            .list_checkpoints(None)
+            .await?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .ok_or_else(|| RootStoreError::MissingRootCheckpoint(checkpoint_id.to_string()))?;
+        if checkpoint.manifest_id != manifest_id {
+            return Err(RootStoreError::RootManifestMismatch {
+                checkpoint_id,
+                expected: manifest_id,
+                actual: checkpoint.manifest_id,
+            });
+        }
+        admin
+            .read_manifest(Some(manifest_id))
+            .await?
+            .ok_or_else(|| RootStoreError::MissingManifest(root.manifest_id.clone()))
+            .map(|manifest| manifest.writer_epoch())
     }
 
     async fn verify_storage_root(
@@ -1024,6 +1195,19 @@ pub enum RootStoreError {
     #[error("durable root is not the canonical operation result: {0}")]
     NonCanonicalRoot(String),
     #[error(
+        "writer head did not advance SlateDB writer incarnation: previous epoch {previous}, current epoch {current}"
+    )]
+    StaleWriterIncarnation { previous: u64, current: u64 },
+    #[error(
+        "writer head incarnation proof changed: previous expected {expected_previous}, found {actual_previous}; current expected {expected_current}, found {actual_current}"
+    )]
+    WriterIncarnationMismatch {
+        expected_previous: u64,
+        actual_previous: u64,
+        expected_current: u64,
+        actual_current: u64,
+    },
+    #[error(
         "root checkpoint {checkpoint_id} manifest mismatch: expected {expected}, found {actual}"
     )]
     RootManifestMismatch {
@@ -1293,6 +1477,13 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            roots
+                .publish_writer_head(branch_id, Uuid::new_v4(), &initial)
+                .await,
+            Err(RootStoreError::StaleWriterIncarnation { previous, current })
+                if current == previous
+        ));
         let destination = Path::from(initial.identity.clone());
         let writer = Db::builder(destination, Arc::clone(&object_store))
             .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -1341,6 +1532,42 @@ mod tests {
         assert!(matches!(
             roots.publish_writer_head(branch_id, lease_id, &head).await,
             Err(RootStoreError::OwnershipConflict(_))
+        ));
+        let descriptor_path = head_result_object_path(&Path::from(head.identity.clone()), lease_id);
+        let descriptor = roots
+            .read_optional::<WriterHeadResult>(&descriptor_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut forged_predecessor = descriptor.clone();
+        let (_, previous_manifest_id) =
+            decode_root_checkpoint(&forged_predecessor.previous_root.manifest_id).unwrap();
+        forged_predecessor.previous_root.manifest_id =
+            encode_root_checkpoint(Uuid::new_v4(), previous_manifest_id);
+        object_store
+            .put(
+                &descriptor_path,
+                serde_json::to_vec(&forged_predecessor).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            roots.verify(&head).await,
+            Err(RootStoreError::MissingRootCheckpoint(_))
+        ));
+
+        let mut forged_epoch = descriptor;
+        forged_epoch.writer_epoch += 1;
+        object_store
+            .put(
+                &descriptor_path,
+                serde_json::to_vec(&forged_epoch).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            roots.verify(&head).await,
+            Err(RootStoreError::WriterIncarnationMismatch { .. })
         ));
     }
 

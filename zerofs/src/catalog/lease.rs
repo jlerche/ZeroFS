@@ -164,6 +164,30 @@ impl LeaseLifecycle {
             .ok_or_else(|| CatalogError::NotFound(request.lease_id.to_string()).into())
     }
 
+    /// Recover one exact writer capability after process state was lost.
+    ///
+    /// This point read never extends or resurrects the lease. An expired grant
+    /// may only drive a strictly-newer writer-incarnation reconciliation and
+    /// head publication before a fresh serving lease is acquired.
+    pub async fn recover_writer(
+        &self,
+        request: LeaseAcquireRequest,
+    ) -> Result<LeaseGrant, LeaseLifecycleError> {
+        if request.access_mode != LeaseAccessMode::Write {
+            return Err(CatalogError::Invalid(
+                "writer recovery requires write access mode".to_string(),
+            )
+            .into());
+        }
+        validate_duration(request.duration)?;
+        let grant = self
+            .exact_grant(&request, LeaseSubjectKind::Branch, true)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(request.lease_id.to_string()))?;
+        self.roots.verify(&grant.lease.root).await?;
+        Ok(grant)
+    }
+
     pub async fn release(
         &self,
         lease_id: Uuid,
@@ -248,10 +272,21 @@ impl LeaseLifecycle {
         request: &LeaseAcquireRequest,
         subject_kind: LeaseSubjectKind,
     ) -> Result<Option<LeaseGrant>, LeaseLifecycleError> {
+        self.exact_grant(request, subject_kind, false).await
+    }
+
+    async fn exact_grant(
+        &self,
+        request: &LeaseAcquireRequest,
+        subject_kind: LeaseSubjectKind,
+        allow_expired_writer_recovery: bool,
+    ) -> Result<Option<LeaseGrant>, LeaseLifecycleError> {
         let Some(lease) = self.catalog.lease(request.lease_id).await? else {
             return Ok(None);
         };
-        if !lease.is_unexpired(catalog_timestamp(Utc::now())) {
+        if !(lease.is_unexpired(catalog_timestamp(Utc::now()))
+            || allow_expired_writer_recovery && lease.access_mode == LeaseAccessMode::Write)
+        {
             return Err(CatalogError::OperationConflict(format!(
                 "lease {} is expired and cannot be resurrected",
                 lease.id
@@ -262,7 +297,7 @@ impl LeaseLifecycle {
             || lease.subject_id != request.subject_id
             || lease.access_mode != request.access_mode
             || lease.token_hash != token_hash(request.renewal_token)
-            || lease.revision != 1
+            || !allow_expired_writer_recovery && lease.revision != 1
             || lease.expires_at - lease.updated_at != request.duration
         {
             return Err(CatalogError::OperationConflict(request.lease_id.to_string()).into());

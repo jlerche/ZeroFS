@@ -326,6 +326,9 @@ The server data-plane opener must consume only this stable grant. It owns lease
 renewal while serving. After a writer has stopped serving, durably flushed, and
 closed, the root store creates a permanent internal checkpoint named for the
 exact writer lease and conditionally publishes an immutable head descriptor.
+The descriptor authenticates both the admitted root's SlateDB writer epoch and
+the closed head's strictly greater writer epoch; opening and closing no newer
+writer is not sufficient publication evidence.
 SlateDB then atomically replaces the ready branch root, exposes every private
 epoch that the new head can reference, removes the writer/index and its GC
 blocker, and records the exact publication in the permanent lease tombstone.
@@ -334,11 +337,14 @@ batch commits. A lost response retries to the same storage checkpoint and
 recorded catalog generation.
 
 A read mount may rely on bounded expiry after a crash. A crashed writer cannot:
-its retained record globally fences collection until a later recovery process
-proves a newer SlateDB writer incarnation, reconciles the durable latest
-manifest through the same head-publication transition, and retires the exact
-capability. That recovery opener is still required before writable mounts can
-be released.
+its retained record globally fences collection. Given the exact lease UUID,
+stable branch UUID, duration, mode, and renewal token, recovery may point-read
+the retained capability even after expiry, but this neither renews nor
+resurrects it. A later process must still open a newer SlateDB writer
+incarnation, reconcile and close it, publish that durable head through the same
+transition, and only then acquire a fresh serving lease. The server-owned
+recovery opener that enforces this ordering remains required before writable
+mounts can be released.
 
 ## Customer projection and administrative inspection
 

@@ -1146,6 +1146,16 @@ mod tests {
                 .expect("an ambiguous renewal retry must reconcile"),
             renewed
         );
+        assert_eq!(
+            leases
+                .recover_writer(lease_request.clone())
+                .await
+                .expect("recovery must accept the exact renewed writer revision"),
+            LeaseGrant {
+                lease: renewed.clone(),
+                renewal_token: first_grant.renewal_token,
+            }
+        );
         assert!(matches!(
             leases
                 .release(renewed.id, renewed.revision, first_grant.renewal_token)
@@ -1154,6 +1164,16 @@ mod tests {
                 CatalogError::WriterLeaseActive(id)
             )) if id == left.id
         ));
+        let writer_db = Db::builder(
+            Path::from(left.root.as_ref().unwrap().identity.clone()),
+            Arc::clone(&store),
+        )
+        .build()
+        .await
+        .unwrap();
+        writer_db.put(b"writer", b"head").await.unwrap();
+        writer_db.flush().await.unwrap();
+        writer_db.close().await.unwrap();
         lifecycle
             .publish_writer_head(&LeaseGrant {
                 lease: renewed.clone(),
@@ -1213,6 +1233,16 @@ mod tests {
             Some(current)
         );
         let renewed_writer = leases.renew(writer_renewal.clone()).await.unwrap();
+        let next_writer_db = Db::builder(
+            Path::from(renewed_writer.root.identity.clone()),
+            Arc::clone(&store),
+        )
+        .build()
+        .await
+        .unwrap();
+        next_writer_db.put(b"writer", b"next-head").await.unwrap();
+        next_writer_db.flush().await.unwrap();
+        next_writer_db.close().await.unwrap();
         lifecycle
             .publish_writer_head(&LeaseGrant {
                 lease: renewed_writer.clone(),
@@ -1768,10 +1798,14 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog_path = Path::from("branch-mount/catalog");
         let source_path = Path::from("branch-mount/source");
-        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+        let source_db = Db::builder(source_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
             .await
             .unwrap();
-        source_db.put(b"key", b"value").await.unwrap();
+        let mount_key = KeyCodec::new().inode_key(71);
+        source_db.put(&mount_key, b"value").await.unwrap();
+        source_db.flush().await.unwrap();
         let checkpoint = source_db
             .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
             .await
@@ -1836,7 +1870,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots.clone());
         assert_eq!(
             lifecycle
                 .mount_branch_by_name(request.clone())
@@ -1844,6 +1878,22 @@ mod tests {
                 .expect("an exact mount retry must survive a catalog process restart"),
             original
         );
+        assert_eq!(
+            lifecycle
+                .leases()
+                .recover_writer(request.lease.clone())
+                .await
+                .expect("writer recovery must resolve only the exact retained capability"),
+            original.lease
+        );
+        let mut wrong_recovery = request.lease.clone();
+        wrong_recovery.renewal_token = Uuid::new_v4();
+        assert!(matches!(
+            lifecycle.leases().recover_writer(wrong_recovery).await,
+            Err(crate::catalog::LeaseLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
 
         assert!(matches!(
             lifecycle
@@ -1859,6 +1909,14 @@ mod tests {
                 CatalogError::WriterLeaseActive(id)
             )) if id == branch_id
         ));
+        let recovered_writer = Db::builder(Path::from(root.identity.clone()), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        recovered_writer.put(&mount_key, b"head").await.unwrap();
+        recovered_writer.flush().await.unwrap();
+        recovered_writer.close().await.unwrap();
         let published = lifecycle
             .publish_writer_head(&original.lease)
             .await
@@ -2020,20 +2078,36 @@ mod tests {
                 .unwrap(),
             Some(bytes::Bytes::from_static(b"after"))
         );
+        let next_request = BranchMountRequest {
+            branch_name: "writable".to_string(),
+            lease: LeaseAcquireRequest {
+                lease_id: Uuid::new_v4(),
+                renewal_token: Uuid::new_v4(),
+                subject_id: branch_id,
+                access_mode: LeaseAccessMode::Write,
+                duration: chrono::Duration::microseconds(1),
+            },
+        };
         let next_mount = lifecycle
-            .mount_branch_by_name(BranchMountRequest {
-                branch_name: "writable".to_string(),
-                lease: LeaseAcquireRequest {
-                    lease_id: Uuid::new_v4(),
-                    renewal_token: Uuid::new_v4(),
-                    subject_id: branch_id,
-                    access_mode: LeaseAccessMode::Write,
-                    duration: chrono::Duration::minutes(1),
-                },
-            })
+            .mount_branch_by_name(next_request.clone())
             .await
             .unwrap();
         assert_eq!(next_mount.lease.lease.root, published.root.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        assert!(matches!(
+            lifecycle.mount_branch_by_name(next_request.clone()).await,
+            Err(BranchLifecycleError::Lease(
+                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::OperationConflict(_))
+            ))
+        ));
+        assert_eq!(
+            lifecycle
+                .leases()
+                .recover_writer(next_request.lease)
+                .await
+                .expect("expired writer recovery must not extend the retained capability"),
+            next_mount.lease
+        );
         catalog.close().await.unwrap();
     }
 

@@ -1336,6 +1336,8 @@ fn classify_root_store_error(error: &RootStoreError) -> GcBlockerKind {
         | RootStoreError::SourceManifestMismatch { .. }
         | RootStoreError::WrongSource { .. }
         | RootStoreError::NonCanonicalRoot(_)
+        | RootStoreError::StaleWriterIncarnation { .. }
+        | RootStoreError::WriterIncarnationMismatch { .. }
         | RootStoreError::RootManifestMismatch { .. }
         | RootStoreError::WalDependency { .. }
         | RootStoreError::Uninitialized(_)
@@ -2366,6 +2368,20 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == GcBlockerKind::LeaseUncertainty)
         );
+        let writer_db = Db::builder(
+            Path::from(published_root.identity.clone()),
+            Arc::clone(&store),
+        )
+        .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+        .build()
+        .await
+        .unwrap();
+        writer_db
+            .put(KeyCodec::new().system_counter_key(), b"advanced")
+            .await
+            .unwrap();
+        writer_db.flush().await.unwrap();
+        writer_db.close().await.unwrap();
         let advanced_root = root_store
             .publish_writer_head(branch.id, writer.id, &writer.root)
             .await
