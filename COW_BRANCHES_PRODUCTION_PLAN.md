@@ -294,7 +294,7 @@
 - [ ] Verify external work scales linearly with roots, references, and inventory.
 - [ ] Verify foreground branch and mount latency remains acceptable during GC.
 - [ ] Verify catalog mutations do not contend on one global multi-megabyte CAS object.
-- [ ] Add metrics for phase duration, scanned references, inventory size, quarantined bytes, reclaimed bytes, aborted runs, retained-on-error objects, and backlog.
+- [x] Add metrics for phase duration, scanned references, inventory size, quarantined bytes, reclaimed bytes, aborted runs, retained-on-error objects, and backlog.
 - [ ] Add alerts for repeated aborted runs, stalled phases, old quarantines, root-open failures, and catalog corruption.
 
 ## Phase 6: Production rollout

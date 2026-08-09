@@ -2,14 +2,16 @@ use super::gc_inventory::{GcInventoryError, GcInventoryStore};
 use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
     Catalog, CatalogError, GcBlockerKind, GcDeletionProgress, GcDeletionPublication,
-    GcQuarantinePublication, GcRevalidationCapture, GcRevalidationPublication,
-    GcRevalidationRecord, GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint, RootStoreError,
-    SlateDbRootStore, catalog_timestamp, gc_root_digest, validate_timestamp,
+    GcInventoryStats, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
+    GcRevalidationPublication, GcRevalidationRecord, GcRevalidationStats, GcRootKind, GcRunPhase,
+    GcRunRecord, ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp,
+    gc_root_digest, validate_timestamp,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 const ROOT_VERIFY_CONCURRENCY: usize = 16;
@@ -74,13 +76,27 @@ impl RootCaptureLifecycle {
     /// exact typed list. A concurrent catalog mutation fails the generation
     /// fence and leaves no partial run record.
     pub async fn begin(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("capture");
         if run_id.is_nil() {
             return Err(CatalogError::Invalid("GC run UUID cannot be nil".to_string()).into());
         }
-        if let Some(existing) = self.catalog.gc_run(run_id).await? {
+        let existing = match self.catalog.gc_run(run_id).await {
+            Ok(existing) => existing,
+            Err(error) => {
+                record_gc_capture_abort(classify_catalog_error(&error));
+                return Err(error.into());
+            }
+        };
+        if let Some(existing) = existing {
             return Ok(existing);
         }
-        let snapshot = self.catalog.snapshot().await?;
+        let snapshot = match self.catalog.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                record_gc_capture_abort(classify_catalog_error(&error));
+                return Err(error.into());
+            }
+        };
         let inventory_cutoff = catalog_timestamp(Utc::now());
         let pins = snapshot.gc_root_pins();
         let root_store = self.roots.clone();
@@ -99,7 +115,10 @@ impl RootCaptureLifecycle {
             })
             .buffer_unordered(ROOT_VERIFY_CONCURRENCY);
         while let Some(result) = verification.next().await {
-            result?;
+            if let Err(error) = result {
+                record_gc_capture_abort(classify_root_store_error(&error));
+                return Err(error.into());
+            }
         }
         drop(verification);
         let run = GcRunRecord {
@@ -126,12 +145,21 @@ impl RootCaptureLifecycle {
             .begin_gc_run(snapshot.generation, run.clone())
             .await;
         if let Err(error) = result {
-            if let Some(existing) = self.catalog.gc_run(run_id).await? {
+            let existing = match self.catalog.gc_run(run_id).await {
+                Ok(existing) => existing,
+                Err(reconcile_error) => {
+                    record_gc_capture_abort(classify_catalog_error(&reconcile_error));
+                    return Err(reconcile_error.into());
+                }
+            };
+            if let Some(existing) = existing {
                 if existing == run {
                     return Ok(existing);
                 }
+                record_gc_capture_abort(GcBlockerKind::GenerationChanged);
                 return Err(CatalogError::OperationConflict(run_id.to_string()).into());
             }
+            record_gc_capture_abort(classify_catalog_error(&error));
             return Err(error.into());
         }
         Ok(run)
@@ -141,6 +169,7 @@ impl RootCaptureLifecycle {
     /// runs, merge/deduplicate them, and publish 256 independently verifiable
     /// mark shards atomically in the authoritative run record.
     pub async fn mark(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("mark");
         let run = self
             .catalog
             .gc_run(run_id)
@@ -181,7 +210,10 @@ impl RootCaptureLifecycle {
             )
             .await;
         match published {
-            Ok(run) => Ok(run),
+            Ok(run) => {
+                record_gc_mark_metrics(&mark_stats);
+                Ok(run)
+            }
             Err(error) => {
                 if let Some(existing) = self.catalog.gc_run(run_id).await?
                     && existing.phase == GcRunPhase::Marking
@@ -193,6 +225,7 @@ impl RootCaptureLifecycle {
                     store
                         .verify_all(existing.id, digest, &existing.mark_shards)
                         .await?;
+                    record_gc_mark_metrics(&mark_stats);
                     return Ok(existing);
                 }
                 Err(error.into())
@@ -205,6 +238,7 @@ impl RootCaptureLifecycle {
     /// and publish a durable first unreachable observation. No segment is
     /// physically deleted by this transition.
     pub async fn quarantine(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("inventory_quarantine");
         let run = self
             .catalog
             .gc_run(run_id)
@@ -254,7 +288,10 @@ impl RootCaptureLifecycle {
             })
             .await;
         match published {
-            Ok(run) => Ok(run),
+            Ok(run) => {
+                record_gc_inventory_metrics(&build.stats);
+                Ok(run)
+            }
             Err(error) => {
                 if let Some(existing) = self.catalog.gc_run(run_id).await?
                     && existing.phase == GcRunPhase::Quarantined
@@ -266,6 +303,7 @@ impl RootCaptureLifecycle {
                     inventory
                         .verify_all(&existing, digest, &existing.quarantine_shards)
                         .await?;
+                    record_gc_inventory_metrics(&build.stats);
                     return Ok(existing);
                 }
                 if self
@@ -307,6 +345,7 @@ impl RootCaptureLifecycle {
         grace: Duration,
         now: DateTime<Utc>,
     ) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("revalidate");
         let grace_seconds = grace.num_seconds();
         if grace_seconds < MIN_REVALIDATION_GRACE_SECONDS as i64
             || grace != Duration::seconds(grace_seconds)
@@ -377,7 +416,11 @@ impl RootCaptureLifecycle {
                 })
                 .buffer_unordered(ROOT_VERIFY_CONCURRENCY);
             while let Some(result) = verification.next().await {
-                result?;
+                if let Err(error) = result {
+                    let kind = classify_root_store_error(&error);
+                    self.record_blocker(run_id, kind, error.to_string()).await;
+                    return Err(error.into());
+                }
             }
             drop(verification);
             let observation = GcRevalidationRecord {
@@ -490,7 +533,10 @@ impl RootCaptureLifecycle {
             })
             .await;
         match published {
-            Ok(run) => Ok(run),
+            Ok(run) => {
+                record_gc_revalidation_metrics(&build.stats, &candidates.stats);
+                Ok(run)
+            }
             Err(error) => {
                 if let Some(existing) = self.catalog.gc_run(run_id).await?
                     && existing.phase == GcRunPhase::Validated
@@ -514,6 +560,7 @@ impl RootCaptureLifecycle {
                         )
                         .await?;
                     inventory.verify_revalidation(stored).await?;
+                    record_gc_revalidation_metrics(&build.stats, &candidates.stats);
                     return Ok(existing);
                 }
                 if self
@@ -544,6 +591,7 @@ impl RootCaptureLifecycle {
         run_id: Uuid,
         policy: GcDeletionPolicy,
     ) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("delete");
         if !policy.enabled {
             return Err(CatalogError::Invalid(
                 "physical GC deletion is disabled by policy".to_string(),
@@ -665,7 +713,9 @@ impl RootCaptureLifecycle {
             started_at: previous.started_at,
             completed_at,
         };
-        self.catalog
+        let expected_progress = progress.clone();
+        let published = self
+            .catalog
             .publish_gc_deletion(GcDeletionPublication {
                 run_id,
                 expected_revision: run.revision,
@@ -673,8 +723,25 @@ impl RootCaptureLifecycle {
                 progress,
                 updated_at,
             })
-            .await
-            .map_err(Into::into)
+            .await;
+        let published = match published {
+            Ok(published) => published,
+            Err(error) => {
+                if let Some(existing) = self.catalog.gc_run(run_id).await?
+                    && existing.deletion.as_ref() == Some(&expected_progress)
+                    && matches!(existing.phase, GcRunPhase::Deleting | GcRunPhase::Completed)
+                {
+                    existing
+                } else {
+                    return Err(error.into());
+                }
+            }
+        };
+        metrics::counter!("zerofs_gc_reclaimed_objects_total").increment(batch.deleted_objects);
+        metrics::counter!("zerofs_gc_reclaimed_bytes_total").increment(batch.deleted_bytes);
+        metrics::counter!("zerofs_gc_backlog_upper_bound_bytes_resolved_total")
+            .increment(batch.deleted_bytes);
+        Ok(published)
     }
 
     /// Delete a bounded batch from one completed run's isolated artifact
@@ -837,6 +904,7 @@ impl RootCaptureLifecycle {
     }
 
     async fn record_blocker(&self, run_id: Uuid, kind: GcBlockerKind, mut detail: String) {
+        record_gc_retained_on_error(kind, 1);
         if detail.len() > super::MAX_ROOT_IDENTIFIER_BYTES {
             let mut end = super::MAX_ROOT_IDENTIFIER_BYTES;
             while !detail.is_char_boundary(end) {
@@ -849,6 +917,66 @@ impl RootCaptureLifecycle {
             .record_gc_blocker(run_id, kind, detail, catalog_timestamp(Utc::now()))
             .await;
     }
+}
+
+struct GcPhaseTimer {
+    phase: &'static str,
+    started: Instant,
+}
+
+impl GcPhaseTimer {
+    fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for GcPhaseTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("zerofs_gc_phase_duration_seconds", "phase" => self.phase)
+            .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+fn record_gc_mark_metrics(stats: &GcMarkStats) {
+    metrics::counter!("zerofs_gc_roots_scanned_total").increment(stats.roots_enumerated);
+    metrics::counter!("zerofs_gc_references_scanned_total").increment(stats.references_enumerated);
+    metrics::counter!("zerofs_gc_unique_segments_marked_total").increment(stats.unique_segments);
+}
+
+fn record_gc_inventory_metrics(stats: &GcInventoryStats) {
+    metrics::counter!("zerofs_gc_inventory_objects_total").increment(stats.objects_seen);
+    metrics::counter!("zerofs_gc_quarantined_objects_total").increment(stats.candidate_objects);
+    metrics::counter!("zerofs_gc_quarantined_bytes_total").increment(stats.candidate_bytes);
+    metrics::counter!("zerofs_gc_backlog_upper_bound_bytes_added_total")
+        .increment(stats.candidate_bytes);
+}
+
+fn record_gc_revalidation_metrics(mark: &GcMarkStats, stats: &GcRevalidationStats) {
+    record_gc_mark_metrics(mark);
+    metrics::counter!("zerofs_gc_candidates_became_reachable_total")
+        .increment(stats.became_reachable);
+    metrics::counter!("zerofs_gc_candidates_already_absent_total").increment(stats.already_absent);
+}
+
+fn record_gc_capture_abort(kind: GcBlockerKind) {
+    record_gc_retained_on_error(kind, 1);
+    metrics::counter!("zerofs_gc_aborted_runs_total", "phase" => "capture").increment(1);
+}
+
+fn record_gc_retained_on_error(kind: GcBlockerKind, lower_bound: u64) {
+    let kind = match kind {
+        GcBlockerKind::MissingRoot => "missing_root",
+        GcBlockerKind::CorruptMetadata => "corrupt_metadata",
+        GcBlockerKind::GenerationChanged => "generation_changed",
+        GcBlockerKind::LeaseUncertainty => "lease_uncertainty",
+        GcBlockerKind::StorageUnavailable => "storage_unavailable",
+    };
+    metrics::counter!("zerofs_gc_retained_on_error_lower_bound_total", "reason" => kind)
+        .increment(lower_bound);
+    metrics::counter!("zerofs_gc_aborted_phase_attempts_total", "reason" => kind).increment(1);
 }
 
 fn validate_cleanup_policy(
@@ -935,6 +1063,50 @@ fn classify_mark_error(error: &GcMarkError) -> GcBlockerKind {
         GcMarkError::SlateDb(_) | GcMarkError::ObjectStore(_) | GcMarkError::Io(_) => {
             GcBlockerKind::StorageUnavailable
         }
+    }
+}
+
+fn classify_root_store_error(error: &RootStoreError) -> GcBlockerKind {
+    match error {
+        RootStoreError::MissingOwner(_)
+        | RootStoreError::MissingResult(_)
+        | RootStoreError::MissingSourceCheckpoint(_)
+        | RootStoreError::MissingManifest(_)
+        | RootStoreError::MissingRootCheckpoint(_)
+        | RootStoreError::MissingExternalPin { .. }
+        | RootStoreError::MissingSst(_) => GcBlockerKind::MissingRoot,
+        RootStoreError::ObjectStore(_) | RootStoreError::SlateDb(_) => {
+            GcBlockerKind::StorageUnavailable
+        }
+        RootStoreError::Invalid(_)
+        | RootStoreError::UnownedDestination(_)
+        | RootStoreError::OwnershipConflict(_)
+        | RootStoreError::SourceManifestMismatch { .. }
+        | RootStoreError::WrongSource { .. }
+        | RootStoreError::NonCanonicalRoot(_)
+        | RootStoreError::RootManifestMismatch { .. }
+        | RootStoreError::WalDependency { .. }
+        | RootStoreError::Uninitialized(_)
+        | RootStoreError::ExternalPinCoverage { .. }
+        | RootStoreError::Clone(_)
+        | RootStoreError::Json(_) => GcBlockerKind::CorruptMetadata,
+    }
+}
+
+fn classify_catalog_error(error: &CatalogError) -> GcBlockerKind {
+    match error {
+        CatalogError::WriterLeaseActive(_) => GcBlockerKind::LeaseUncertainty,
+        CatalogError::OperationConflict(_)
+        | CatalogError::RevisionConflict { .. }
+        | CatalogError::AlreadyExists(_) => GcBlockerKind::GenerationChanged,
+        CatalogError::NotFound(_) => GcBlockerKind::MissingRoot,
+        CatalogError::Invalid(_) | CatalogError::Corrupt(_) | CatalogError::Json(_) => {
+            GcBlockerKind::CorruptMetadata
+        }
+        CatalogError::Io(_)
+        | CatalogError::SlateDb(_)
+        | CatalogError::Postgres(_)
+        | CatalogError::PostgresTls(_) => GcBlockerKind::StorageUnavailable,
     }
 }
 
@@ -1028,6 +1200,50 @@ mod tests {
                 .with_segment_pool_root(segment_pool.clone()),
         );
         (catalog, lifecycle)
+    }
+
+    #[test]
+    fn gc_operability_metrics_cover_work_backlog_errors_and_phase_time() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let timer = GcPhaseTimer::start("mark");
+            record_gc_mark_metrics(&GcMarkStats {
+                roots_enumerated: 2,
+                references_enumerated: 7,
+                intermediate_runs: 1,
+                unique_segments: 5,
+            });
+            record_gc_inventory_metrics(&GcInventoryStats {
+                objects_seen: 11,
+                objects_newer_than_cutoff: 1,
+                reachable_objects: 6,
+                candidate_objects: 4,
+                candidate_bytes: 4096,
+                intermediate_runs: 1,
+            });
+            record_gc_retained_on_error(GcBlockerKind::CorruptMetadata, 1);
+            record_gc_capture_abort(GcBlockerKind::StorageUnavailable);
+            drop(timer);
+        });
+        let rendered = handle.render();
+        assert!(rendered.contains("zerofs_gc_references_scanned_total 7"));
+        assert!(rendered.contains("zerofs_gc_inventory_objects_total 11"));
+        assert!(rendered.contains("zerofs_gc_quarantined_bytes_total 4096"));
+        assert!(rendered.contains("zerofs_gc_backlog_upper_bound_bytes_added_total 4096"));
+        assert!(rendered.contains(
+            "zerofs_gc_retained_on_error_lower_bound_total{reason=\"corrupt_metadata\"} 1"
+        ));
+        assert!(rendered.contains("zerofs_gc_aborted_runs_total{phase=\"capture\"} 1"));
+        assert!(rendered.contains("zerofs_gc_phase_duration_seconds_sum{phase=\"mark\"}"));
+        assert_eq!(
+            classify_root_store_error(&RootStoreError::MissingResult("root".to_string())),
+            GcBlockerKind::MissingRoot
+        );
+        assert_eq!(
+            classify_root_store_error(&RootStoreError::Invalid("root".to_string())),
+            GcBlockerKind::CorruptMetadata
+        );
     }
 
     #[test]
