@@ -85,12 +85,14 @@ call rather than durable catalog authority.
 
 | Metric | Type | Description |
 | --- | --- | --- |
-| `zerofs_gc_phase_duration_seconds` | histogram | Completed call duration labeled by `capture`, `mark`, `inventory_quarantine`, `revalidate`, or `delete` |
+| `zerofs_gc_phase_duration_seconds` | histogram | Completed call duration labeled by `capture`, `mark`, `inventory_report`, `inventory_quarantine`, `revalidate`, or `delete` |
 | `zerofs_gc_phase_active` | gauge | Calls currently executing, labeled by phase |
 | `zerofs_gc_roots_scanned_total` | counter | Roots enumerated while marking |
 | `zerofs_gc_references_scanned_total` | counter | Segment references streamed while marking |
 | `zerofs_gc_unique_segments_marked_total` | counter | Unique reachable segment identities emitted by marking |
 | `zerofs_gc_inventory_objects_total` | counter | Physical segment objects streamed during inventory |
+| `zerofs_gc_reported_candidate_objects_total` | counter | Candidate segment objects proposed by terminal shadow reports |
+| `zerofs_gc_reported_candidate_bytes_total` | counter | Candidate bytes proposed by terminal shadow reports |
 | `zerofs_gc_quarantined_objects_total` | counter | Segment objects entering a first unreachable observation |
 | `zerofs_gc_quarantined_bytes_total` | counter | Bytes entering a first unreachable observation |
 | `zerofs_gc_candidates_became_reachable_total` | counter | First-observation candidates retained because the second observation reached them |

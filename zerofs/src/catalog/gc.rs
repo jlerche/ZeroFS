@@ -2,10 +2,10 @@ use super::gc_inventory::{GcInventoryError, GcInventoryStore};
 use super::gc_mark::{GcMarkError, GcMarkStore};
 use super::{
     Catalog, CatalogError, GcBlockerKind, GcDeletionProgress, GcDeletionPublication,
-    GcInventoryStats, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
-    GcRevalidationPublication, GcRevalidationRecord, GcRevalidationStats, GcRootKind, GcRunPhase,
-    GcRunRecord, ImmutableCheckpoint, RootStoreError, SlateDbRootStore, catalog_timestamp,
-    gc_root_digest, validate_timestamp,
+    GcInventoryStats, GcMarkStats, GcQuarantinePublication, GcReportPublication,
+    GcRevalidationCapture, GcRevalidationPublication, GcRevalidationRecord, GcRevalidationStats,
+    GcRootKind, GcRunPhase, GcRunRecord, ImmutableCheckpoint, RootStoreError, SlateDbRootStore,
+    catalog_timestamp, gc_root_digest, validate_timestamp,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{StreamExt, stream};
@@ -246,7 +246,10 @@ impl RootCaptureLifecycle {
             .await?
             .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
         let store = GcMarkStore::new(self.roots.clone());
-        if matches!(run.phase, GcRunPhase::Marking | GcRunPhase::Quarantined) {
+        if matches!(
+            run.phase,
+            GcRunPhase::Marking | GcRunPhase::Reported | GcRunPhase::Quarantined
+        ) {
             let digest = decode_digest(&run.root_digest)?;
             if let Err(error) = store.verify_all(run.id, digest, &run.mark_shards).await {
                 self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
@@ -297,6 +300,98 @@ impl RootCaptureLifecycle {
                         .await?;
                     record_gc_mark_metrics(&mark_stats);
                     return Ok(existing);
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Build and publish a terminal mark/inventory report without entering
+    /// quarantine. The immutable candidate shards remain available for audit,
+    /// but the transition atomically releases the run's root pins and has no
+    /// path to revalidation or physical deletion.
+    pub async fn report(&self, run_id: Uuid) -> Result<GcRunRecord, RootCaptureLifecycleError> {
+        let _phase_timer = GcPhaseTimer::start("inventory_report");
+        let run = self
+            .gc_run_for_phase(run_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
+        let digest = decode_digest(&run.root_digest)?;
+        let marks = GcMarkStore::new(self.roots.clone());
+        if let Err(error) = marks.verify_all(run.id, digest, &run.mark_shards).await {
+            self.record_blocker(run.id, classify_mark_error(&error), error.to_string())
+                .await;
+            return Err(error.into());
+        }
+        let inventory = GcInventoryStore::new(&self.roots);
+        if run.phase == GcRunPhase::Reported {
+            if let Err(error) = inventory
+                .verify_all(&run, digest, &run.quarantine_shards)
+                .await
+            {
+                self.record_blocker(run.id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+            return Ok(run);
+        }
+        if run.phase != GcRunPhase::Marking || run.revision != 2 {
+            return Err(CatalogError::OperationConflict(run_id.to_string()).into());
+        }
+        let build = match inventory.build(&run).await {
+            Ok(build) => build,
+            Err(error) => {
+                self.record_blocker(run.id, classify_inventory_error(&error), error.to_string())
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let reported_at = catalog_timestamp(Utc::now());
+        let published = self
+            .catalog
+            .publish_gc_report(GcReportPublication {
+                id: run.id,
+                expected_revision: run.revision,
+                expected_generation: run.catalog_generation,
+                root_digest: run.root_digest.clone(),
+                candidate_shards: build.shards.clone(),
+                inventory_stats: build.stats.clone(),
+                reported_at,
+            })
+            .await;
+        match published {
+            Ok(run) => {
+                record_gc_report_metrics(&build.stats);
+                Ok(run)
+            }
+            Err(error) => {
+                if let Some(existing) = self.gc_run_for_phase(run_id).await?
+                    && existing.phase == GcRunPhase::Reported
+                    && existing.root_digest == run.root_digest
+                    && existing.quarantine_shards == build.shards
+                    && existing.inventory_stats.as_ref() == Some(&build.stats)
+                    && existing.quarantine_at == Some(reported_at)
+                {
+                    inventory
+                        .verify_all(&existing, digest, &existing.quarantine_shards)
+                        .await?;
+                    record_gc_report_metrics(&build.stats);
+                    return Ok(existing);
+                }
+                if self
+                    .snapshot_for_phase()
+                    .await
+                    .is_ok_and(|snapshot| snapshot.generation != run.catalog_generation)
+                {
+                    self.record_blocker(
+                        run.id,
+                        GcBlockerKind::GenerationChanged,
+                        format!(
+                            "catalog generation changed after capture at {}",
+                            run.catalog_generation
+                        ),
+                    )
+                    .await;
                 }
                 Err(error.into())
             }
@@ -835,7 +930,7 @@ impl RootCaptureLifecycle {
         Ok(published)
     }
 
-    /// Delete a bounded batch from one completed run's isolated artifact
+    /// Delete a bounded batch from one terminal run's isolated artifact
     /// namespace after its retention period. Relisting the shrinking prefix is
     /// the durable cursor: crashes and ambiguous already-absent deletes resume
     /// without catalog-side per-object state.
@@ -850,16 +945,24 @@ impl RootCaptureLifecycle {
             .await?
             .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
         run.validate()?;
-        let completed_at = run
-            .deletion
-            .as_ref()
-            .and_then(|progress| progress.completed_at)
-            .filter(|_| run.phase == GcRunPhase::Completed)
-            .ok_or_else(|| {
-                CatalogError::OperationConflict(format!(
-                    "GC run {run_id} has not completed deletion"
+        let completed_at = match run.phase {
+            GcRunPhase::Reported => run.updated_at,
+            GcRunPhase::Completed => run
+                .deletion
+                .as_ref()
+                .and_then(|progress| progress.completed_at)
+                .ok_or_else(|| {
+                    CatalogError::Corrupt(format!(
+                        "completed GC run {run_id} has no completion timestamp"
+                    ))
+                })?,
+            _ => {
+                return Err(CatalogError::OperationConflict(format!(
+                    "GC run {run_id} is not terminal"
                 ))
-            })?;
+                .into());
+            }
+        };
         let retain_until = completed_at
             .checked_add_signed(retention_duration)
             .ok_or_else(|| {
@@ -901,9 +1004,8 @@ impl RootCaptureLifecycle {
     }
 
     /// Delete bounded, phase-obsolete build artifacts while retaining every
-    /// shard still needed to retry or complete the active run. Completed runs
-    /// use [`Self::cleanup_artifacts`] so their one retention boundary also
-    /// covers the second observation's sibling namespace.
+    /// shard still needed to retry or complete the active run. Terminal runs
+    /// use [`Self::cleanup_artifacts`].
     pub async fn cleanup_obsolete_artifacts(
         &self,
         run_id: Uuid,
@@ -915,9 +1017,9 @@ impl RootCaptureLifecycle {
             .await?
             .ok_or_else(|| CatalogError::NotFound(run_id.to_string()))?;
         run.validate()?;
-        if run.phase == GcRunPhase::Completed {
+        if matches!(run.phase, GcRunPhase::Reported | GcRunPhase::Completed) {
             return Err(CatalogError::OperationConflict(format!(
-                "GC run {run_id} is complete; use completed artifact cleanup"
+                "GC run {run_id} is terminal; use terminal artifact cleanup"
             ))
             .into());
         }
@@ -1045,6 +1147,13 @@ fn record_gc_inventory_metrics(stats: &GcInventoryStats) {
         .increment(stats.candidate_bytes);
 }
 
+fn record_gc_report_metrics(stats: &GcInventoryStats) {
+    metrics::counter!("zerofs_gc_inventory_objects_total").increment(stats.objects_seen);
+    metrics::counter!("zerofs_gc_reported_candidate_objects_total")
+        .increment(stats.candidate_objects);
+    metrics::counter!("zerofs_gc_reported_candidate_bytes_total").increment(stats.candidate_bytes);
+}
+
 fn record_gc_revalidation_metrics(mark: &GcMarkStats, stats: &GcRevalidationStats) {
     record_gc_mark_metrics(mark);
     metrics::counter!("zerofs_gc_candidates_became_reachable_total")
@@ -1067,7 +1176,10 @@ fn record_gc_root_open_failure(phase: &'static str, kind: GcBlockerKind) {
 }
 
 fn record_gc_quarantine_state(run: &GcRunRecord) {
-    let timestamp = if matches!(run.phase, GcRunPhase::Completed | GcRunPhase::Aborted) {
+    let timestamp = if matches!(
+        run.phase,
+        GcRunPhase::Reported | GcRunPhase::Completed | GcRunPhase::Aborted
+    ) {
         None
     } else {
         run.quarantine_at.map(|value| value.timestamp())
@@ -1349,6 +1461,14 @@ mod tests {
                 candidate_bytes: 4096,
                 intermediate_runs: 1,
             });
+            record_gc_report_metrics(&GcInventoryStats {
+                objects_seen: 3,
+                objects_newer_than_cutoff: 0,
+                reachable_objects: 1,
+                candidate_objects: 2,
+                candidate_bytes: 2048,
+                intermediate_runs: 1,
+            });
             record_gc_retained_on_error(GcBlockerKind::CorruptMetadata, 1);
             record_gc_root_open_failure("capture", GcBlockerKind::MissingRoot);
             record_gc_capture_abort(GcBlockerKind::StorageUnavailable);
@@ -1356,7 +1476,9 @@ mod tests {
         });
         let rendered = handle.render();
         assert!(rendered.contains("zerofs_gc_references_scanned_total 7"));
-        assert!(rendered.contains("zerofs_gc_inventory_objects_total 11"));
+        assert!(rendered.contains("zerofs_gc_inventory_objects_total 14"));
+        assert!(rendered.contains("zerofs_gc_reported_candidate_objects_total 2"));
+        assert!(rendered.contains("zerofs_gc_reported_candidate_bytes_total 2048"));
         assert!(rendered.contains("zerofs_gc_quarantined_bytes_total 4096"));
         assert!(rendered.contains("zerofs_gc_backlog_upper_bound_bytes_added_total 4096"));
         assert!(rendered.contains(
@@ -1482,18 +1604,22 @@ mod tests {
             mark_stats: None,
             quarantine_shards: Vec::new(),
             inventory_stats: None,
-            phase: GcRunPhase::Completed,
+            phase: GcRunPhase::Reported,
             quarantine_at: None,
             revalidation: None,
             deletion: None,
             created_at: now,
             updated_at: now,
         };
-        assert!(matches!(run.validate(), Err(CatalogError::Invalid(_))));
-        let mut snapshot = CatalogSnapshot::default();
-        snapshot.gc_runs.insert(run.id, run);
-        assert!(snapshot.validate().is_err());
-        assert!(snapshot.gc_roots().contains(&&root));
+        for phase in [GcRunPhase::Reported, GcRunPhase::Completed] {
+            let mut invalid = run.clone();
+            invalid.phase = phase;
+            assert!(matches!(invalid.validate(), Err(CatalogError::Invalid(_))));
+            let mut snapshot = CatalogSnapshot::default();
+            snapshot.gc_runs.insert(invalid.id, invalid);
+            assert!(snapshot.validate().is_err());
+            assert!(snapshot.gc_roots().contains(&&root));
+        }
     }
 
     #[tokio::test]
@@ -2927,18 +3053,25 @@ mod tests {
             )
             .await
             .unwrap();
-        let quarantined = lifecycle.quarantine(run.id).await.unwrap();
-        assert_eq!(quarantined.phase, GcRunPhase::Quarantined);
-        assert_eq!(quarantined.revision, 3);
-        assert_eq!(quarantined.quarantine_shards.len(), 256);
-        let inventory = quarantined.inventory_stats.as_ref().unwrap();
+        let reported = lifecycle.report(run.id).await.unwrap();
+        assert_eq!(reported.phase, GcRunPhase::Reported);
+        assert_eq!(reported.revision, 3);
+        assert_eq!(reported.quarantine_shards.len(), 256);
+        let inventory = reported.inventory_stats.as_ref().unwrap();
         assert_eq!(inventory.objects_seen, 10_001);
         assert_eq!(inventory.objects_newer_than_cutoff, 1);
         assert_eq!(inventory.reachable_objects, 1_000);
         assert_eq!(inventory.candidate_objects, 9_000);
         assert_eq!(inventory.candidate_bytes, 9_000);
         assert_eq!(inventory.intermediate_runs, 257);
-        assert_eq!(lifecycle.quarantine(run.id).await.unwrap(), quarantined);
+        assert_eq!(lifecycle.report(run.id).await.unwrap(), reported);
+        assert!(catalog.snapshot().await.unwrap().gc_roots().is_empty());
+        assert!(matches!(
+            lifecycle.quarantine(run.id).await,
+            Err(RootCaptureLifecycleError::Catalog(
+                CatalogError::OperationConflict(_)
+            ))
+        ));
         assert!(
             artifact_store
                 .head(&Path::from(format!(
@@ -2951,13 +3084,13 @@ mod tests {
         );
         artifact_store
             .put(
-                &Path::from(quarantined.quarantine_shards[0].location.clone()),
+                &Path::from(reported.quarantine_shards[0].location.clone()),
                 bytes::Bytes::from_static(b"corrupt").into(),
             )
             .await
             .unwrap();
         assert!(matches!(
-            lifecycle.quarantine(run.id).await,
+            lifecycle.report(run.id).await,
             Err(RootCaptureLifecycleError::Inventory(_))
         ));
         artifact_store
@@ -2985,6 +3118,22 @@ mod tests {
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0].kind, GcBlockerKind::CorruptMetadata);
         assert_eq!(blockers[0].occurrences, 2);
+        let cleanup_policy = GcArtifactCleanupPolicy {
+            enabled: true,
+            retention_seconds: 0,
+            max_objects: MAX_ARTIFACT_CLEANUP_OBJECTS,
+            observed_at: reported.updated_at + Duration::seconds(1),
+        };
+        loop {
+            let cleanup = lifecycle
+                .cleanup_artifacts(run.id, cleanup_policy)
+                .await
+                .unwrap();
+            if !cleanup.has_more {
+                break;
+            }
+        }
+        assert_eq!(catalog.gc_run(run.id).await.unwrap(), Some(reported));
         catalog.close().await.unwrap();
     }
 }

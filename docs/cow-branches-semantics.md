@@ -642,7 +642,8 @@ resource from `deleted` to `absent`.
 
 Global collector artifacts live only below `__zerofs_gc/<run UUID>/`. A
 disabled-by-default cleanup call may drain that prefix only for an exact
-schema-valid `Completed` run and only after a caller-selected retention period.
+schema-valid terminal `Reported` or `Completed` run and only after a
+caller-selected retention period.
 It never removes the compact catalog run/audit record. Each pass lists and
 confirm-deletes at most 4096 objects; final mark, inventory, quarantine, and
 revalidation shards and intermediate run/merge files are treated uniformly.
@@ -727,6 +728,16 @@ available until a separately reviewed offline protocol either publishes an
 authoritative completion manifest after reserving every old epoch and rejecting
 duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
 
+Schema v17 supports a terminal shadow path after marking. `report` performs the
+same cutoff-bounded physical inventory and partitioned merge join as the first
+quarantine observation, then publishes immutable candidate shards, exact
+candidate counts/bytes, and a `Reported` phase in one authoritative SlateDB
+transition. That transition atomically releases the captured roots. It never
+publishes `Quarantined`, cannot enter revalidation or deletion, and performs no
+segment delete. Exact retries verify the report artifacts. PostgreSQL and JSON
+remain identical customer projections and receive none of the run, root,
+candidate, or report state.
+
 1. Capture generation `G`, immutable root list/digest, and an inventory cutoff;
    pin the list for the run.
 2. Enumerate each root once and emit segment IDs into memory-bounded sorted runs
@@ -767,9 +778,9 @@ than the active policy requires; changing policy cannot rewrite that history.
 The run record contains only run UUID, generation, cutoff, segment-pool
 identity, both immutable observation root-list identities/digests, mark and
 candidate shard locations/checksums, bounded work statistics, phase, quarantine
-time, and the configured grace boundary. The second observation records only
-aggregate reachable/absent/retained counts and bytes, never unbounded
-per-object catalog metadata.
+or report time, and the configured grace boundary. The second observation
+records only aggregate reachable/absent/retained counts and bytes, never
+unbounded per-object catalog metadata.
 Bounded per-kind blocker records retain the last reason and occurrence count for
 missing roots, corrupt metadata, generation changes, lease uncertainty, or
 storage unavailability. Missing state prevents deletion. The deletion record is
@@ -786,8 +797,9 @@ shared manifest. Ambiguous ownership falls back to global retention.
 
 Tombstones may be compacted only after no lease, recovery operation, projection
 reconciler, or retained GC generation can observe them. UUID non-reuse must
-survive compaction. Completed run records, marks, and quarantine artifacts are
-removed idempotently in bounded passes after retention windows.
+survive compaction. Reported and completed run records remain as bounded audit
+state; their marks and candidate/quarantine artifacts are removed idempotently
+in bounded passes after retention windows.
 
 ## Research-branch inventory
 

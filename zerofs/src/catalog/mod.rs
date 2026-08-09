@@ -56,7 +56,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 16;
+pub const CATALOG_SCHEMA_VERSION: u32 = 17;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -808,6 +808,9 @@ pub struct GcRootPin {
 pub enum GcRunPhase {
     Captured,
     Marking,
+    /// Terminal shadow-mode inventory report. No candidate was quarantined or
+    /// deleted, and the run no longer retains its captured roots.
+    Reported,
     Quarantined,
     Revalidating,
     Validated,
@@ -969,6 +972,17 @@ pub(crate) struct GcQuarantinePublication {
     pub(crate) quarantine_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GcReportPublication {
+    pub(crate) id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) expected_generation: u64,
+    pub(crate) root_digest: String,
+    pub(crate) candidate_shards: Vec<GcQuarantineShard>,
+    pub(crate) inventory_stats: GcInventoryStats,
+    pub(crate) reported_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GcBlockerKind {
@@ -1013,9 +1027,11 @@ impl GcBlockerRecord {
 
 impl GcRunRecord {
     fn retains_roots(&self) -> bool {
-        // Only a fully schema-valid completed deletion releases pins. A
-        // fabricated, partial, future, or corrupt terminal record retains.
-        self.phase != GcRunPhase::Completed || self.validate().is_err()
+        // Only a fully schema-valid terminal report or completed deletion
+        // releases pins. A fabricated, partial, future, or corrupt record
+        // retains.
+        !matches!(self.phase, GcRunPhase::Reported | GcRunPhase::Completed)
+            || self.validate().is_err()
     }
 
     pub fn validate(&self) -> Result<(), CatalogError> {
@@ -1038,6 +1054,18 @@ impl GcRunRecord {
                     && self.quarantine_shards.is_empty()
                     && self.inventory_stats.is_none()
                     && self.quarantine_at.is_none()
+                    && self.revalidation.is_none()
+                    && self.deletion.is_none() => {}
+            GcRunPhase::Reported
+                if self.revision == 3
+                    && !self.segment_pool.is_empty()
+                    && self.mark_shards.len() == 256
+                    && self.mark_stats.is_some()
+                    && self.quarantine_shards.len() == 256
+                    && self.inventory_stats.is_some()
+                    && self
+                        .quarantine_at
+                        .is_some_and(|reported_at| reported_at == self.updated_at)
                     && self.revalidation.is_none()
                     && self.deletion.is_none() => {}
             GcRunPhase::Quarantined
@@ -1100,7 +1128,8 @@ impl GcRunRecord {
             }
             _ => {
                 return Err(CatalogError::Invalid(
-                    "GC schema v11 supports captured through completed revisions".to_string(),
+                    "GC schema v17 supports captured through reported/completed revisions"
+                        .to_string(),
                 ));
             }
         }
@@ -2226,6 +2255,17 @@ pub(crate) trait Catalog: Send + Sync {
         mark_stats: GcMarkStats,
         updated_at: DateTime<Utc>,
     ) -> Result<GcRunRecord, CatalogError>;
+    /// Publish a terminal mark/inventory report and atomically release its
+    /// captured root pins. This transition cannot authorize quarantine,
+    /// revalidation, or physical deletion.
+    async fn publish_gc_report(
+        &self,
+        _publication: GcReportPublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        Err(CatalogError::Invalid(
+            "catalog backend does not support GC reporting".to_string(),
+        ))
+    }
     /// Publish a verified first unreachable observation only if the catalog
     /// still has the exact root generation captured by this run.
     async fn publish_gc_quarantine(

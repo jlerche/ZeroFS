@@ -3,7 +3,7 @@ use super::{
     BranchCreateOperation, BranchCreatePhase, BranchDeleteOperation, BranchDeletePhase,
     BranchRecord, BranchState, CATALOG_SCHEMA_VERSION, Catalog, CatalogError, CatalogMutation,
     CatalogSnapshot, CheckpointRecord, GcBlockerKind, GcBlockerRecord, GcDeletionPublication,
-    GcMarkShard, GcMarkStats, GcQuarantinePublication, GcRevalidationCapture,
+    GcMarkShard, GcMarkStats, GcQuarantinePublication, GcReportPublication, GcRevalidationCapture,
     GcRevalidationPublication, GcRunPhase, GcRunRecord, LeaseAccessMode, LeaseRecord,
     LeaseSubjectKind, LeaseTombstone, LocalGcGuardRecord, LocalGcProgressRecord,
     MAX_TOMBSTONE_CLEANUP_SCAN, PrivateEpochRecord, PrivateEpochState, PrivateGcGuardView,
@@ -61,6 +61,7 @@ const PRIVATE_EPOCH_SCHEMA_VERSION: u32 = 12;
 const LOCAL_GC_GUARD_SCHEMA_VERSION: u32 = 13;
 const TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION: u32 = 14;
 const PRIVATE_GC_BLOCKER_SCHEMA_VERSION: u32 = 15;
+const TOMBSTONE_CLEANUP_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
@@ -220,6 +221,7 @@ impl SlateDbCatalog {
             LOCAL_GC_GUARD_SCHEMA_VERSION,
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
+            TOMBSTONE_CLEANUP_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -2265,6 +2267,79 @@ impl Catalog for SlateDbCatalog {
                 &slatedb::config::PutOptions::default(),
                 &durable_write_options(),
             )
+            .await?;
+        Ok(run)
+    }
+
+    async fn publish_gc_report(
+        &self,
+        publication: GcReportPublication,
+    ) -> Result<GcRunRecord, CatalogError> {
+        let GcReportPublication {
+            id,
+            expected_revision,
+            expected_generation,
+            root_digest,
+            candidate_shards,
+            inventory_stats,
+            reported_at,
+        } = publication;
+        let _guard = self.lock.lock().await;
+        validate_timestamp(reported_at, "GC report timestamp")?;
+        let state = self.state_unlocked().await?;
+        let mut run = self
+            .get_record::<GcRunRecord>(gc_run_key(id))
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        run.validate()?;
+        if run.phase == GcRunPhase::Reported {
+            if run.catalog_generation == expected_generation
+                && run.root_digest == root_digest
+                && run.quarantine_shards == candidate_shards
+                && run.inventory_stats.as_ref() == Some(&inventory_stats)
+                && run.quarantine_at == Some(reported_at)
+            {
+                return Ok(run);
+            }
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        ensure_expected_revision(expected_revision, run.revision)?;
+        ensure_expected_revision(expected_generation, state.generation)?;
+        if run.phase != GcRunPhase::Marking
+            || run.catalog_generation != expected_generation
+            || run.root_digest != root_digest
+            || run.segment_pool.is_empty()
+            || reported_at < run.updated_at
+        {
+            return Err(CatalogError::OperationConflict(id.to_string()));
+        }
+        run.revision = run
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::Corrupt("GC run revision overflow".to_string()))?;
+        run.phase = GcRunPhase::Reported;
+        run.quarantine_shards = candidate_shards;
+        run.inventory_stats = Some(inventory_stats);
+        // This is the immutable first-observation timestamp. In report mode
+        // it does not mean that quarantine was enabled.
+        run.quarantine_at = Some(reported_at);
+        run.updated_at = reported_at;
+        run.validate()?;
+
+        let mut global = self.private_gc_global_blockers_unlocked().await?;
+        decrement_blocker(
+            &mut global.root_retaining_gc_runs,
+            "root-retaining GC blocker",
+        )?;
+        let mut batch = WriteBatch::new();
+        put_json(&mut batch, gc_run_key(run.id), &run)?;
+        put_json(
+            &mut batch,
+            Bytes::from_static(PRIVATE_GC_GLOBAL_BLOCKER_KEY),
+            &global,
+        )?;
+        self.db
+            .write_with_options(batch, &durable_write_options())
             .await?;
         Ok(run)
     }
@@ -4906,7 +4981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v15_catalogs_to_tombstone_compaction_schema() {
+    async fn migrates_v2_through_v16_catalogs_to_shadow_reporting_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -4922,9 +4997,10 @@ mod tests {
             LOCAL_GC_GUARD_SCHEMA_VERSION,
             TARGETED_PRIVATE_GC_VIEW_SCHEMA_VERSION,
             PRIVATE_GC_BLOCKER_SCHEMA_VERSION,
+            TOMBSTONE_CLEANUP_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v16"));
+            let path = Path::from(format!("migration-v{prior_version}-v17"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
