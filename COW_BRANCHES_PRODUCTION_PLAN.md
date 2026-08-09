@@ -47,7 +47,7 @@
 ### Epic 0.3: Restore a reviewable baseline
 
 - [x] Confirm the fresh branch passes `cargo check --workspace --all-targets`.
-- [ ] Confirm the fresh branch passes the repository's standard formatting, lint, and test gates.
+- [x] Confirm the fresh branch passes the repository's standard formatting, lint, and test gates.
 - [x] Avoid carrying over the current `FuseTasks` compilation failure in `zerofs/src/mount.rs`.
 - [x] Define a pull-request size and scope policy for the implementation.
   - [x] Keep storage-model, catalog, lifecycle, GC, API, and integration changes in separate reviewable commits or pull requests.
@@ -648,3 +648,7 @@
 - Root-capture publication is generation-fenced and leaves no partial run when the catalog changes after its snapshot. The cutoff fixture publishes a valid branch and checkpoint after capture, then runs the immutable mark and inventory work; quarantine publication rejects the stale generation, remains in `Marking`, and retains every pool object. A fresh capture includes all pre- and post-cutoff roots.
 - A complementary fixture publishes a storage-authenticated ready branch after quarantine. Revalidation captures the newer catalog generation, authenticates that branch root, includes it in the canonical second-observation pins, and leaves the first-observation candidate untouched until validation completes.
 - The same branch is revised again after validation. Deletion preflight observes the generation mismatch, records a `GenerationChanged` blocker, publishes no deletion cursor, leaves the run in `Validated`, and proves the candidate remains physically present. Together these tests exercise mutations around root capture, mark generation, inventory, quarantine, and the physical-delete boundary.
+
+### 2026-08-08: baseline gate reconfirmation
+
+- The production branch passes `cargo fmt --all -- --check`, the complete default test suite, `cargo check --all-targets`, and `cargo clippy --all-targets -- -D warnings`. The PostgreSQL projection integration remains explicitly environment-gated on a disposable `ZEROFS_TEST_POSTGRES_URL`, and the real-process failover cases retain their existing shared-runner ignored status.
