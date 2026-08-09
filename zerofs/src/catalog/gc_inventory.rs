@@ -606,24 +606,38 @@ impl GcInventoryStore {
                                 candidate.segid
                             )));
                         }
-                        self.object_store.delete(&path).await?;
-                        match self.object_store.head(&path).await {
-                            Err(object_store::Error::NotFound { .. }) => {}
-                            Ok(_) => {
+                        let delete = self.object_store.delete(&path).await;
+                        match (delete, self.object_store.head(&path).await) {
+                            (Ok(()), Err(object_store::Error::NotFound { .. })) => {
+                                deleted_objects = checked_add(
+                                    deleted_objects,
+                                    1,
+                                    "physically deleted candidate count",
+                                )?;
+                                deleted_bytes = checked_add(
+                                    deleted_bytes,
+                                    candidate.size,
+                                    "physically deleted candidate bytes",
+                                )?;
+                            }
+                            (Err(_), Err(object_store::Error::NotFound { .. })) => {
+                                // The delete may have succeeded even though its response was
+                                // lost. Treat confirmed absence exactly like a replay.
+                                already_absent = checked_add(
+                                    already_absent,
+                                    1,
+                                    "ambiguously deleted candidate count",
+                                )?;
+                            }
+                            (Err(error), Ok(_)) => return Err(error.into()),
+                            (Ok(()), Ok(_)) => {
                                 return Err(GcInventoryError::Corrupt(format!(
                                     "candidate {:?} remained after delete",
                                     candidate.segid
                                 )));
                             }
-                            Err(error) => return Err(error.into()),
+                            (_, Err(error)) => return Err(error.into()),
                         }
-                        deleted_objects =
-                            checked_add(deleted_objects, 1, "physically deleted candidate count")?;
-                        deleted_bytes = checked_add(
-                            deleted_bytes,
-                            candidate.size,
-                            "physically deleted candidate bytes",
-                        )?;
                     }
                     Err(GcInventoryError::ObjectStore(object_store::Error::NotFound {
                         ..
@@ -1093,6 +1107,7 @@ pub(crate) enum GcInventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault_store::FaultStore;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -1231,21 +1246,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletion_batch_is_bounded_and_replay_treats_prior_delete_as_absent() {
+    async fn deletion_batches_resume_after_partial_and_ambiguous_deletes() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let timestamp = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let store: Arc<dyn ObjectStore> = Arc::new(FixedTimestampStore { inner, timestamp });
+        let fixed: Arc<dyn ObjectStore> = Arc::new(FixedTimestampStore { inner, timestamp });
+        let (fault_store, faults) = FaultStore::new(fixed);
+        let store: Arc<dyn ObjectStore> = fault_store;
         let pool = "pool";
-        let segid = Segid::new(4, 0);
-        let object = Path::from(format!("{pool}/{}", segid.object_key()));
-        store
-            .put(&object, bytes::Bytes::from_static(b"candidate").into())
-            .await
-            .unwrap();
+        let first_segid = Segid::new(4, 0);
+        let second_segid = Segid::new(4, 256);
+        let first_object = Path::from(format!("{pool}/{}", first_segid.object_key()));
+        let second_object = Path::from(format!("{pool}/{}", second_segid.object_key()));
+        for object in [&first_object, &second_object] {
+            store
+                .put(object, bytes::Bytes::from_static(b"candidate").into())
+                .await
+                .unwrap();
+        }
         let inventory = GcInventoryStore {
             object_store: Arc::clone(&store),
         };
-        let candidate = inventory.read_identity(&object, segid).await.unwrap();
+        let first_candidate = inventory
+            .read_identity(&first_object, first_segid)
+            .await
+            .unwrap();
+        let second_candidate = inventory
+            .read_identity(&second_object, second_segid)
+            .await
+            .unwrap();
         let observation_id = Uuid::new_v4();
         let digest = [7u8; 32];
         let artifact = Path::from("candidate-shard");
@@ -1259,7 +1287,8 @@ mod tests {
         )
         .await
         .unwrap();
-        writer.push(candidate).await.unwrap();
+        writer.push(first_candidate).await.unwrap();
+        writer.push(second_candidate).await.unwrap();
         let result = writer.finish().await.unwrap();
         let mut shards = (0u8..=u8::MAX)
             .map(|shard| GcQuarantineShard {
@@ -1274,8 +1303,8 @@ mod tests {
             shard: 0,
             location: artifact.to_string(),
             checksum: encode_digest(result.checksum),
-            candidate_count: 1,
-            candidate_bytes: candidate.size,
+            candidate_count: 2,
+            candidate_bytes: first_candidate.size + second_candidate.size,
         };
         let observation = GcRevalidationRecord {
             id: observation_id,
@@ -1292,20 +1321,40 @@ mod tests {
             captured_at: timestamp,
             completed_at: Some(timestamp),
         };
-        let first = inventory
-            .delete_batch(pool, &observation, 0, 0, 1)
+        faults.fail_delete_after_attempts(1);
+        assert!(
+            inventory
+                .delete_batch(pool, &observation, 0, 0, 2)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store.head(&first_object).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(store.head(&second_object).await.is_ok());
+
+        faults.fail_deletes_after_apply(1);
+        let reconciled = inventory
+            .delete_batch(pool, &observation, 0, 0, 2)
             .await
             .unwrap();
-        assert_eq!(first.next_shard, 256);
-        assert_eq!(first.deleted_objects, 1);
-        assert_eq!(first.already_absent, 0);
+        assert_eq!(reconciled.next_shard, 256);
+        assert_eq!(reconciled.deleted_objects, 0);
+        assert_eq!(reconciled.already_absent, 2);
+        assert!(matches!(
+            store.head(&second_object).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+
         let replay = inventory
-            .delete_batch(pool, &observation, 0, 0, 1)
+            .delete_batch(pool, &observation, 0, 0, 2)
             .await
             .unwrap();
         assert_eq!(replay.next_shard, 256);
         assert_eq!(replay.deleted_objects, 0);
-        assert_eq!(replay.already_absent, 1);
+        assert_eq!(replay.already_absent, 2);
+        assert_eq!(faults.delete_count(), 3);
     }
 
     #[test]

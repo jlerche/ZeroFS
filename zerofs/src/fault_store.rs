@@ -10,7 +10,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
@@ -27,11 +27,18 @@ pub struct FaultControls {
     fail_next_puts: AtomicUsize,
     /// Apply the next N `put` calls, then return a transient response error.
     fail_after_puts: AtomicUsize,
+    /// Fail the next N `delete` calls before applying them, then resume.
+    fail_next_deletes: AtomicUsize,
+    /// Fail before the delete whose absolute attempt number is stored here.
+    fail_delete_attempt: AtomicUsize,
+    /// Apply the next N `delete` calls, then return a transient response error.
+    fail_after_deletes: AtomicUsize,
     /// Return a body `truncate_bytes` short of the claimed length on the next N gets.
     truncate_next_gets: AtomicUsize,
     truncate_bytes: AtomicUsize,
     gets: AtomicUsize,
     puts: AtomicUsize,
+    deletes: AtomicUsize,
 }
 
 impl FaultControls {
@@ -47,6 +54,22 @@ impl FaultControls {
     pub fn fail_puts_after_apply(&self, n: usize) {
         self.fail_after_puts.store(n, Ordering::SeqCst);
     }
+    pub fn fail_deletes(&self, n: usize) {
+        self.fail_next_deletes.store(n, Ordering::SeqCst);
+    }
+    /// Allow `n` delete attempts, then fail the following one before apply.
+    pub fn fail_delete_after_attempts(&self, n: usize) {
+        let attempt = self
+            .deletes
+            .load(Ordering::SeqCst)
+            .checked_add(n)
+            .and_then(|attempt| attempt.checked_add(1))
+            .expect("delete fault attempt overflow");
+        self.fail_delete_attempt.store(attempt, Ordering::SeqCst);
+    }
+    pub fn fail_deletes_after_apply(&self, n: usize) {
+        self.fail_after_deletes.store(n, Ordering::SeqCst);
+    }
     /// Make the next `n` gets return a body `by` bytes short of the claimed length.
     pub fn truncate_gets(&self, n: usize, by: usize) {
         self.truncate_bytes.store(by, Ordering::SeqCst);
@@ -57,6 +80,9 @@ impl FaultControls {
     }
     pub fn put_count(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
+    }
+    pub fn delete_count(&self) -> usize {
+        self.deletes.load(Ordering::SeqCst)
     }
 }
 
@@ -175,14 +201,32 @@ impl ObjectStore for FaultStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        // A write partition fails every delete fast (one yield per input, as the
-        // provided `ObjectStoreExt::delete` and bulk callers expect).
-        if self.ctl.partition_writes.load(Ordering::SeqCst) {
-            return locations
-                .map(|loc| loc.and_then(|_| Err(Self::transient("delete"))))
-                .boxed();
-        }
-        self.inner.delete_stream(locations)
+        let inner = Arc::clone(&self.inner);
+        let ctl = Arc::clone(&self.ctl);
+        locations
+            .then(move |location| {
+                let inner = Arc::clone(&inner);
+                let ctl = Arc::clone(&ctl);
+                async move {
+                    let location = location?;
+                    let attempt = ctl.deletes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if ctl.partition_writes.load(Ordering::SeqCst)
+                        || take_one(&ctl.fail_next_deletes)
+                        || ctl
+                            .fail_delete_attempt
+                            .compare_exchange(attempt, 0, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        return Err(Self::transient("delete"));
+                    }
+                    inner.delete(&location).await?;
+                    if take_one(&ctl.fail_after_deletes) {
+                        return Err(Self::transient("delete response"));
+                    }
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -281,5 +325,32 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap().len(),
             100
         );
+    }
+
+    #[tokio::test]
+    async fn delete_faults_distinguish_before_and_after_apply() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("k");
+        store.put(&path, b"v".to_vec().into()).await.unwrap();
+
+        ctl.fail_deletes(1);
+        assert!(store.delete(&path).await.is_err());
+        assert!(store.head(&path).await.is_ok());
+
+        ctl.fail_deletes_after_apply(1);
+        assert!(store.delete(&path).await.is_err());
+        assert!(matches!(
+            store.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+
+        store.put(&path, b"v2".to_vec().into()).await.unwrap();
+        ctl.fail_delete_after_attempts(1);
+        store.delete(&path).await.unwrap();
+        store.put(&path, b"v3".to_vec().into()).await.unwrap();
+        assert!(store.delete(&path).await.is_err());
+        assert!(store.head(&path).await.is_ok());
+        store.delete(&path).await.unwrap();
+        assert_eq!(ctl.delete_count(), 5);
     }
 }

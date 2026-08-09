@@ -281,7 +281,7 @@
 - [x] Test active, expired, renewed, and corrupted leases.
 - [x] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
 - [ ] Test collector crashes and restarts in every persisted phase.
-- [ ] Test partial and ambiguous object-store deletes.
+- [x] Test partial and ambiguous object-store deletes.
 - [x] Assert that uncertainty always retains data.
 - [x] Assert eventual reclamation once an object is stably unreachable.
 
@@ -630,3 +630,9 @@
 - Existing lifecycle coverage proves an active lease keeps its exact root after subject deletion, renewal cannot move time backwards or resurrect a deleting subject, expiry waits through the full deadline plus clock-skew allowance, expiry is idempotent, and the lease UUID cannot be reused after its root-free tombstone is published.
 - Renewal coverage injects an applied catalog write followed by a lost response, then proves the exact token/revision retry reconciles the renewed record and a stale renewal cannot advance it again. Active, renewed, and not-yet-skew-expired leases therefore remain roots until one authoritative end transition succeeds.
 - The missing corruption case now overwrites a durable SlateDB lease with an invalid token hash. Full snapshot validation fails, `RootCaptureLifecycle::begin` rejects before publishing any run, and the exact run UUID remains absent. A malformed authoritative lease can neither be silently omitted from the root set nor guessed expired, completing the lease-state safety item.
+
+### 2026-08-08: partial and ambiguous GC deletion recovery
+
+- The reusable fault-injecting object store now distinguishes deletes that fail before application from deletes that are applied but lose their response, and counts every attempted delete. This gives lifecycle and collector tests the same deterministic ambiguity model already used for immutable puts.
+- Every GC candidate deletion is followed by an authoritative absence check even when the delete response is an error. Confirmed absence advances the bounded cursor as an already-absent reconciliation; a failed delete whose object remains returns the original error, while an inconclusive absence check returns its verification error and retains the candidate.
+- Executable proof starts a two-candidate bounded batch, deletes its first candidate, then injects a before-apply failure on the second and proves that object remains. Retrying from the unchanged batch cursor classifies the first as already absent without another delete, reconciles an after-apply lost response for the second, advances to completion, and remains idempotent on replay.
