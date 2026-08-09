@@ -295,7 +295,7 @@
 - [ ] Verify foreground branch and mount latency remains acceptable during GC.
 - [ ] Verify catalog mutations do not contend on one global multi-megabyte CAS object.
 - [x] Add metrics for phase duration, scanned references, inventory size, quarantined bytes, reclaimed bytes, aborted runs, retained-on-error objects, and backlog.
-- [ ] Add alerts for repeated aborted runs, stalled phases, old quarantines, root-open failures, and catalog corruption.
+- [x] Add alerts for repeated aborted runs, stalled phases, old quarantines, root-open failures, and catalog corruption.
 
 ## Phase 6: Production rollout
 
@@ -664,3 +664,10 @@
 
 - The authoritative create operation retains only its operation/destination/source UUIDs, immutable source root, optional historical parent UUID, one `reserved`/`root_created`/`published` phase, the independently authenticated destination root once available, and revision/timestamps. It has no per-step receipt log, takeover generation, expiry bucket, or recovery sweep state.
 - The persisted-boundary restart matrix closes and reopens the SlateDB catalog before reservation, after atomic reservation, after destination storage but before root publication, after root publication, and after ready publication. Reissuing the exact immutable request converges on the same authenticated ready branch at every boundary; conflicting inputs fail rather than retargeting recovery.
+
+### 2026-08-08: global GC alerting
+
+- Phase entry and exit now maintain a low-cardinality active-call gauge alongside the completed-duration histogram. A nonzero phase series can therefore alert while an asynchronous call is stuck rather than waiting for it to return and publish a duration.
+- Root authentication failures have a dedicated phase-and-reason counter in addition to the fail-closed retained/abort counters. Capture and second-observation verification both emit it before returning, while no error metric is used as deletion authority.
+- The shipped Prometheus rules cover repeated aborts, a phase active for 15 minutes, a quarantine older than 24 hours, root-open failures, and corrupt metadata. A process-local tracker emits the oldest timestamp across concurrently observed active runs and removes only completed or aborted runs; resuming a durable run after restart restores the signal.
+- Operator documentation lists every global collector series, counter aggregation/reset semantics, and the response boundary: keep deletion disabled and inspect authoritative SlateDB plus immutable root/run artifacts. PostgreSQL and JSON remain identical customer projections and are not recovery authority.

@@ -1,0 +1,47 @@
+groups:
+  - name: zerofs-cow-branches
+    rules:
+      - alert: ZeroFSGlobalGcRepeatedAborts
+        expr: sum(increase(zerofs_gc_aborted_phase_attempts_total[15m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Global GC is repeatedly aborting
+          description: Inspect the reason labels and authoritative GC run before retrying or enabling deletion.
+
+      - alert: ZeroFSGlobalGcPhaseStalled
+        expr: max by (phase) (zerofs_gc_phase_active) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Global GC phase {{ $labels.phase }} has not returned
+          description: A phase call has remained active for 15 minutes; inspect storage latency and the durable run state.
+
+      - alert: ZeroFSGlobalGcOldQuarantine
+        expr: zerofs_gc_oldest_quarantine_timestamp_seconds > 0 and (time() - zerofs_gc_oldest_quarantine_timestamp_seconds) > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Global GC has retained a quarantine for more than 24 hours
+          description: Inspect active runs and their authoritative candidate artifacts before changing grace or deletion policy.
+
+      - alert: ZeroFSGlobalGcRootOpenFailure
+        expr: sum by (phase, reason) (increase(zerofs_gc_root_open_failures_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Global GC could not authenticate a {{ $labels.phase }} root
+          description: Reachability is uncertain and deletion remains blocked; repair the exact root or storage path first.
+
+      - alert: ZeroFSCatalogCorruption
+        expr: sum(increase(zerofs_gc_aborted_phase_attempts_total{reason="corrupt_metadata"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Global GC observed corrupt authoritative metadata
+          description: Keep physical deletion disabled and inspect the catalog, root, and run artifacts with the administrative API.

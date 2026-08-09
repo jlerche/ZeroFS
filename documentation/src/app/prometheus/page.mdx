@@ -75,6 +75,55 @@ An extent is the 32 KiB unit of file data, stored as a frame in an immutable seg
 
 The metrics above cover the tombstone sweep that reclaims a deleted file's extents. Segment reclamation and compaction, which recover dead space inside the immutable segment objects that hold file data, are reported separately below.
 
+### Copy-on-write branch global GC
+
+The generation-fenced collector for shared branch storage exports the following
+operational series. Counters are process-local and must be aggregated across the
+collector job. `zerofs_gc_phase_active` is incremented on entry and decremented
+when the call returns, including errors, so a value above zero is an in-flight
+call rather than durable catalog authority.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_gc_phase_duration_seconds` | histogram | Completed call duration labeled by `capture`, `mark`, `inventory_quarantine`, `revalidate`, or `delete` |
+| `zerofs_gc_phase_active` | gauge | Calls currently executing, labeled by phase |
+| `zerofs_gc_roots_scanned_total` | counter | Roots enumerated while marking |
+| `zerofs_gc_references_scanned_total` | counter | Segment references streamed while marking |
+| `zerofs_gc_unique_segments_marked_total` | counter | Unique reachable segment identities emitted by marking |
+| `zerofs_gc_inventory_objects_total` | counter | Physical segment objects streamed during inventory |
+| `zerofs_gc_quarantined_objects_total` | counter | Segment objects entering a first unreachable observation |
+| `zerofs_gc_quarantined_bytes_total` | counter | Bytes entering a first unreachable observation |
+| `zerofs_gc_candidates_became_reachable_total` | counter | First-observation candidates retained because the second observation reached them |
+| `zerofs_gc_candidates_already_absent_total` | counter | First-observation candidates already absent during the second observation |
+| `zerofs_gc_reclaimed_objects_total` | counter | Segment objects confirmed physically deleted |
+| `zerofs_gc_reclaimed_bytes_total` | counter | Bytes confirmed physically deleted |
+| `zerofs_gc_aborted_runs_total` | counter | Root-capture runs aborted before publication |
+| `zerofs_gc_aborted_phase_attempts_total` | counter | Later phase attempts blocked, labeled by fail-closed reason |
+| `zerofs_gc_root_open_failures_total` | counter | Root authentication failures labeled by phase and reason |
+| `zerofs_gc_retained_on_error_lower_bound_total` | counter | Lower-bound objects retained because reachability was uncertain |
+| `zerofs_gc_oldest_quarantine_timestamp_seconds` | gauge | Unix timestamp of the oldest active quarantine observed by this collector process, or zero |
+| `zerofs_gc_backlog_upper_bound_bytes_added_total` | counter | Candidate bytes added to the conservative backlog bound |
+| `zerofs_gc_backlog_upper_bound_bytes_resolved_total` | counter | Candidate bytes removed by confirmed physical deletion |
+
+Subtract the two backlog counters only after summing the same collector job and
+clamp the result at zero across counter resets. It is intentionally an upper
+bound: candidates that later become reachable can keep it elevated. Use it to
+trigger investigation, never as permission to delete data.
+
+The oldest-quarantine gauge tracks all active runs observed by the process and is
+restored when a persisted run is resumed after restart. A production scheduler
+must resume or inspect durable active runs on startup; the gauge is an alerting
+signal and the catalog record remains authority.
+
+Example alert rules are provided in
+`monitoring/prometheus/cow-branches-alerts.yml`. They cover repeated aborts, a
+phase call active for 15 minutes, a quarantine older than 24 hours, root-open
+failures, and corrupt metadata. Tune the time windows to
+the supported inventory size and normal collection cadence. Root-open or
+corruption alerts require keeping physical deletion disabled until the exact
+authoritative SlateDB state and immutable root artifacts have been inspected;
+PostgreSQL and JSON projections are not recovery authority.
+
 ### Segment Footprint
 
 Gauges reporting the on-store segment footprint as of the last reclaim scan. These are the store-wide totals from which dead space is derived; between passes they hold their last value.
