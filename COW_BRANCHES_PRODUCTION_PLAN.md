@@ -278,7 +278,7 @@
 - [ ] Test catalog changes during root capture, marking, inventory, quarantine, and deletion.
 - [x] Test branches and checkpoints created immediately before and after the inventory cutoff.
 - [x] Test deletion of parents and source checkpoints with surviving descendants.
-- [ ] Test active, expired, renewed, and corrupted leases.
+- [x] Test active, expired, renewed, and corrupted leases.
 - [x] Test missing, corrupt, truncated, duplicated, and reordered mark shards.
 - [ ] Test collector crashes and restarts in every persisted phase.
 - [ ] Test partial and ambiguous object-store deletes.
@@ -624,3 +624,9 @@
 - The mark reader is exercised against a missing object, a physically truncated object, a wrong authenticated header, a valid-body file with a corrupt checksum, and independently checksummed files containing duplicate or reordered segment identities. Missing storage is distinguished from corrupt encoding; every malformed present artifact is rejected before it can become an authoritative sorted set.
 - Duplicate and reordered fixtures carry internally consistent headers, counts, and checksums, so their rejection specifically proves the strict ordering/deduplication invariant rather than incidental checksum failure. The normal collector integration separately corrupts published mark and quarantine artifacts, records bounded `CorruptMetadata` blockers, and now explicitly rechecks that a quarantined pool candidate remains present after both failures.
 - Together with the cutoff generation fence, root-open failure, changed-object identity checks, and delete-time byte revalidation, these cases establish the operational rule that uncertainty retains. No corrupt or unavailable proof path reaches physical deletion; repair/restart behavior remains covered by the following persisted-phase work.
+
+### 2026-08-08: lease-state GC safety matrix
+
+- Existing lifecycle coverage proves an active lease keeps its exact root after subject deletion, renewal cannot move time backwards or resurrect a deleting subject, expiry waits through the full deadline plus clock-skew allowance, expiry is idempotent, and the lease UUID cannot be reused after its root-free tombstone is published.
+- Renewal coverage injects an applied catalog write followed by a lost response, then proves the exact token/revision retry reconciles the renewed record and a stale renewal cannot advance it again. Active, renewed, and not-yet-skew-expired leases therefore remain roots until one authoritative end transition succeeds.
+- The missing corruption case now overwrites a durable SlateDB lease with an invalid token hash. Full snapshot validation fails, `RootCaptureLifecycle::begin` rejects before publishing any run, and the exact run UUID remains absent. A malformed authoritative lease can neither be silently omitted from the root set nor guessed expired, completing the lease-state safety item.

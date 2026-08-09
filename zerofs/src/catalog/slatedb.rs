@@ -3087,7 +3087,8 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchState, DurableRoot, GcInventoryStats, GcQuarantineShard, GcRevalidationRecord,
-        GcRevalidationStats, catalog_timestamp, lease::LEASE_CLOCK_SKEW,
+        GcRevalidationStats, RootCaptureLifecycle, RootCaptureLifecycleError, SlateDbRootStore,
+        catalog_timestamp, lease::LEASE_CLOCK_SKEW,
     };
     use chrono::Utc;
     use slatedb::object_store::memory::InMemory;
@@ -3474,6 +3475,64 @@ mod tests {
                 .await,
             Err(CatalogError::AlreadyExists(_) | CatalogError::NotFound(_))
         ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_durable_lease_blocks_snapshot_and_gc_admission() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("corrupt-lease"), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let branch = branch("corrupt-lease-owner");
+        catalog
+            .apply(CatalogMutation::CreateBranch(branch.clone()))
+            .await
+            .unwrap();
+        let issued_at = catalog_timestamp(Utc::now());
+        let lease = branch_lease(&branch, issued_at);
+        catalog
+            .apply(CatalogMutation::AcquireLease {
+                expected_subject_revision: branch.revision,
+                lease: lease.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .snapshot()
+                .await
+                .unwrap()
+                .gc_roots()
+                .contains(&&lease.root)
+        );
+
+        let mut corrupt = lease.clone();
+        corrupt.token_hash = "not-a-sha256".to_string();
+        let mut batch = WriteBatch::new();
+        put_json(&mut batch, lease_key(lease.id), &corrupt).unwrap();
+        catalog
+            .db
+            .write_with_options(batch, &durable_write_options())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            catalog.snapshot().await,
+            Err(CatalogError::Invalid(_))
+        ));
+        let run_id = Uuid::new_v4();
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, Path::from("corrupt-lease-branches")),
+        );
+        assert!(matches!(
+            lifecycle.begin(run_id).await,
+            Err(RootCaptureLifecycleError::Catalog(CatalogError::Invalid(_)))
+        ));
+        assert!(catalog.gc_run(run_id).await.unwrap().is_none());
         catalog.close().await.unwrap();
     }
 
