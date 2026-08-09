@@ -45,8 +45,8 @@ pub use lifecycle::{
     AdministrativeInspectionRequest, AdministrativeLeaseRecord,
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchFeatureConfig,
     BranchInspection, BranchLifecycle, BranchLifecycleError, BranchLineageInspection,
-    BranchMountGrant, BranchMountRequest, HistoricalResource, HistoricalResourceStatus,
-    MAX_ADMINISTRATIVE_INSPECTION_RECORDS, ServerWriterMountDisposition,
+    BranchMountGrant, BranchMountRequest, CheckpointCreateRequest, HistoricalResource,
+    HistoricalResourceStatus, MAX_ADMINISTRATIVE_INSPECTION_RECORDS, ServerWriterMountDisposition,
     ServerWriterMountPreparation, ServerWriterMountRequest,
 };
 pub use postgres::PostgresCatalogProjection;
@@ -76,6 +76,12 @@ pub const MAX_UNEXPOSED_PRIVATE_EPOCHS_PER_BRANCH: usize = 64;
 pub const MAX_BRANCH_LINEAGE_DEPTH: usize = 64;
 
 pub type CustomerMetadata = Map<String, Value>;
+
+/// Validate a public catalog resource name before performing external storage
+/// I/O. Internal `__zerofs_` namespaces are reserved and never customer-visible.
+pub fn validate_resource_name(name: &str) -> Result<(), CatalogError> {
+    validate_name(name)
+}
 
 /// Normalize a timestamp to PostgreSQL's microsecond precision so projections
 /// and authoritative backends have identical round-trip behavior.
@@ -2160,7 +2166,6 @@ pub(crate) enum CatalogMutation {
         expected_revision: u64,
         record: BranchRecord,
     },
-    #[cfg(test)]
     CreateCheckpoint(CheckpointRecord),
     #[cfg(test)]
     ReplaceCheckpoint {

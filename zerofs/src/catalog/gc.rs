@@ -1334,6 +1334,12 @@ fn classify_root_store_error(error: &RootStoreError) -> GcBlockerKind {
         | RootStoreError::UnownedDestination(_)
         | RootStoreError::OwnershipConflict(_)
         | RootStoreError::SourceManifestMismatch { .. }
+        | RootStoreError::SourceCheckpointNameMismatch { .. }
+        | RootStoreError::MissingSourceCheckpointName(_)
+        | RootStoreError::DuplicateSourceCheckpointName(_)
+        | RootStoreError::SourceCheckpointNameIdentityMismatch { .. }
+        | RootStoreError::ExpiringSourceCheckpoint(_)
+        | RootStoreError::SourceCheckpointCreateTimeMismatch { .. }
         | RootStoreError::WrongSource { .. }
         | RootStoreError::NonCanonicalRoot(_)
         | RootStoreError::StaleWriterIncarnation { .. }

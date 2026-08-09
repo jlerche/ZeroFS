@@ -1,4 +1,5 @@
-use super::{DurableRoot, MAX_ROOT_IDENTIFIER_BYTES, validate_root};
+use super::{DurableRoot, MAX_ROOT_IDENTIFIER_BYTES, catalog_timestamp, validate_root};
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -150,7 +151,72 @@ impl SlateDbRootStore {
         checkpoint: &ImmutableCheckpoint,
     ) -> Result<(), RootStoreError> {
         validate_database_path("checkpoint", &checkpoint.database_path)?;
-        self.verify_source(checkpoint).await
+        self.authenticate_source(checkpoint).await.map(|_| ())
+    }
+
+    /// Authenticate every physical field required to publish a customer-named,
+    /// permanent checkpoint as an authoritative catalog root.
+    pub async fn verify_public_checkpoint(
+        &self,
+        checkpoint: &ImmutableCheckpoint,
+        expected_name: &str,
+        expected_created_at: DateTime<Utc>,
+    ) -> Result<(), RootStoreError> {
+        validate_database_path("checkpoint", &checkpoint.database_path)?;
+        let physical = self.authenticate_source(checkpoint).await?;
+        if physical.name.as_deref() != Some(expected_name) {
+            return Err(RootStoreError::SourceCheckpointNameMismatch {
+                checkpoint_id: checkpoint.checkpoint_id,
+                expected: expected_name.to_string(),
+                actual: physical.name,
+            });
+        }
+        let named = self
+            .admin(checkpoint.database_path.clone())
+            .list_checkpoints(Some(expected_name))
+            .await?;
+        let resolved = match named.as_slice() {
+            [resolved] => resolved,
+            [] => {
+                return Err(RootStoreError::MissingSourceCheckpointName(
+                    expected_name.to_string(),
+                ));
+            }
+            _ => {
+                return Err(RootStoreError::DuplicateSourceCheckpointName(
+                    expected_name.to_string(),
+                ));
+            }
+        };
+        if resolved.id != checkpoint.checkpoint_id {
+            return Err(RootStoreError::SourceCheckpointNameIdentityMismatch {
+                name: expected_name.to_string(),
+                expected: checkpoint.checkpoint_id,
+                actual: resolved.id,
+            });
+        }
+        if resolved.manifest_id != checkpoint.manifest_id {
+            return Err(RootStoreError::SourceManifestMismatch {
+                checkpoint_id: checkpoint.checkpoint_id,
+                expected: checkpoint.manifest_id,
+                actual: resolved.manifest_id,
+            });
+        }
+        if physical.expire_time.is_some() {
+            return Err(RootStoreError::ExpiringSourceCheckpoint(
+                checkpoint.checkpoint_id,
+            ));
+        }
+        let expected = catalog_timestamp(expected_created_at);
+        let actual = catalog_timestamp(physical.create_time);
+        if actual != expected {
+            return Err(RootStoreError::SourceCheckpointCreateTimeMismatch {
+                checkpoint_id: checkpoint.checkpoint_id,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Idempotently create a destination clone from one exact checkpoint.
@@ -869,6 +935,13 @@ impl SlateDbRootStore {
     }
 
     async fn verify_source(&self, source: &ImmutableCheckpoint) -> Result<(), RootStoreError> {
+        self.authenticate_source(source).await.map(|_| ())
+    }
+
+    async fn authenticate_source(
+        &self,
+        source: &ImmutableCheckpoint,
+    ) -> Result<slatedb::Checkpoint, RootStoreError> {
         let source_admin = self.admin(source.database_path.clone());
         let source_checkpoint = source_admin
             .list_checkpoints(None)
@@ -889,7 +962,8 @@ impl SlateDbRootStore {
             .read_manifest(Some(source.manifest_id))
             .await?
             .ok_or_else(|| RootStoreError::MissingManifest(source.manifest_id.to_string()))?;
-        ensure_no_wal_dependency(&source_manifest)
+        ensure_no_wal_dependency(&source_manifest)?;
+        Ok(source_checkpoint)
     }
 
     async fn read_result(&self, destination: &Path) -> Result<Option<RootResult>, RootStoreError> {
@@ -1179,6 +1253,36 @@ pub enum RootStoreError {
         checkpoint_id: Uuid,
         expected: u64,
         actual: u64,
+    },
+    #[error(
+        "source checkpoint {checkpoint_id} name mismatch: expected {expected:?}, found {actual:?}"
+    )]
+    SourceCheckpointNameMismatch {
+        checkpoint_id: Uuid,
+        expected: String,
+        actual: Option<String>,
+    },
+    #[error("public source checkpoint name {0:?} does not resolve to a physical checkpoint")]
+    MissingSourceCheckpointName(String),
+    #[error("multiple physical checkpoints use public source name {0:?}")]
+    DuplicateSourceCheckpointName(String),
+    #[error(
+        "public source checkpoint name {name:?} resolves to UUID {actual}, expected {expected}"
+    )]
+    SourceCheckpointNameIdentityMismatch {
+        name: String,
+        expected: Uuid,
+        actual: Uuid,
+    },
+    #[error("source checkpoint {0} is expiring and cannot become a catalog root")]
+    ExpiringSourceCheckpoint(Uuid),
+    #[error(
+        "source checkpoint {checkpoint_id} creation time mismatch: expected {expected}, found {actual}"
+    )]
+    SourceCheckpointCreateTimeMismatch {
+        checkpoint_id: Uuid,
+        expected: DateTime<Utc>,
+        actual: DateTime<Utc>,
     },
     #[error(
         "destination {destination} is attached to a different source than {source_path} checkpoint {checkpoint_id}"

@@ -31,6 +31,15 @@ pub struct BranchCreateFromCheckpointNameRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCreateRequest {
+    pub checkpoint_id: Uuid,
+    pub branch_id: Uuid,
+    pub name: String,
+    pub source: ImmutableCheckpoint,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchMountRequest {
     pub branch_name: String,
     /// The subject UUID identifies the exact branch incarnation; the remaining
@@ -266,6 +275,99 @@ impl BranchLifecycle {
         let snapshot = self.catalog.snapshot().await?;
         projection.reconcile(volume_id, &snapshot).await?;
         Ok(())
+    }
+
+    /// Publish one already-durable data-plane checkpoint as an authoritative
+    /// named branch root. Exact retries are generation-neutral; the immutable
+    /// SlateDB identity is authenticated before any catalog mutation.
+    pub async fn publish_checkpoint(
+        &self,
+        request: CheckpointCreateRequest,
+    ) -> Result<super::CheckpointRecord, BranchLifecycleError> {
+        validate_name(&request.name)?;
+        if request.checkpoint_id != request.source.checkpoint_id {
+            return Err(BranchLifecycleError::SourceRootConflict(
+                request.checkpoint_id,
+            ));
+        }
+        let root = request.source.durable_root();
+        if let Some(existing) = self.catalog.checkpoint(request.checkpoint_id).await? {
+            let existing = exact_checkpoint_publication(&request, &root, existing)?;
+            self.roots
+                .verify_public_checkpoint(&request.source, &request.name, request.created_at)
+                .await?;
+            return Ok(existing);
+        }
+        if let Some(existing) = self
+            .catalog
+            .checkpoint_by_name(request.branch_id, &request.name)
+            .await?
+        {
+            let existing = exact_checkpoint_publication(&request, &root, existing)?;
+            self.roots
+                .verify_public_checkpoint(&request.source, &request.name, request.created_at)
+                .await?;
+            return Ok(existing);
+        }
+        let branch = self
+            .catalog
+            .branch(request.branch_id)
+            .await?
+            .filter(|branch| branch.state == BranchState::Ready)
+            .ok_or_else(|| {
+                CatalogError::NotFound(format!("ready checkpoint branch {}", request.branch_id))
+            })?;
+        let branch_root = branch.root.as_ref().ok_or_else(|| {
+            BranchLifecycleError::Invariant(format!(
+                "ready checkpoint branch {} has no root",
+                branch.id
+            ))
+        })?;
+        if branch_root.identity != request.source.database_path.to_string() {
+            return Err(CatalogError::Invalid(format!(
+                "checkpoint database identity does not match branch {}",
+                request.branch_id
+            ))
+            .into());
+        }
+        self.roots
+            .verify_public_checkpoint(&request.source, &request.name, request.created_at)
+            .await?;
+        let record = super::CheckpointRecord {
+            id: request.checkpoint_id,
+            revision: 1,
+            branch_id: request.branch_id,
+            name: request.name.clone(),
+            root: root.clone(),
+            created_at: request.created_at,
+            updated_at: request.created_at,
+        };
+        let applied = self
+            .catalog
+            .apply(CatalogMutation::CreateCheckpoint(record.clone()))
+            .await;
+        if let Err(error) = applied {
+            if let Some(existing) = self.catalog.checkpoint(request.checkpoint_id).await? {
+                let existing = exact_checkpoint_publication(&request, &root, existing)?;
+                self.roots
+                    .verify_public_checkpoint(&request.source, &request.name, request.created_at)
+                    .await?;
+                return Ok(existing);
+            }
+            if let Some(existing) = self
+                .catalog
+                .checkpoint_by_name(request.branch_id, &request.name)
+                .await?
+            {
+                let existing = exact_checkpoint_publication(&request, &root, existing)?;
+                self.roots
+                    .verify_public_checkpoint(&request.source, &request.name, request.created_at)
+                    .await?;
+                return Ok(existing);
+            }
+            return Err(error.into());
+        }
+        Ok(record)
     }
 
     pub fn deletions(&self) -> super::DeletionLifecycle {
@@ -729,6 +831,22 @@ impl BranchLifecycle {
     }
 }
 
+fn exact_checkpoint_publication(
+    request: &CheckpointCreateRequest,
+    root: &super::DurableRoot,
+    existing: super::CheckpointRecord,
+) -> Result<super::CheckpointRecord, BranchLifecycleError> {
+    if existing.id != request.checkpoint_id
+        || existing.branch_id != request.branch_id
+        || existing.name != request.name
+        || existing.root != *root
+        || existing.created_at != request.created_at
+    {
+        return Err(CatalogError::OperationConflict(request.checkpoint_id.to_string()).into());
+    }
+    Ok(existing)
+}
+
 fn derive_server_lease_request(
     request: &ServerWriterMountRequest,
     branch_revision: u64,
@@ -953,6 +1071,270 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
+
+    #[tokio::test]
+    async fn checkpoint_publication_authenticates_and_retries_without_generation_change() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from("checkpoint-publication/catalog"),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        let source_path = Path::from("checkpoint-publication/live");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"value").await.unwrap();
+        let first = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("snapshot".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let conflicting = source_db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: None,
+                    name: Some("other-physical-name".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let first_physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == first.id)
+            .unwrap();
+        let first_source = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: first.id,
+            manifest_id: first.manifest_id,
+        };
+        let branch_id = Uuid::new_v4();
+        let now = catalog_timestamp(first_physical.create_time);
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: branch_id,
+                revision: 1,
+                name: "main".to_string(),
+                state: BranchState::Ready,
+                root: Some(first_source.durable_root()),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("checkpoint-publication/branches"),
+        );
+        let lifecycle = BranchLifecycle::new(catalog.clone(), roots);
+        let request = CheckpointCreateRequest {
+            checkpoint_id: first.id,
+            branch_id,
+            name: "snapshot".to_string(),
+            source: first_source,
+            created_at: now,
+        };
+
+        let published = lifecycle.publish_checkpoint(request.clone()).await.unwrap();
+        assert_eq!(published.id, first.id);
+        assert_eq!(published.root, request.source.durable_root());
+        let generation = catalog.snapshot().await.unwrap().generation;
+        assert_eq!(
+            lifecycle.publish_checkpoint(request.clone()).await.unwrap(),
+            published
+        );
+        assert_eq!(catalog.snapshot().await.unwrap().generation, generation);
+
+        let conflict = lifecycle
+            .publish_checkpoint(CheckpointCreateRequest {
+                checkpoint_id: conflicting.id,
+                branch_id,
+                name: request.name,
+                source: ImmutableCheckpoint {
+                    database_path: source_path,
+                    checkpoint_id: conflicting.id,
+                    manifest_id: conflicting.manifest_id,
+                },
+                created_at: now,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            BranchLifecycleError::Catalog(CatalogError::OperationConflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_rejects_relabeling_expiry_and_fabricated_time() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from("checkpoint-publication-rejection/catalog"),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        let source_path = Path::from("checkpoint-publication-rejection/live");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"value").await.unwrap();
+        let specifications = [
+            (Some("__zerofs_branch_head_internal"), None),
+            (None, None),
+            (Some("physical-name"), None),
+            (Some("expiring"), Some(std::time::Duration::from_secs(3600))),
+            (Some("timestamp"), None),
+            (Some("duplicate"), None),
+            (Some("duplicate"), None),
+        ];
+        let mut created = Vec::new();
+        for (name, lifetime) in specifications {
+            created.push(
+                source_db
+                    .create_checkpoint(
+                        CheckpointScope::All,
+                        &CheckpointOptions {
+                            lifetime,
+                            source: None,
+                            name: name.map(str::to_string),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        source_db.close().await.unwrap();
+        let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+            .build()
+            .list_checkpoints(None)
+            .await
+            .unwrap();
+        let branch_id = Uuid::new_v4();
+        let now = catalog_timestamp(Utc::now());
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: branch_id,
+                revision: 1,
+                name: "main".to_string(),
+                state: BranchState::Ready,
+                root: Some(
+                    ImmutableCheckpoint {
+                        database_path: source_path.clone(),
+                        checkpoint_id: created[0].id,
+                        manifest_id: created[0].manifest_id,
+                    }
+                    .durable_root(),
+                ),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        let lifecycle = BranchLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(
+                Arc::clone(&store),
+                Path::from("checkpoint-publication-rejection/branches"),
+            ),
+        );
+        let public_names = [
+            "internal-alias",
+            "unnamed-alias",
+            "different-alias",
+            "expiring",
+            "timestamp",
+            "duplicate",
+            "duplicate",
+        ];
+
+        for (index, checkpoint) in created.into_iter().enumerate() {
+            let physical = physical
+                .iter()
+                .find(|candidate| candidate.id == checkpoint.id)
+                .unwrap();
+            let mut created_at = catalog_timestamp(physical.create_time);
+            if index == 4 {
+                created_at += chrono::TimeDelta::seconds(1);
+            }
+            let error = lifecycle
+                .publish_checkpoint(CheckpointCreateRequest {
+                    checkpoint_id: checkpoint.id,
+                    branch_id,
+                    name: public_names[index].to_string(),
+                    source: ImmutableCheckpoint {
+                        database_path: source_path.clone(),
+                        checkpoint_id: checkpoint.id,
+                        manifest_id: checkpoint.manifest_id,
+                    },
+                    created_at,
+                })
+                .await
+                .unwrap_err();
+            match index {
+                0..=2 => assert!(
+                    matches!(
+                        error,
+                        BranchLifecycleError::RootStore(
+                            RootStoreError::SourceCheckpointNameMismatch { .. }
+                        )
+                    ),
+                    "case {index}: {error:?}"
+                ),
+                3 => assert!(
+                    matches!(
+                        error,
+                        BranchLifecycleError::RootStore(RootStoreError::ExpiringSourceCheckpoint(
+                            _
+                        ))
+                    ),
+                    "case {index}: {error:?}"
+                ),
+                4 => assert!(
+                    matches!(
+                        error,
+                        BranchLifecycleError::RootStore(
+                            RootStoreError::SourceCheckpointCreateTimeMismatch { .. }
+                        )
+                    ),
+                    "case {index}: {error:?}"
+                ),
+                5..=6 => assert!(
+                    matches!(
+                        error,
+                        BranchLifecycleError::RootStore(
+                            RootStoreError::DuplicateSourceCheckpointName(_)
+                        )
+                    ),
+                    "case {index}: {error:?}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+        assert!(catalog.snapshot().await.unwrap().checkpoints.is_empty());
+    }
 
     #[tokio::test]
     async fn named_concurrent_creates_publish_once_and_ignore_source_name_reuse_on_retry() {

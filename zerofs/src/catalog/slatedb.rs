@@ -2452,7 +2452,6 @@ impl SlateDbCatalog {
                 }
                 put_json(&mut batch, branch_key(record.id), &record)?;
             }
-            #[cfg(test)]
             CatalogMutation::CreateCheckpoint(record) => {
                 record.validate()?;
                 ensure_initial_revision(record.revision)?;
