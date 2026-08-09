@@ -296,6 +296,46 @@ the lease itself never owns an unpublished mutable head. `Deleting` turns all
 remaining writer leases into read-only retention roots and waits for their
 release/expiry before removing the final branch head.
 
+### Mount admission and restart
+
+A branch mount request carries the current branch name, the expected stable
+branch UUID, a new lease UUID and renewal token, the requested access mode, and
+a bounded duration. The name is only the first lookup key. The catalog admits
+the lease only if that name still resolves to the expected UUID, the branch is
+`Ready`, its revision and root are unchanged, and the root authenticates.
+Immediately before returning the data-plane capability, the lifecycle verifies
+the exact granted root again. The returned lease—not the requested name—is the
+mount authority.
+
+An exact retry first resolves the already durable lease by lease UUID, renewal
+token binding, subject UUID, mode, duration, and root. It does not resolve the
+name again. Consequently, a response lost before a process crash can be
+recovered after reopening the authoritative SlateDB catalog, even if deletion
+has since removed the old name and a new branch UUID has reused it. A fresh
+lease request for the old UUID cannot use that reused name and fails rather
+than retargeting the mount.
+
+The server data-plane opener must consume only this stable grant. It owns lease
+renewal while serving and attempts exact release after the database is closed;
+crash safety continues to rely on bounded expiry, not shutdown callbacks.
+
+## Customer projection and administrative inspection
+
+PostgreSQL and JSON are identical customer-facing projections. Both contain
+reconstructible lifecycle and customer metadata, and neither is a mount, write,
+or GC authority. Durable roots, manifests, active leases, storage operation
+proofs, private epochs, GC guards, and permanent internal ID reservations remain
+in authoritative SlateDB for local and production deployments.
+
+Operational inspection reads one validated SlateDB generation and returns a
+bounded UUID-ordered page of one resource kind. The production maximum is 256
+records per page. Administrators can inspect live branch UUIDs and roots,
+leases, tombstones, and incomplete branch create/delete operations. Completed
+operations are excluded from the incomplete-operation views, and renewal-token
+hashes are redacted. Every page reports its catalog generation so callers can
+detect changes between pages; an inspection result never grants mutation or
+mount authority.
+
 ## Catalog consistency
 
 - Each successful mutation durably changes a monotonically increasing snapshot
