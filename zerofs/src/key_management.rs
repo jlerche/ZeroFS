@@ -13,6 +13,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const ARGON2_MEM_COST: u32 = 65536;
@@ -168,23 +169,89 @@ fn wrapped_key_path(db_path: &Path) -> Path {
     path
 }
 
-/// A new CoW volume keeps encryption-key authority at the shared pool root.
-/// Legacy migration is intentionally unavailable until a reviewed protocol can
-/// preserve the exact key while reserving or rewriting every existing segment
-/// epoch. Merely copying the wrapped key must never make an old database look
-/// migrated.
+async fn load_wrapped_key_bytes(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+) -> Result<Option<Bytes>> {
+    match object_store.get(&wrapped_key_path(db_path)).await {
+        Ok(result) => Ok(Some(result.bytes().await?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("Failed to load wrapped key: {error}")),
+    }
+}
+
+pub(crate) async fn wrapped_key_digest(
+    object_store: &Arc<dyn ObjectStore>,
+    root: &Path,
+) -> Result<Option<[u8; 32]>> {
+    Ok(load_wrapped_key_bytes(object_store, root)
+        .await?
+        .map(|bytes| Sha256::digest(bytes).into()))
+}
+
+/// Preserve the exact legacy wrapped-key object at the shared-pool root. A
+/// conflicting pool key is never rewrapped or replaced; every database sharing
+/// one pool must already use this same volume key.
+pub(crate) async fn prepare_legacy_shared_key(
+    object_store: &Arc<dyn ObjectStore>,
+    database_path: &Path,
+    segment_pool_path: &Path,
+    password: &str,
+) -> Result<([u8; 32], [u8; 32])> {
+    let legacy_bytes = load_wrapped_key_bytes(object_store, database_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("legacy database has no wrapped encryption key"))?;
+    let legacy: WrappedDataKey = bincode::deserialize(&legacy_bytes)
+        .map_err(|error| anyhow::anyhow!("Failed to deserialize legacy wrapped key: {error}"))?;
+    let dek = unwrap_key_blocking(password, legacy).await?;
+    let wrapped_key_digest = Sha256::digest(&legacy_bytes).into();
+    let pool_path = wrapped_key_path(segment_pool_path);
+    match object_store
+        .put_opts(
+            &pool_path,
+            PutPayload::from(legacy_bytes.clone()),
+            PutOptions::from(PutMode::Create),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = load_wrapped_key_bytes(object_store, segment_pool_path)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("shared wrapped key disappeared"))?;
+            if existing != legacy_bytes {
+                return Err(anyhow::anyhow!(
+                    "shared segment pool uses a different wrapped volume key"
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to save shared wrapped key: {error}"
+            ));
+        }
+    }
+    Ok((dek, wrapped_key_digest))
+}
+
+/// A migrated database may retain its old wrapped key as a rollback artifact.
+/// The two serialized wrappers initially match exactly, but password rotation
+/// rewraps only the authoritative pool key. The authenticated migration
+/// completion checked after pool authority opens proves that the pool still
+/// uses the DEK which authorized the migration.
 pub(crate) async fn ensure_shared_key_compatibility(
     object_store: &Arc<dyn ObjectStore>,
     database_path: &Path,
     segment_pool_path: &Path,
 ) -> Result<()> {
-    let legacy = load_wrapped_key_from_object_store(object_store, database_path).await?;
-    let _shared = load_wrapped_key_from_object_store(object_store, segment_pool_path).await?;
-    match legacy {
-        Some(_) => Err(anyhow::anyhow!(
-            "legacy database encryption key exists; CoW shared-pool migration is not yet supported, and manually copying the key or segments is unsafe"
+    let legacy = load_wrapped_key_bytes(object_store, database_path).await?;
+    let shared = load_wrapped_key_bytes(object_store, segment_pool_path).await?;
+    match (legacy, shared) {
+        (None, _) => Ok(()),
+        (Some(_), Some(_)) => Ok(()),
+        (Some(_), None) => Err(anyhow::anyhow!(
+            "legacy database encryption key exists but the shared pool key is absent; run the reviewed offline migration"
         )),
-        None => Ok(()),
     }
 }
 
@@ -428,11 +495,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_key_compatibility_rejects_even_an_exact_manual_legacy_copy() {
+    async fn legacy_migration_preserves_exact_wrapped_and_unwrapped_key() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let database = Path::from("volume/database");
         let pool = Path::from("volume/segment-pool");
-        load_or_init_encryption_key(&store, &database, "password", false)
+        let expected = load_or_init_encryption_key(&store, &database, "password", false)
             .await
             .unwrap();
         assert!(
@@ -440,26 +507,57 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("migration is not yet supported")
+                .contains("offline migration")
         );
-        let wrapped = store
+        let wrapped_before = store
             .get(&wrapped_key_path(&database))
             .await
             .unwrap()
             .bytes()
             .await
             .unwrap();
-        store
-            .put(&wrapped_key_path(&pool), wrapped.into())
+        let (prepared, wrapped_digest) =
+            prepare_legacy_shared_key(&store, &database, &pool, "password")
+                .await
+                .unwrap();
+        assert_eq!(prepared, expected);
+        let expected_wrapped_digest: [u8; 32] = Sha256::digest(&wrapped_before).into();
+        assert_eq!(wrapped_digest, expected_wrapped_digest);
+        let wrapped_after = store
+            .get(&wrapped_key_path(&pool))
+            .await
+            .unwrap()
+            .bytes()
             .await
             .unwrap();
-        assert!(
-            ensure_shared_key_compatibility(&store, &database, &pool)
+        assert_eq!(wrapped_after, wrapped_before);
+        ensure_shared_key_compatibility(&store, &database, &pool)
+            .await
+            .unwrap();
+
+        change_encryption_password(&store, &pool, "password", "new-password")
+            .await
+            .unwrap();
+        assert_ne!(
+            store
+                .get(&wrapped_key_path(&pool))
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("manually copying")
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            wrapped_before,
+            "password rotation rewraps only the authoritative pool key"
         );
+        assert_eq!(
+            load_or_init_encryption_key(&store, &pool, "new-password", false)
+                .await
+                .unwrap(),
+            expected
+        );
+        ensure_shared_key_compatibility(&store, &database, &pool)
+            .await
+            .unwrap();
 
         let new_database = Path::from("volume/new-database");
         ensure_shared_key_compatibility(&store, &new_database, &pool)

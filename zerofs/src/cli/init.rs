@@ -403,21 +403,49 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     contains(&left, &right) || contains(&right, &left)
 }
 
-async fn ensure_shared_pool_has_no_legacy_segments(
+async fn ensure_shared_pool_legacy_migration(
     store: Arc<dyn object_store::ObjectStore>,
+    pool_store: &Arc<dyn object_store::ObjectStore>,
+    authority: &crate::segment_store::SegmentPoolAuthority,
     database_path: &str,
-    segment_pool_path: &str,
+    database_instance_id: uuid::Uuid,
 ) -> Result<()> {
     let legacy_prefix = Path::from(format!("{database_path}/segments"));
     let mut legacy = store.list(Some(&legacy_prefix));
-    if let Some(entry) = legacy.next().await {
-        let entry = entry.context("Failed to inspect legacy per-database segments")?;
-        anyhow::bail!(
-            "CoW shared segment pool cannot open database {database_path}: legacy segment {} \
-             remains; legacy migration is not yet supported, so do not set \
-             storage.segment_pool_path={segment_pool_path} for this database",
-            entry.location,
-        );
+    let legacy_segment = legacy
+        .next()
+        .await
+        .transpose()
+        .context("Failed to inspect legacy per-database segments")?;
+    let legacy_key_digest =
+        key_management::wrapped_key_digest(&store, &Path::from(database_path.to_string()))
+            .await
+            .context("Failed to inspect legacy encryption key")?;
+    let migration_required = crate::segment_store::SegmentStore::legacy_migration_required(
+        pool_store,
+        authority,
+        database_path,
+        database_instance_id,
+    )
+    .await
+    .context("Failed to authenticate legacy migration requirement")?;
+    if migration_required || legacy_key_digest.is_some() || legacy_segment.is_some() {
+        crate::segment_store::SegmentStore::legacy_migration_completion(
+            pool_store,
+            authority,
+            database_path,
+            database_instance_id,
+            legacy_key_digest,
+        )
+        .await
+        .with_context(|| {
+            format!("Failed to authenticate legacy migration for database {database_path}")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CoW shared segment pool cannot open database {database_path}: legacy key or segments remain without an authenticated migration completion; run `zerofs migrate-legacy-pool --confirm-offline`"
+            )
+        })?;
     }
     Ok(())
 }
@@ -544,12 +572,6 @@ impl StartupContext {
                     "storage.segment_pool_path must be disjoint from the SlateDB database path"
                 );
             }
-            ensure_shared_pool_has_no_legacy_segments(
-                Arc::clone(&object_store),
-                &actual_db_path,
-                pool,
-            )
-            .await?;
         }
 
         info!("Starting ZeroFS server with {} backend", object_store);
@@ -620,10 +642,19 @@ impl StartupContext {
                 .await
                 .context("Failed to authenticate CoW shared segment-pool genesis")?;
                 crate::segment_store::SegmentStore::validate_epoch_reservations(
-                    pool_store, &authority,
+                    Arc::clone(&pool_store),
+                    &authority,
                 )
                 .await
                 .context("CoW shared segment pool contains unreserved identities")?;
+                ensure_shared_pool_legacy_migration(
+                    Arc::clone(&object_store),
+                    &pool_store,
+                    &authority,
+                    &actual_db_path,
+                    bucket.id(),
+                )
+                .await?;
                 Some(authority)
             }
             None => None,
@@ -1597,8 +1628,8 @@ pub async fn initialize_filesystem(
 #[cfg(test)]
 mod role_decision_tests {
     use super::{
-        DatabaseMode, ImmediateRoleDecision, StartupContext,
-        ensure_shared_pool_has_no_legacy_segments, immediate_role_decision, open_catalog_runtime,
+        DatabaseMode, ImmediateRoleDecision, StartupContext, ensure_shared_pool_legacy_migration,
+        immediate_role_decision, open_catalog_runtime,
     };
     use crate::config::{BranchCatalogConfig, CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
@@ -1620,15 +1651,51 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
-    async fn shared_pool_opt_in_fails_closed_when_legacy_segments_remain() {
+    async fn shared_pool_opt_in_requires_authenticated_legacy_completion() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        ensure_shared_pool_has_no_legacy_segments(
+        let database_instance_id = uuid::Uuid::new_v4();
+        let pool: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
             Arc::clone(&store),
+            Path::from("volume/segment-pool"),
+        ));
+        let authority = crate::segment_store::SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool),
+            &[1u8; 32],
             "volume/db",
-            "volume/segment-pool",
+            true,
         )
         .await
         .unwrap();
+        ensure_shared_pool_legacy_migration(
+            Arc::clone(&store),
+            &pool,
+            &authority,
+            "volume/db",
+            database_instance_id,
+        )
+        .await
+        .unwrap();
+        store
+            .put(
+                &Path::from("volume/db/zerofs.key"),
+                bytes::Bytes::from_static(b"legacy-key").into(),
+            )
+            .await
+            .unwrap();
+        let error = ensure_shared_pool_legacy_migration(
+            Arc::clone(&store),
+            &pool,
+            &authority,
+            "volume/db",
+            database_instance_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("migration completion"));
+        store
+            .delete(&Path::from("volume/db/zerofs.key"))
+            .await
+            .unwrap();
         store
             .put(
                 &Path::from("volume/db/segments/00/0000000000000001/0000000000000000"),
@@ -1636,11 +1703,50 @@ mod role_decision_tests {
             )
             .await
             .unwrap();
-        let error =
-            ensure_shared_pool_has_no_legacy_segments(store, "volume/db", "volume/segment-pool")
-                .await
-                .unwrap_err();
-        assert!(error.to_string().contains("legacy segment"));
+        let error = ensure_shared_pool_legacy_migration(
+            store,
+            &pool,
+            &authority,
+            "volume/db",
+            database_instance_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("migration completion"));
+
+        let interrupted: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let interrupted_pool: Arc<dyn ObjectStore> =
+            Arc::new(object_store::prefix::PrefixStore::new(
+                Arc::clone(&interrupted),
+                Path::from("volume/interrupted-pool"),
+            ));
+        interrupted_pool
+            .put(
+                &Path::from("zerofs.key"),
+                bytes::Bytes::from_static(b"wrapped-key").into(),
+            )
+            .await
+            .unwrap();
+        let interrupted_authority =
+            crate::segment_store::SegmentStore::open_or_create_legacy_pool_authority(
+                Arc::clone(&interrupted_pool),
+                &[2u8; 32],
+                "volume/interrupted-db",
+                database_instance_id,
+                [3u8; 32],
+            )
+            .await
+            .unwrap();
+        let error = ensure_shared_pool_legacy_migration(
+            interrupted,
+            &interrupted_pool,
+            &interrupted_authority,
+            "volume/interrupted-db",
+            database_instance_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("migration completion"));
     }
 
     #[tokio::test]
@@ -1752,59 +1858,6 @@ mod role_decision_tests {
 
         fallback.close().await.unwrap();
         runtime.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn two_legacy_databases_with_the_same_segid_cannot_join_one_pool() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let relative = "segments/00/0000000000000007/0000000000000000";
-        let mut legacy_paths = Vec::new();
-        for (database, contents) in [
-            ("volume/a", b"first".as_slice()),
-            ("volume/b", b"second".as_slice()),
-        ] {
-            let legacy_path = Path::from(format!("{database}/{relative}"));
-            store
-                .put(&legacy_path, bytes::Bytes::copy_from_slice(contents).into())
-                .await
-                .unwrap();
-            legacy_paths.push(legacy_path);
-            let error = ensure_shared_pool_has_no_legacy_segments(
-                Arc::clone(&store),
-                database,
-                "volume/segment-pool",
-            )
-            .await
-            .unwrap_err();
-            assert!(error.to_string().contains("legacy segment"));
-        }
-
-        // Even a blind copy followed by removal of both source objects cannot
-        // manufacture the reservation authority required by shared-pool mode.
-        store
-            .put(
-                &Path::from(format!("volume/segment-pool/{relative}")),
-                bytes::Bytes::from_static(b"first").into(),
-            )
-            .await
-            .unwrap();
-        for path in legacy_paths {
-            store.delete(&path).await.unwrap();
-        }
-        let pool: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
-            Arc::clone(&store),
-            Path::from("volume/segment-pool"),
-        ));
-        assert!(
-            crate::segment_store::SegmentStore::open_or_create_pool_authority(
-                pool, &[1u8; 32], "volume/a", true,
-            )
-            .await
-            .err()
-            .expect("a pre-populated pool must not gain new-volume authority")
-            .to_string()
-            .contains("cannot establish shared segment-pool genesis")
-        );
     }
 
     #[tokio::test]

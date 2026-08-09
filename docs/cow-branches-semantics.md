@@ -812,17 +812,75 @@ per-branch segment namespace, or an ambiguous segment ID fails closed. This is
 storage authority in SlateDB/configuration and is never copied into PostgreSQL
 or JSON customer projections.
 
-The shared segment pool is also the volume encryption-key root. The initial
-implementation admits new CoW volumes only: any database-local wrapped key or
-legacy per-database segment prevents startup, genesis cannot be established in
-a prepopulated pool, and every segment already in an admitted pool must have a
-readable epoch marker authenticated for that exact genesis and epoch. Copying
-or synthesizing shaped key, marker, or segment objects alone cannot manufacture
-authenticated migration. Legacy
-single-database mode remains
-available until a separately reviewed offline protocol either publishes an
-authoritative completion manifest after reserving every old epoch and rejecting
-duplicate physical segment IDs, or rewrites every colliding ID and `FrameLoc`.
+The shared segment pool is also the volume encryption-key root. New CoW volumes
+establish it directly. A legacy single-database volume must instead run the
+reviewed offline import below; startup rejects a retained database-local key or
+legacy segment namespace unless the exact database identity has an authenticated
+completion record. Every segment in an admitted pool must have a readable epoch
+marker authenticated for that pool genesis and epoch. Copying shaped key,
+marker, or segment objects cannot manufacture migration completion.
+
+### Offline legacy-to-pool migration
+
+Stop every reader, writer, mount, replica, GC collector, and maintenance process
+for both the legacy source and the complete target shared pool, disable
+replication in the source configuration, set a disjoint
+`storage.segment_pool_path`, and run:
+
+```text
+zerofs migrate-legacy-pool --config zerofs.toml --confirm-offline
+```
+
+`--confirm-offline` is an operator assertion, not a distributed stop mechanism.
+The command refuses to run without it or while replication is configured. Keep
+all source and target-pool serving, GC, and maintenance processes stopped after
+the command succeeds, start the migrated database normally, and resume other
+pool activity only after that startup has authenticated completion and admitted
+the database root. Migration intent, claims, copied segments, and completion are
+not GC roots, so an active pool collector in either the copy phase or the
+completion-to-root-admission window would make the procedure unsafe. The source
+database and target pool must use the same object-store configuration, and
+neither path may contain the other.
+
+The first attempt binds the source path to its persistent database-instance UUID
+and publishes a create-only bootstrap before touching the pool key. That marker
+makes a crash before genesis fail closed instead of allowing normal startup to
+reinterpret the partial pool as native. The command then unwraps the local key
+with the configured password and conditionally copies its exact serialized
+wrapper to the empty/new pool; an existing different wrapper is a hard conflict.
+Authenticated pool genesis binds the first legacy source UUID and wrapped-key
+digest. The importer streams and durably fingerprints the complete initial
+`segments/` inventory and rejects every physical `Segid` already present in the
+pool before publishing authenticated intent. Each imported epoch receives a
+permanent authenticated reservation.
+Different sources may share an epoch only when their counters—and therefore
+their complete physical segment IDs—are disjoint; any duplicate physical ID is
+rejected rather than rewritten.
+
+For each source object the importer validates the canonical key against its
+footer, streams a full-object SHA-256 and byte count, publishes one immutable
+pool-global `Segid` ownership claim bound to the exact source UUID/key digest,
+performs create-only copying without changing the `Segid` or any `FrameLoc`, and
+streams the target again to prove exact identity. Pool-global create-only claims
+give concurrent sources one winner even when their bytes match. A second source
+inventory and streamed durable-claim traversal verify source, claims, and target
+against the initial fingerprint, including a claimed object removed across a
+crash, before authenticated bounded completion. The completion contains only
+migration/pool/source identity, aggregate count and bytes, and a commutative
+inventory fingerprint. Memory does not scale with inventory: claims remain
+independently keyed and epoch validation point-checks each streamed segment's
+reservation rather than retaining every distinct epoch.
+
+A failed or response-ambiguous run is retried with the same command. It may
+reconcile only targets already covered by its exact authenticated pool-global
+claims; an unclaimed object appearing at a destination key fails closed.
+Bootstrap, genesis, intent, database-instance UUID, and retained-key digest all
+force the same completion, so removing legacy remnants or reusing the source
+path cannot bypass startup. Legacy key and segment objects are retained
+as an offline rollback copy and are never served once the pool is configured.
+After migration, password rotation rewraps the authoritative pool key. The old
+database-local wrapper may therefore differ; the completion authentication,
+which derives from the unchanged DEK, proves compatibility on later startup.
 
 Schema v17 supports a terminal shadow path after marking. `report` performs the
 same cutoff-bounded physical inventory and partitioned merge join as the first

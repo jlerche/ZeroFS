@@ -1201,7 +1201,7 @@ impl Settings {
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
              # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n\
-             # segment_pool_path = \".zerofs/segment-pool\"   # Required shared data plane for new CoW volumes; legacy migration is not yet supported.\n"
+             # segment_pool_path = \".zerofs/segment-pool\"   # Required shared data plane for CoW volumes; existing volumes use the offline migrate-legacy-pool command.\n"
         );
 
         // Document warm_metadata in place (the [cache] table is not last, so the

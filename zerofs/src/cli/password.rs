@@ -64,11 +64,14 @@ pub async fn change_password(
         Arc::from(object_store),
         settings.storage.storage_class.as_deref(),
     );
-    let db_path = Path::from(path_from_url.to_string());
+    let key_root = match settings.storage.segment_pool_path.as_deref() {
+        Some(pool) => Path::parse(pool).map_err(|e| PasswordError::Other(e.to_string()))?,
+        None => Path::from(path_from_url.to_string()),
+    };
 
     key_management::change_encryption_password(
         &object_store,
-        &db_path,
+        &key_root,
         current_password,
         &new_password,
     )

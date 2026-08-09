@@ -116,6 +116,12 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
+        cli::Commands::MigrateLegacyPool {
+            config,
+            confirm_offline,
+        } => {
+            cli::migrate_legacy_pool::run(&config, confirm_offline).await?;
+        }
         cli::Commands::Run {
             config,
             read_only,

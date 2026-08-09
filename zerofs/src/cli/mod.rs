@@ -11,6 +11,7 @@ pub mod fatrace;
 pub mod flush;
 mod init;
 pub(crate) use init::{CatalogRuntime, CheckpointCatalogRuntime};
+pub mod migrate_legacy_pool;
 pub mod monitor;
 pub mod otrace;
 pub mod password;
@@ -53,6 +54,14 @@ pub enum Commands {
     ChangePassword {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Offline migration from per-database segments into the configured shared pool
+    MigrateLegacyPool {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Confirm source and target-pool serving, GC, and maintenance stay stopped through root admission
+        #[arg(long)]
+        confirm_offline: bool,
     },
     /// Debug commands for inspecting the database
     Debug {

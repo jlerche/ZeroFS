@@ -31,16 +31,23 @@ const SEGMENT_EPOCH_PREFIX: &str = "segment-epochs";
 const LEGACY_SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 1;
 const SEGMENT_EPOCH_RESERVATION_VERSION: u32 = 2;
 const SEGMENT_POOL_GENESIS_PATH: &str = "segment-pool-genesis.json";
-const SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
+const LEGACY_SEGMENT_POOL_GENESIS_VERSION: u32 = 1;
+const SEGMENT_POOL_GENESIS_VERSION: u32 = 2;
 const SEGMENT_POOL_AUTH_INFO: &[u8] = b"zerofs-v1-segment-pool-authority";
 const SEGMENT_UPLOAD_PREFIX: &str = "segment-uploads";
 const PRIVATE_GC_ARTIFACT_PREFIX: &str = "private-gc-artifacts";
+const LEGACY_MIGRATION_PREFIX: &str = "legacy-segment-migrations";
+const LEGACY_SEGMENT_CLAIM_PREFIX: &str = "legacy-segment-claims";
+const LEGACY_MIGRATION_BOOTSTRAP_PREFIX: &str = "legacy-migration-bootstraps";
+const LEGACY_MIGRATION_VERSION: u32 = 1;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SegmentPoolGenesis {
     schema_version: u32,
     pool_id: uuid::Uuid,
     creator_database_identity: String,
+    #[serde(default)]
+    legacy_source: Option<LegacyMigrationSource>,
     auth_tag: [u8; 32],
 }
 
@@ -48,6 +55,21 @@ struct SegmentPoolGenesis {
 pub struct SegmentPoolAuthority {
     pool_id: uuid::Uuid,
     auth_key: [u8; 32],
+    legacy_source: Option<LegacyMigrationSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct LegacyMigrationSource {
+    database_identity: String,
+    database_instance_id: uuid::Uuid,
+    wrapped_key_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct LegacyMigrationBootstrap {
+    schema_version: u32,
+    database_identity: String,
+    database_instance_id: uuid::Uuid,
 }
 
 /// Exact storage-authenticated identity of one branch-owned writer epoch.
@@ -76,7 +98,7 @@ pub(crate) struct SegmentObjectIdentity {
     pub(crate) content_digest: [u8; 32],
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct SegmentEpochReservation {
     schema_version: u32,
     pool_id: uuid::Uuid,
@@ -86,6 +108,88 @@ struct SegmentEpochReservation {
     #[serde(default)]
     branch_id: Option<uuid::Uuid>,
     auth_tag: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct LegacyMigrationIntent {
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    migration_id: uuid::Uuid,
+    database_identity: String,
+    database_instance_id: uuid::Uuid,
+    wrapped_key_digest: [u8; 32],
+    initial_segment_count: u64,
+    initial_total_bytes: u64,
+    initial_inventory_fingerprint: [u8; 32],
+    auth_tag: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct LegacySegmentClaim {
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    migration_id: uuid::Uuid,
+    database_identity: String,
+    database_instance_id: uuid::Uuid,
+    wrapped_key_digest: [u8; 32],
+    segid: Segid,
+    size: u64,
+    content_digest: [u8; 32],
+    auth_tag: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct LegacyMigrationCompletion {
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    migration_id: uuid::Uuid,
+    database_identity: String,
+    database_instance_id: uuid::Uuid,
+    wrapped_key_digest: [u8; 32],
+    segment_count: u64,
+    total_bytes: u64,
+    inventory_fingerprint: [u8; 32],
+    auth_tag: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationReport {
+    pub migration_id: uuid::Uuid,
+    pub segment_count: u64,
+    pub total_bytes: u64,
+    pub inventory_fingerprint: [u8; 32],
+}
+
+#[derive(Default)]
+struct LegacyInventory {
+    segment_count: u64,
+    total_bytes: u64,
+    fingerprint: [u8; 32],
+}
+
+impl LegacyInventory {
+    fn include(&mut self, segid: Segid, size: u64, content_digest: [u8; 32]) -> Result<()> {
+        self.segment_count = self.segment_count.checked_add(1).ok_or_else(|| {
+            SegmentStoreError::ObjectStore("legacy migration segment count overflow".to_string())
+        })?;
+        self.total_bytes = self.total_bytes.checked_add(size).ok_or_else(|| {
+            SegmentStoreError::ObjectStore("legacy migration byte count overflow".to_string())
+        })?;
+        let item = Sha256::digest(
+            [
+                b"legacy-inventory-item".as_slice(),
+                &segid.epoch.to_be_bytes(),
+                &segid.counter.to_be_bytes(),
+                &size.to_be_bytes(),
+                &content_digest,
+            ]
+            .concat(),
+        );
+        for (accumulator, byte) in self.fingerprint.iter_mut().zip(item) {
+            *accumulator ^= byte;
+        }
+        Ok(())
+    }
 }
 
 fn derive_pool_auth_key(master_key: &[u8; 32]) -> [u8; 32] {
@@ -114,14 +218,29 @@ fn authentication_tag_is_valid(key: &[u8; 32], fields: &[&[u8]], tag: &[u8; 32])
     mac.verify_slice(tag).is_ok()
 }
 
-fn genesis_tag(key: &[u8; 32], pool_id: uuid::Uuid, database_identity: &str) -> [u8; 32] {
+fn genesis_tag(
+    key: &[u8; 32],
+    schema_version: u32,
+    pool_id: uuid::Uuid,
+    database_identity: &str,
+    legacy_source: Option<&LegacyMigrationSource>,
+) -> [u8; 32] {
+    let absent_uuid = [0u8; 16];
+    let absent_digest = [0u8; 32];
     authentication_tag(
         key,
         &[
             b"genesis",
-            &SEGMENT_POOL_GENESIS_VERSION.to_be_bytes(),
+            &schema_version.to_be_bytes(),
             pool_id.as_bytes(),
             database_identity.as_bytes(),
+            legacy_source.map_or(&[][..], |source| source.database_identity.as_bytes()),
+            legacy_source.map_or(absent_uuid.as_slice(), |source| {
+                source.database_instance_id.as_bytes()
+            }),
+            legacy_source.map_or(absent_digest.as_slice(), |source| {
+                source.wrapped_key_digest.as_slice()
+            }),
         ],
     )
 }
@@ -216,6 +335,106 @@ fn reservation_tag_is_valid(
     }
 }
 
+fn legacy_migration_id(authority: &SegmentPoolAuthority, database_identity: &str) -> uuid::Uuid {
+    let digest = authentication_tag(
+        &authority.auth_key,
+        &[
+            b"legacy-migration-id",
+            authority.pool_id.as_bytes(),
+            database_identity.as_bytes(),
+        ],
+    );
+    let mut bytes: [u8; 16] = digest[..16].try_into().expect("digest prefix is 16 bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn legacy_intent_tag(authority: &SegmentPoolAuthority, intent: &LegacyMigrationIntent) -> [u8; 32] {
+    authentication_tag(
+        &authority.auth_key,
+        &[
+            b"legacy-migration-intent",
+            &LEGACY_MIGRATION_VERSION.to_be_bytes(),
+            authority.pool_id.as_bytes(),
+            intent.migration_id.as_bytes(),
+            intent.database_identity.as_bytes(),
+            intent.database_instance_id.as_bytes(),
+            &intent.wrapped_key_digest,
+            &intent.initial_segment_count.to_be_bytes(),
+            &intent.initial_total_bytes.to_be_bytes(),
+            &intent.initial_inventory_fingerprint,
+        ],
+    )
+}
+
+fn legacy_claim_tag(authority: &SegmentPoolAuthority, claim: &LegacySegmentClaim) -> [u8; 32] {
+    authentication_tag(
+        &authority.auth_key,
+        &[
+            b"legacy-segment-claim",
+            &claim.schema_version.to_be_bytes(),
+            claim.pool_id.as_bytes(),
+            claim.migration_id.as_bytes(),
+            claim.database_identity.as_bytes(),
+            claim.database_instance_id.as_bytes(),
+            &claim.wrapped_key_digest,
+            &claim.segid.epoch.to_be_bytes(),
+            &claim.segid.counter.to_be_bytes(),
+            &claim.size.to_be_bytes(),
+            &claim.content_digest,
+        ],
+    )
+}
+
+fn legacy_completion_tag(
+    authority: &SegmentPoolAuthority,
+    completion: &LegacyMigrationCompletion,
+) -> [u8; 32] {
+    authentication_tag(
+        &authority.auth_key,
+        &[
+            b"legacy-migration-completion",
+            &completion.schema_version.to_be_bytes(),
+            completion.pool_id.as_bytes(),
+            completion.migration_id.as_bytes(),
+            completion.database_identity.as_bytes(),
+            completion.database_instance_id.as_bytes(),
+            &completion.wrapped_key_digest,
+            &completion.segment_count.to_be_bytes(),
+            &completion.total_bytes.to_be_bytes(),
+            &completion.inventory_fingerprint,
+        ],
+    )
+}
+
+fn legacy_intent_path(migration_id: uuid::Uuid) -> Path {
+    Path::from(format!(
+        "{LEGACY_MIGRATION_PREFIX}/{migration_id}/intent.json"
+    ))
+}
+
+fn legacy_claim_path(segid: Segid) -> Path {
+    Path::from(format!(
+        "{LEGACY_SEGMENT_CLAIM_PREFIX}/{:02x}/{:016x}/{:016x}.json",
+        segid.counter & 0xff,
+        segid.epoch,
+        segid.counter
+    ))
+}
+
+fn legacy_completion_path(migration_id: uuid::Uuid) -> Path {
+    Path::from(format!(
+        "{LEGACY_MIGRATION_PREFIX}/{migration_id}/completion.json"
+    ))
+}
+
+fn legacy_bootstrap_path(database_instance_id: uuid::Uuid) -> Path {
+    Path::from(format!(
+        "{LEGACY_MIGRATION_BOOTSTRAP_PREFIX}/{database_instance_id}.json"
+    ))
+}
+
 async fn load_pool_authority(
     object_store: &Arc<dyn ObjectStore>,
     auth_key: [u8; 32],
@@ -234,20 +453,33 @@ async fn load_pool_authority(
     let genesis: SegmentPoolGenesis = serde_json::from_slice(&bytes).map_err(|error| {
         SegmentStoreError::ObjectStore(format!("invalid shared segment-pool genesis: {error}"))
     })?;
-    let valid_tag = authentication_tag_is_valid(
-        &auth_key,
-        &[
-            b"genesis",
-            &SEGMENT_POOL_GENESIS_VERSION.to_be_bytes(),
-            genesis.pool_id.as_bytes(),
-            genesis.creator_database_identity.as_bytes(),
-        ],
-        &genesis.auth_tag,
-    );
-    if genesis.schema_version != SEGMENT_POOL_GENESIS_VERSION
-        || genesis.pool_id.is_nil()
-        || !valid_tag
-    {
+    let valid_tag = match genesis.schema_version {
+        LEGACY_SEGMENT_POOL_GENESIS_VERSION => {
+            genesis.legacy_source.is_none()
+                && authentication_tag_is_valid(
+                    &auth_key,
+                    &[
+                        b"genesis",
+                        &LEGACY_SEGMENT_POOL_GENESIS_VERSION.to_be_bytes(),
+                        genesis.pool_id.as_bytes(),
+                        genesis.creator_database_identity.as_bytes(),
+                    ],
+                    &genesis.auth_tag,
+                )
+        }
+        SEGMENT_POOL_GENESIS_VERSION => {
+            genesis.auth_tag
+                == genesis_tag(
+                    &auth_key,
+                    genesis.schema_version,
+                    genesis.pool_id,
+                    &genesis.creator_database_identity,
+                    genesis.legacy_source.as_ref(),
+                )
+        }
+        _ => false,
+    };
+    if genesis.pool_id.is_nil() || !valid_tag {
         return Err(SegmentStoreError::ObjectStore(
             "shared segment-pool genesis is unauthenticated or unsupported".to_string(),
         ));
@@ -255,6 +487,7 @@ async fn load_pool_authority(
     Ok(Some(SegmentPoolAuthority {
         pool_id: genesis.pool_id,
         auth_key,
+        legacy_source: genesis.legacy_source,
     }))
 }
 
@@ -308,6 +541,148 @@ pub struct SegmentStore {
     warm: Option<SegmentWarmHook>,
 }
 
+fn legacy_relative_segment_key(database_path: &Path, location: &Path) -> Result<(String, Segid)> {
+    let database = database_path.to_string();
+    let location = location.to_string();
+    let relative = if database.is_empty() {
+        location.as_str()
+    } else {
+        location
+            .strip_prefix(&database)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "legacy segment {location} is outside database {database}"
+                ))
+            })?
+    };
+    let segid = Segid::from_object_key(relative)
+        .filter(|segid| segid.object_key() == relative)
+        .ok_or_else(|| {
+            SegmentStoreError::ObjectStore(format!(
+                "legacy database contains a noncanonical segment key: {location}"
+            ))
+        })?;
+    Ok((relative.to_string(), segid))
+}
+
+fn path_below(parent: &Path, relative: &str) -> Path {
+    if parent.as_ref().is_empty() {
+        Path::from(relative)
+    } else {
+        Path::from(format!("{parent}/{relative}"))
+    }
+}
+
+async fn digest_object(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+) -> Result<(u64, [u8; 32])> {
+    let result = object_store
+        .get(path)
+        .await
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+    let expected_size = result.meta.size;
+    let mut stream = result.into_stream();
+    let mut size = 0u64;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+        size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+            SegmentStoreError::ObjectStore("object digest length overflow".to_string())
+        })?;
+        hasher.update(&chunk);
+    }
+    if size != expected_size {
+        return Err(SegmentStoreError::ObjectStore(format!(
+            "object {path} body length disagrees with metadata"
+        )));
+    }
+    Ok((size, hasher.finalize().into()))
+}
+
+async fn verify_segment_key_matches_footer(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    expected: Segid,
+) -> Result<()> {
+    let result = object_store
+        .get_opts(
+            path,
+            GetOptions {
+                range: Some(GetRange::Suffix(FOOTER_LEN as u64)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+    let object_size = result.meta.size;
+    let footer = result
+        .bytes()
+        .await
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+    let actual = crate::segment::parse_footer(&footer, object_size)?.segid;
+    if actual != expected {
+        return Err(SegmentError::SegidMismatch {
+            expected,
+            found: actual,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+async fn load_json<T: serde::de::DeserializeOwned>(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+) -> Result<Option<T>> {
+    let result = match object_store.get(path).await {
+        Ok(result) => result,
+        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+    };
+    let bytes = result
+        .bytes()
+        .await
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))
+}
+
+async fn create_json_exact<T>(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    record: &T,
+) -> Result<bool>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    let payload = serde_json::to_vec(record)
+        .map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+    match object_store
+        .put_opts(path, payload.into(), PutOptions::from(PutMode::Create))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+            let existing = load_json::<T>(object_store, path).await?.ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "immutable object {path} disappeared after create conflict"
+                ))
+            })?;
+            if existing == *record {
+                Ok(false)
+            } else {
+                Err(SegmentStoreError::ObjectStore(format!(
+                    "immutable object {path} conflicts with this migration"
+                )))
+            }
+        }
+        Err(error) => Err(SegmentStoreError::ObjectStore(error.to_string())),
+    }
+}
+
 impl SegmentStore {
     /// Create a fresh writer term over the same authenticated pool and codec.
     /// The caller must have already reserved `epoch`; counters restart at zero
@@ -333,6 +708,84 @@ impl SegmentStore {
         database_identity: &str,
         allow_create: bool,
     ) -> Result<SegmentPoolAuthority> {
+        Self::open_or_create_pool_authority_inner(
+            object_store,
+            master_key,
+            database_identity,
+            allow_create,
+            None,
+        )
+        .await
+    }
+
+    /// Publish a create-only fail-closed bootstrap before copying a legacy key
+    /// into a fresh pool. If the command crashes before authenticated genesis,
+    /// ordinary startup refuses to reinterpret the half-created pool as native.
+    pub async fn mark_legacy_pool_bootstrap(
+        pool_store: &Arc<dyn ObjectStore>,
+        database_identity: &str,
+        database_instance_id: uuid::Uuid,
+    ) -> Result<()> {
+        if database_identity.is_empty()
+            || database_identity.len() > 4 * 1024
+            || database_instance_id.is_nil()
+        {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy bootstrap requires a bounded path and non-nil database identity"
+                    .to_string(),
+            ));
+        }
+        create_json_exact(
+            pool_store,
+            &legacy_bootstrap_path(database_instance_id),
+            &LegacyMigrationBootstrap {
+                schema_version: LEGACY_MIGRATION_VERSION,
+                database_identity: database_identity.to_string(),
+                database_instance_id,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Establish the first pool genesis with an authenticated, non-clearable
+    /// requirement for this exact legacy database incarnation to complete its
+    /// import before serving. Existing pools use an authenticated intent for
+    /// each additional legacy source.
+    pub async fn open_or_create_legacy_pool_authority(
+        object_store: Arc<dyn ObjectStore>,
+        master_key: &[u8; 32],
+        database_identity: &str,
+        database_instance_id: uuid::Uuid,
+        wrapped_key_digest: [u8; 32],
+    ) -> Result<SegmentPoolAuthority> {
+        if database_instance_id.is_nil() {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy database instance identity must be non-nil".to_string(),
+            ));
+        }
+        let source = LegacyMigrationSource {
+            database_identity: database_identity.to_string(),
+            database_instance_id,
+            wrapped_key_digest,
+        };
+        Self::open_or_create_pool_authority_inner(
+            object_store,
+            master_key,
+            database_identity,
+            true,
+            Some(source),
+        )
+        .await
+    }
+
+    async fn open_or_create_pool_authority_inner(
+        object_store: Arc<dyn ObjectStore>,
+        master_key: &[u8; 32],
+        database_identity: &str,
+        allow_create: bool,
+        legacy_source: Option<LegacyMigrationSource>,
+    ) -> Result<SegmentPoolAuthority> {
         if database_identity.len() > 4 * 1024 {
             return Err(SegmentStoreError::ObjectStore(
                 "segment-pool database identity must contain at most 4096 bytes".to_string(),
@@ -350,15 +803,40 @@ impl SegmentStore {
         }
 
         let mut objects = object_store.list(None);
+        let mut has_wrapped_key = false;
         while let Some(object) = objects.next().await {
             let object =
                 object.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
-            if object.location.as_ref() != "zerofs.key" {
+            has_wrapped_key |= object.location.as_ref() == "zerofs.key";
+            let allowed_bootstrap = if legacy_source.as_ref().is_some_and(|source| {
+                object.location == legacy_bootstrap_path(source.database_instance_id)
+            }) {
+                if let Some(source) = legacy_source.as_ref() {
+                    load_json::<LegacyMigrationBootstrap>(&object_store, &object.location)
+                        .await?
+                        .is_some_and(|bootstrap| {
+                            bootstrap.schema_version == LEGACY_MIGRATION_VERSION
+                                && bootstrap.database_identity == source.database_identity
+                                && bootstrap.database_instance_id == source.database_instance_id
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if object.location.as_ref() != "zerofs.key" && !allowed_bootstrap {
                 return Err(SegmentStoreError::ObjectStore(format!(
                     "cannot establish shared segment-pool genesis because {} already exists",
                     object.location
                 )));
             }
+        }
+        if legacy_source.is_some() && !has_wrapped_key {
+            return Err(SegmentStoreError::ObjectStore(
+                "cannot establish legacy shared-pool genesis before its exact wrapped key exists"
+                    .to_string(),
+            ));
         }
 
         let pool_id = uuid::Uuid::new_v4();
@@ -366,7 +844,18 @@ impl SegmentStore {
             schema_version: SEGMENT_POOL_GENESIS_VERSION,
             pool_id,
             creator_database_identity: database_identity.to_string(),
-            auth_tag: genesis_tag(&auth_key, pool_id, database_identity),
+            legacy_source,
+            auth_tag: [0; 32],
+        };
+        let genesis = SegmentPoolGenesis {
+            auth_tag: genesis_tag(
+                &auth_key,
+                genesis.schema_version,
+                genesis.pool_id,
+                &genesis.creator_database_identity,
+                genesis.legacy_source.as_ref(),
+            ),
+            ..genesis
         };
         let create = object_store
             .put_opts(
@@ -378,7 +867,11 @@ impl SegmentStore {
             )
             .await;
         if create.is_ok() {
-            return Ok(SegmentPoolAuthority { pool_id, auth_key });
+            return Ok(SegmentPoolAuthority {
+                pool_id,
+                auth_key,
+                legacy_source: genesis.legacy_source,
+            });
         }
         if let Some(authority) = load_pool_authority(&object_store, auth_key).await? {
             return Ok(authority);
@@ -398,7 +891,6 @@ impl SegmentStore {
         authority: &SegmentPoolAuthority,
     ) -> Result<()> {
         let mut segments = object_store.list(Some(&Path::from("segments")));
-        let mut verified = HashSet::new();
         while let Some(object) = segments.next().await {
             let object = object.map_err(|error| {
                 SegmentStoreError::ObjectStore(format!(
@@ -412,9 +904,6 @@ impl SegmentStore {
                     "shared segment pool contains a noncanonical segment key: {key}"
                 ))
             })?;
-            if !verified.insert(segid.epoch) {
-                continue;
-            }
             let marker_path =
                 Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{:016x}.json", segid.epoch));
             let marker = object_store
@@ -451,6 +940,502 @@ impl SegmentStore {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Import one offline legacy database's per-database segments without
+    /// changing any `Segid`/`FrameLoc`. The first attempt rejects every target
+    /// collision before publishing an authenticated intent. Retries reconcile
+    /// only objects protected by exact per-segment claims.
+    pub async fn migrate_legacy_segments(
+        object_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_path: &Path,
+        segment_pool_path: &Path,
+        database_instance_id: uuid::Uuid,
+        wrapped_key_digest: [u8; 32],
+    ) -> Result<LegacyMigrationReport> {
+        let database_identity = database_path.to_string();
+        if database_identity.is_empty() || database_identity.len() > 4 * 1024 {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy migration database identity must contain 1..=4096 bytes".to_string(),
+            ));
+        }
+        let pool_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                segment_pool_path.clone(),
+            ));
+        if database_instance_id.is_nil() {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy database instance identity must be non-nil".to_string(),
+            ));
+        }
+        let migration_id = legacy_migration_id(authority, &database_identity);
+        Self::legacy_migration_required(
+            &pool_store,
+            authority,
+            &database_identity,
+            database_instance_id,
+        )
+        .await?;
+        if let Some(report) = Self::legacy_migration_completion(
+            &pool_store,
+            authority,
+            &database_identity,
+            database_instance_id,
+            Some(wrapped_key_digest),
+        )
+        .await?
+        {
+            return Ok(report);
+        }
+
+        let intent_path = legacy_intent_path(migration_id);
+        let existing_intent = load_json::<LegacyMigrationIntent>(&pool_store, &intent_path).await?;
+        let intent = if let Some(intent) = existing_intent {
+            intent
+        } else {
+            // A first attempt must prove the target has no duplicate physical
+            // identity and durably bind the complete initial source inventory
+            // before it creates any migration-owned object.
+            let mut initial = LegacyInventory::default();
+            let source_prefix = database_path.clone().join("segments");
+            let mut source = object_store.list(Some(&source_prefix));
+            while let Some(object) = source.next().await {
+                let object = object.map_err(|error| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "failed to inventory legacy segments: {error}"
+                    ))
+                })?;
+                let (relative, segid) =
+                    legacy_relative_segment_key(database_path, &object.location)?;
+                let target = path_below(segment_pool_path, &relative);
+                match object_store.head(&target).await {
+                    Err(slatedb::object_store::Error::NotFound { .. }) => {}
+                    Ok(_) => {
+                        return Err(SegmentStoreError::ObjectStore(format!(
+                            "legacy migration rejects duplicate physical segment {relative}"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(SegmentStoreError::ObjectStore(format!(
+                            "failed to inspect migration target {target}: {error}"
+                        )));
+                    }
+                }
+                verify_segment_key_matches_footer(&object_store, &object.location, segid).await?;
+                let (size, content_digest) = digest_object(&object_store, &object.location).await?;
+                initial.include(segid, size, content_digest)?;
+            }
+            let mut intent = LegacyMigrationIntent {
+                schema_version: LEGACY_MIGRATION_VERSION,
+                pool_id: authority.pool_id,
+                migration_id,
+                database_identity: database_identity.clone(),
+                database_instance_id,
+                wrapped_key_digest,
+                initial_segment_count: initial.segment_count,
+                initial_total_bytes: initial.total_bytes,
+                initial_inventory_fingerprint: initial.fingerprint,
+                auth_tag: [0; 32],
+            };
+            intent.auth_tag = legacy_intent_tag(authority, &intent);
+            intent
+        };
+        create_json_exact(&pool_store, &intent_path, &intent).await?;
+
+        let source_prefix = database_path.clone().join("segments");
+        let mut source = object_store.list(Some(&source_prefix));
+        while let Some(object) = source.next().await {
+            let object = object.map_err(|error| {
+                SegmentStoreError::ObjectStore(format!(
+                    "failed to inventory legacy segments: {error}"
+                ))
+            })?;
+            let (relative, segid) = legacy_relative_segment_key(database_path, &object.location)?;
+            Self::reserve_imported_epoch(Arc::clone(&pool_store), authority, segid.epoch).await?;
+            verify_segment_key_matches_footer(&object_store, &object.location, segid).await?;
+            let (size, content_digest) = digest_object(&object_store, &object.location).await?;
+            let mut claim = LegacySegmentClaim {
+                schema_version: LEGACY_MIGRATION_VERSION,
+                pool_id: authority.pool_id,
+                migration_id,
+                database_identity: database_identity.clone(),
+                database_instance_id,
+                wrapped_key_digest,
+                segid,
+                size,
+                content_digest,
+                auth_tag: [0; 32],
+            };
+            claim.auth_tag = legacy_claim_tag(authority, &claim);
+            let claim_path = legacy_claim_path(segid);
+            let claim_existed = load_json::<LegacySegmentClaim>(&pool_store, &claim_path)
+                .await?
+                .is_some();
+            if !claim_existed {
+                let target = path_below(segment_pool_path, &relative);
+                match object_store.head(&target).await {
+                    Err(slatedb::object_store::Error::NotFound { .. }) => {}
+                    Ok(_) => {
+                        return Err(SegmentStoreError::ObjectStore(format!(
+                            "legacy migration rejects unclaimed physical segment {relative}"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(SegmentStoreError::ObjectStore(error.to_string()));
+                    }
+                }
+            }
+            let claim_created = create_json_exact(&pool_store, &claim_path, &claim).await?;
+            let target = path_below(segment_pool_path, &relative);
+            match object_store
+                .copy_opts(
+                    &object.location,
+                    &target,
+                    CopyOptions {
+                        mode: CopyMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(slatedb::object_store::Error::AlreadyExists { .. }) if !claim_created => {}
+                Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                    return Err(SegmentStoreError::ObjectStore(format!(
+                        "physical segment {relative} appeared after its migration preflight"
+                    )));
+                }
+                Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+            }
+            let target_identity = digest_object(&object_store, &target).await?;
+            if target_identity != (size, content_digest) {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "copied physical segment {relative} does not match its immutable source"
+                )));
+            }
+        }
+
+        // A second full pass catches source additions, removals, or changes and
+        // authenticates every target against its immutable claim before the
+        // completion record makes startup legal.
+        let mut verified = LegacyInventory::default();
+        let source_prefix = database_path.clone().join("segments");
+        let mut source = object_store.list(Some(&source_prefix));
+        while let Some(object) = source.next().await {
+            let object = object.map_err(|error| {
+                SegmentStoreError::ObjectStore(format!(
+                    "failed to verify legacy inventory: {error}"
+                ))
+            })?;
+            let (relative, segid) = legacy_relative_segment_key(database_path, &object.location)?;
+            verify_segment_key_matches_footer(&object_store, &object.location, segid).await?;
+            let (size, content_digest) = digest_object(&object_store, &object.location).await?;
+            let claim = load_json::<LegacySegmentClaim>(&pool_store, &legacy_claim_path(segid))
+                .await?
+                .ok_or_else(|| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "legacy segment {relative} has no immutable import claim"
+                    ))
+                })?;
+            if claim.schema_version != LEGACY_MIGRATION_VERSION
+                || claim.pool_id != authority.pool_id
+                || claim.migration_id != migration_id
+                || claim.database_identity != database_identity
+                || claim.database_instance_id != database_instance_id
+                || claim.wrapped_key_digest != wrapped_key_digest
+                || claim.segid != segid
+                || claim.size != size
+                || claim.content_digest != content_digest
+                || claim.auth_tag != legacy_claim_tag(authority, &claim)
+            {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "legacy segment {relative} has a conflicting or unauthenticated claim"
+                )));
+            }
+            let target = path_below(segment_pool_path, &relative);
+            if digest_object(&object_store, &target).await? != (size, content_digest) {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "migration target {relative} changed before completion"
+                )));
+            }
+            verified.include(segid, size, content_digest)?;
+        }
+        // The durable pool-global claim set is the inventory boundary across
+        // crashes. Enumerating it prevents a retry from forgetting a segment
+        // which disappeared from the source after its claim was published.
+        let mut claimed = LegacyInventory::default();
+        let mut claims = pool_store.list(Some(&Path::from(LEGACY_SEGMENT_CLAIM_PREFIX)));
+        while let Some(object) = claims.next().await {
+            let object = object.map_err(|error| {
+                SegmentStoreError::ObjectStore(format!(
+                    "failed to inventory durable legacy claims: {error}"
+                ))
+            })?;
+            let claim = load_json::<LegacySegmentClaim>(&pool_store, &object.location)
+                .await?
+                .ok_or_else(|| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "legacy claim {} disappeared during verification",
+                        object.location
+                    ))
+                })?;
+            if claim.schema_version != LEGACY_MIGRATION_VERSION
+                || claim.pool_id != authority.pool_id
+                || claim.database_instance_id.is_nil()
+                || claim.auth_tag != legacy_claim_tag(authority, &claim)
+                || legacy_claim_path(claim.segid) != object.location
+            {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "pool contains a corrupt or noncanonical legacy claim: {}",
+                    object.location
+                )));
+            }
+            if claim.migration_id != migration_id {
+                continue;
+            }
+            if claim.database_identity != database_identity
+                || claim.database_instance_id != database_instance_id
+                || claim.wrapped_key_digest != wrapped_key_digest
+            {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "migration claim {} is bound to another legacy incarnation",
+                    object.location
+                )));
+            }
+            let target = path_below(segment_pool_path, &claim.segid.object_key());
+            if digest_object(&object_store, &target).await? != (claim.size, claim.content_digest) {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "claimed migration target {} is absent or changed",
+                    claim.segid.object_key()
+                )));
+            }
+            claimed.include(claim.segid, claim.size, claim.content_digest)?;
+        }
+        if claimed.segment_count != verified.segment_count
+            || claimed.total_bytes != verified.total_bytes
+            || claimed.fingerprint != verified.fingerprint
+            || claimed.segment_count != intent.initial_segment_count
+            || claimed.total_bytes != intent.initial_total_bytes
+            || claimed.fingerprint != intent.initial_inventory_fingerprint
+        {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy segment inventory differs from its durable migration intent or claims"
+                    .to_string(),
+            ));
+        }
+        let mut completion = LegacyMigrationCompletion {
+            schema_version: LEGACY_MIGRATION_VERSION,
+            pool_id: authority.pool_id,
+            migration_id,
+            database_identity: database_identity.clone(),
+            database_instance_id,
+            wrapped_key_digest,
+            segment_count: claimed.segment_count,
+            total_bytes: claimed.total_bytes,
+            inventory_fingerprint: claimed.fingerprint,
+            auth_tag: [0; 32],
+        };
+        completion.auth_tag = legacy_completion_tag(authority, &completion);
+        create_json_exact(
+            &pool_store,
+            &legacy_completion_path(migration_id),
+            &completion,
+        )
+        .await?;
+        Ok(LegacyMigrationReport {
+            migration_id,
+            segment_count: completion.segment_count,
+            total_bytes: completion.total_bytes,
+            inventory_fingerprint: completion.inventory_fingerprint,
+        })
+    }
+
+    /// Authenticate the immutable completion record for one legacy database.
+    /// Startup uses this before allowing old per-database segment objects to
+    /// coexist with the configured shared pool.
+    pub async fn legacy_migration_required(
+        pool_store: &Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_identity: &str,
+        database_instance_id: uuid::Uuid,
+    ) -> Result<bool> {
+        if database_instance_id.is_nil() {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy database instance identity must be non-nil".to_string(),
+            ));
+        }
+        let mut required = false;
+        let mut bootstraps = pool_store.list(Some(&Path::from(LEGACY_MIGRATION_BOOTSTRAP_PREFIX)));
+        while let Some(object) = bootstraps.next().await {
+            let object =
+                object.map_err(|error| SegmentStoreError::ObjectStore(error.to_string()))?;
+            let bootstrap = load_json::<LegacyMigrationBootstrap>(pool_store, &object.location)
+                .await?
+                .ok_or_else(|| {
+                    SegmentStoreError::ObjectStore(format!(
+                        "legacy migration bootstrap {} disappeared",
+                        object.location
+                    ))
+                })?;
+            if bootstrap.schema_version != LEGACY_MIGRATION_VERSION
+                || bootstrap.database_instance_id.is_nil()
+                || legacy_bootstrap_path(bootstrap.database_instance_id) != object.location
+            {
+                return Err(SegmentStoreError::ObjectStore(format!(
+                    "pool contains a corrupt legacy migration bootstrap: {}",
+                    object.location
+                )));
+            }
+            if bootstrap.database_identity == database_identity {
+                if bootstrap.database_instance_id != database_instance_id {
+                    return Err(SegmentStoreError::ObjectStore(
+                        "legacy migration bootstrap is bound to a different database incarnation"
+                            .to_string(),
+                    ));
+                }
+                required = true;
+            }
+        }
+        if let Some(source) = authority.legacy_source.as_ref() {
+            if source.database_identity == database_identity {
+                if source.database_instance_id != database_instance_id {
+                    return Err(SegmentStoreError::ObjectStore(
+                        "shared-pool genesis is bound to a different legacy database incarnation"
+                            .to_string(),
+                    ));
+                }
+                required = true;
+            } else if source.database_instance_id == database_instance_id {
+                return Err(SegmentStoreError::ObjectStore(
+                    "legacy database incarnation moved after shared-pool genesis".to_string(),
+                ));
+            }
+        }
+        let migration_id = legacy_migration_id(authority, database_identity);
+        if let Some(intent) =
+            load_json::<LegacyMigrationIntent>(pool_store, &legacy_intent_path(migration_id))
+                .await?
+        {
+            if intent.schema_version != LEGACY_MIGRATION_VERSION
+                || intent.pool_id != authority.pool_id
+                || intent.migration_id != migration_id
+                || intent.database_identity != database_identity
+                || intent.database_instance_id != database_instance_id
+                || intent.auth_tag != legacy_intent_tag(authority, &intent)
+            {
+                return Err(SegmentStoreError::ObjectStore(
+                    "legacy migration intent is unauthenticated or conflicts with this database"
+                        .to_string(),
+                ));
+            }
+            if authority.legacy_source.as_ref().is_some_and(|genesis| {
+                genesis.database_identity == database_identity
+                    && (genesis.database_instance_id != intent.database_instance_id
+                        || genesis.wrapped_key_digest != intent.wrapped_key_digest)
+            }) {
+                return Err(SegmentStoreError::ObjectStore(
+                    "legacy migration intent conflicts with the source bound into pool genesis"
+                        .to_string(),
+                ));
+            }
+            required = true;
+        }
+        Ok(required)
+    }
+
+    pub async fn legacy_migration_completion(
+        pool_store: &Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        database_identity: &str,
+        database_instance_id: uuid::Uuid,
+        expected_wrapped_key_digest: Option<[u8; 32]>,
+    ) -> Result<Option<LegacyMigrationReport>> {
+        let migration_id = legacy_migration_id(authority, database_identity);
+        let Some(completion) = load_json::<LegacyMigrationCompletion>(
+            pool_store,
+            &legacy_completion_path(migration_id),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let intent =
+            load_json::<LegacyMigrationIntent>(pool_store, &legacy_intent_path(migration_id))
+                .await?
+                .ok_or_else(|| {
+                    SegmentStoreError::ObjectStore(
+                        "legacy migration completion has no immutable intent".to_string(),
+                    )
+                })?;
+        if completion.schema_version != LEGACY_MIGRATION_VERSION
+            || completion.pool_id != authority.pool_id
+            || completion.migration_id != migration_id
+            || completion.database_identity != database_identity
+            || completion.database_instance_id != database_instance_id
+            || expected_wrapped_key_digest
+                .is_some_and(|digest| digest != completion.wrapped_key_digest)
+            || intent.schema_version != LEGACY_MIGRATION_VERSION
+            || intent.pool_id != authority.pool_id
+            || intent.migration_id != migration_id
+            || intent.database_identity != completion.database_identity
+            || intent.database_instance_id != completion.database_instance_id
+            || intent.wrapped_key_digest != completion.wrapped_key_digest
+            || intent.initial_segment_count != completion.segment_count
+            || intent.initial_total_bytes != completion.total_bytes
+            || intent.initial_inventory_fingerprint != completion.inventory_fingerprint
+            || intent.auth_tag != legacy_intent_tag(authority, &intent)
+            || completion.auth_tag != legacy_completion_tag(authority, &completion)
+        {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy migration completion is unauthenticated or conflicts with this database"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(LegacyMigrationReport {
+            migration_id,
+            segment_count: completion.segment_count,
+            total_bytes: completion.total_bytes,
+            inventory_fingerprint: completion.inventory_fingerprint,
+        }))
+    }
+
+    async fn reserve_imported_epoch(
+        pool_store: Arc<dyn ObjectStore>,
+        authority: &SegmentPoolAuthority,
+        epoch: u64,
+    ) -> Result<()> {
+        if epoch == 0 {
+            return Err(SegmentStoreError::ObjectStore(
+                "legacy segment epoch zero cannot be imported".to_string(),
+            ));
+        }
+        let reservation_owner = format!("legacy-import/{}/{epoch:016x}", authority.pool_id);
+        let digest = authentication_tag(
+            &authority.auth_key,
+            &[
+                b"legacy-imported-epoch-id",
+                authority.pool_id.as_bytes(),
+                &epoch.to_be_bytes(),
+            ],
+        );
+        let mut id_bytes: [u8; 16] = digest[..16].try_into().expect("digest prefix is 16 bytes");
+        id_bytes[6] = (id_bytes[6] & 0x0f) | 0x40;
+        id_bytes[8] = (id_bytes[8] & 0x3f) | 0x80;
+        let reservation_id = uuid::Uuid::from_bytes(id_bytes);
+        let marker = SegmentEpochReservation {
+            schema_version: SEGMENT_EPOCH_RESERVATION_VERSION,
+            pool_id: authority.pool_id,
+            epoch,
+            reservation_id,
+            database_identity: reservation_owner.clone(),
+            branch_id: None,
+            auth_tag: reservation_tag(authority, epoch, reservation_id, &reservation_owner, None),
+        };
+        let path = Path::from(format!("{SEGMENT_EPOCH_PREFIX}/{epoch:016x}.json"));
+        create_json_exact(&pool_store, &path, &marker).await?;
         Ok(())
     }
 
@@ -1374,6 +2359,400 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_legacy_migration_is_exact_retryable_and_reserves_every_epoch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let database = Path::from("volume/database");
+        let database_instance_id = uuid::Uuid::new_v4();
+        let wrapped_key_digest = [8u8; 32];
+        let pool_path = Path::from("volume/segment-pool");
+        let pool_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                pool_path.clone(),
+            ));
+        pool_store
+            .put(
+                &Path::from("zerofs.key"),
+                PutPayload::from(Bytes::from_static(b"exact wrapped key")),
+            )
+            .await
+            .unwrap();
+        let authority = SegmentStore::open_or_create_legacy_pool_authority(
+            Arc::clone(&pool_store),
+            &[9u8; 32],
+            database.as_ref(),
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap();
+        assert!(
+            SegmentStore::legacy_migration_required(
+                &pool_store,
+                &authority,
+                database.as_ref(),
+                database_instance_id,
+            )
+            .await
+            .unwrap(),
+            "genesis itself durably requires completion before any intent exists"
+        );
+        let legacy_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                database.clone(),
+            ));
+        let codec = || FrameCodec::new(&[9u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let epoch_seven = SegmentStore::new(Arc::clone(&legacy_store), codec(), 7, None);
+        let epoch_eleven = SegmentStore::new(Arc::clone(&legacy_store), codec(), 11, None);
+        let mut segments = Vec::new();
+        segments.push(
+            epoch_seven
+                .seal(&[(1, 0, Bytes::from_static(b"legacy-one"))])
+                .await
+                .unwrap()[0]
+                .2
+                .segid,
+        );
+        segments.push(
+            epoch_seven
+                .seal(&[(2, 0, Bytes::from_static(b"legacy-two"))])
+                .await
+                .unwrap()[0]
+                .2
+                .segid,
+        );
+        segments.push(
+            epoch_eleven
+                .seal(&[(3, 0, Bytes::from_static(b"legacy-three"))])
+                .await
+                .unwrap()[0]
+                .2
+                .segid,
+        );
+        let expected_bytes = futures::future::try_join_all(segments.iter().map(|segid| {
+            let object_store = Arc::clone(&object_store);
+            let source = path_below(&database, &segid.object_key());
+            async move {
+                object_store
+                    .get(&source)
+                    .await?
+                    .bytes()
+                    .await
+                    .map(|bytes| (*segid, bytes))
+            }
+        }))
+        .await
+        .unwrap();
+
+        let first = SegmentStore::migrate_legacy_segments(
+            Arc::clone(&object_store),
+            &authority,
+            &database,
+            &pool_path,
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap();
+        let retry = SegmentStore::migrate_legacy_segments(
+            Arc::clone(&object_store),
+            &authority,
+            &database,
+            &pool_path,
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(first.segment_count, segments.len() as u64);
+        assert_eq!(
+            first.total_bytes,
+            expected_bytes
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            SegmentStore::legacy_migration_completion(
+                &pool_store,
+                &authority,
+                database.as_ref(),
+                database_instance_id,
+                Some(wrapped_key_digest),
+            )
+            .await
+            .unwrap(),
+            Some(first)
+        );
+        assert!(
+            SegmentStore::legacy_migration_required(
+                &pool_store,
+                &authority,
+                database.as_ref(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect_err("path reuse must not bind a new database incarnation")
+            .to_string()
+            .contains("different legacy database incarnation")
+        );
+        SegmentStore::validate_epoch_reservations(Arc::clone(&pool_store), &authority)
+            .await
+            .unwrap();
+        for (segid, bytes) in expected_bytes {
+            assert_eq!(
+                object_store
+                    .get(&path_below(&pool_path, &segid.object_key()))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_legacy_migration_rejects_cross_source_segment_ids() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first_database = Path::from("volume/first");
+        let second_database = Path::from("volume/second");
+        let pool_path = Path::from("volume/segment-pool");
+        let pool_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                pool_path.clone(),
+            ));
+        pool_store
+            .put(
+                &Path::from("zerofs.key"),
+                PutPayload::from(Bytes::from_static(b"exact wrapped key")),
+            )
+            .await
+            .unwrap();
+        let authority = SegmentStore::open_or_create_pool_authority(
+            Arc::clone(&pool_store),
+            &[4u8; 32],
+            first_database.as_ref(),
+            true,
+        )
+        .await
+        .unwrap();
+        let codec = || FrameCodec::new(&[4u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let first_instance_id = uuid::Uuid::new_v4();
+        let second_instance_id = uuid::Uuid::new_v4();
+        let wrapped_key_digest = [7u8; 32];
+        let mut segid = None;
+        for (database, bytes) in [
+            (&first_database, Bytes::from_static(b"first source")),
+            (&second_database, Bytes::from_static(b"second source")),
+        ] {
+            let legacy_store: Arc<dyn ObjectStore> =
+                Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                    Arc::clone(&object_store),
+                    database.clone(),
+                ));
+            let written = SegmentStore::new(legacy_store, codec(), 5, None)
+                .seal(&[(1, 0, bytes)])
+                .await
+                .unwrap();
+            assert_eq!(segid.get_or_insert(written[0].2.segid), &written[0].2.segid);
+        }
+        let migrate_first = || {
+            SegmentStore::migrate_legacy_segments(
+                Arc::clone(&object_store),
+                &authority,
+                &first_database,
+                &pool_path,
+                first_instance_id,
+                wrapped_key_digest,
+            )
+        };
+        let migrate_second = || {
+            SegmentStore::migrate_legacy_segments(
+                Arc::clone(&object_store),
+                &authority,
+                &second_database,
+                &pool_path,
+                second_instance_id,
+                wrapped_key_digest,
+            )
+        };
+        let (first, second) = tokio::join!(migrate_first(), migrate_second());
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "exactly one source may own the Segid"
+        );
+        let (first_retry, second_retry) = tokio::join!(migrate_first(), migrate_second());
+        assert_eq!(first.is_ok(), first_retry.is_ok());
+        assert_eq!(second.is_ok(), second_retry.is_ok());
+        let loser = match (first_retry, second_retry) {
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+            _ => panic!("exactly one retry must retain global Segid ownership"),
+        };
+        let loser = loser.to_string();
+        assert!(
+            loser.contains("conflicts with this migration")
+                || loser.contains("duplicate physical segment"),
+            "unexpected collision error: {loser}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_legacy_retry_rejects_a_removed_durable_claim() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let database = Path::from("volume/interrupted");
+        let database_instance_id = uuid::Uuid::new_v4();
+        let wrapped_key_digest = [6u8; 32];
+        let pool_path = Path::from("volume/segment-pool");
+        let pool_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                pool_path.clone(),
+            ));
+        pool_store
+            .put(
+                &Path::from("zerofs.key"),
+                PutPayload::from(Bytes::from_static(b"exact wrapped key")),
+            )
+            .await
+            .unwrap();
+        let authority = SegmentStore::open_or_create_legacy_pool_authority(
+            Arc::clone(&pool_store),
+            &[6u8; 32],
+            database.as_ref(),
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap();
+        let legacy_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+                Arc::clone(&object_store),
+                database.clone(),
+            ));
+        let codec = FrameCodec::new(&[6u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let segid = SegmentStore::new(legacy_store, codec, 12, None)
+            .seal(&[(1, 0, Bytes::from_static(b"claimed-before-crash"))])
+            .await
+            .unwrap()[0]
+            .2
+            .segid;
+        let source = path_below(&database, &segid.object_key());
+        let target = path_below(&pool_path, &segid.object_key());
+        let (size, content_digest) = digest_object(&object_store, &source).await.unwrap();
+        let migration_id = legacy_migration_id(&authority, database.as_ref());
+        let mut initial = LegacyInventory::default();
+        initial.include(segid, size, content_digest).unwrap();
+        let mut intent = LegacyMigrationIntent {
+            schema_version: LEGACY_MIGRATION_VERSION,
+            pool_id: authority.pool_id,
+            migration_id,
+            database_identity: database.to_string(),
+            database_instance_id,
+            wrapped_key_digest,
+            initial_segment_count: initial.segment_count,
+            initial_total_bytes: initial.total_bytes,
+            initial_inventory_fingerprint: initial.fingerprint,
+            auth_tag: [0; 32],
+        };
+        intent.auth_tag = legacy_intent_tag(&authority, &intent);
+        create_json_exact(&pool_store, &legacy_intent_path(migration_id), &intent)
+            .await
+            .unwrap();
+        let source_bytes = object_store
+            .get(&source)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        object_store.delete(&source).await.unwrap();
+        let error = SegmentStore::migrate_legacy_segments(
+            Arc::clone(&object_store),
+            &authority,
+            &database,
+            &pool_path,
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable migration intent or claims")
+        );
+        object_store
+            .put(&source, PutPayload::from(source_bytes))
+            .await
+            .unwrap();
+        SegmentStore::reserve_imported_epoch(Arc::clone(&pool_store), &authority, segid.epoch)
+            .await
+            .unwrap();
+        let mut claim = LegacySegmentClaim {
+            schema_version: LEGACY_MIGRATION_VERSION,
+            pool_id: authority.pool_id,
+            migration_id,
+            database_identity: database.to_string(),
+            database_instance_id,
+            wrapped_key_digest,
+            segid,
+            size,
+            content_digest,
+            auth_tag: [0; 32],
+        };
+        claim.auth_tag = legacy_claim_tag(&authority, &claim);
+        create_json_exact(&pool_store, &legacy_claim_path(segid), &claim)
+            .await
+            .unwrap();
+        object_store
+            .copy_opts(
+                &source,
+                &target,
+                CopyOptions {
+                    mode: CopyMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        object_store.delete(&source).await.unwrap();
+
+        let error = SegmentStore::migrate_legacy_segments(
+            object_store,
+            &authority,
+            &database,
+            &pool_path,
+            database_instance_id,
+            wrapped_key_digest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable migration intent or claims")
+        );
+        assert!(
+            SegmentStore::legacy_migration_completion(
+                &pool_store,
+                &authority,
+                database.as_ref(),
+                database_instance_id,
+                Some(wrapped_key_digest),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn branch_epoch_reservation_authenticates_exact_incarnation() {
         let pool: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let authority =
@@ -1478,6 +2857,30 @@ mod tests {
 
     #[tokio::test]
     async fn shared_pool_genesis_is_key_authenticated_and_empty_only() {
+        let interrupted: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        SegmentStore::mark_legacy_pool_bootstrap(
+            &interrupted,
+            "legacy/interrupted",
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let interrupted_error = match SegmentStore::open_or_create_pool_authority(
+            interrupted,
+            &[3u8; 32],
+            "legacy/interrupted",
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("bootstrap must block native genesis"),
+            Err(error) => error,
+        };
+        assert!(
+            interrupted_error.to_string().contains("cannot establish"),
+            "ordinary startup cannot reinterpret a pre-genesis migration crash"
+        );
+
         let fresh_read_only: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         assert!(
             SegmentStore::open_or_create_pool_authority(
