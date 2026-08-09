@@ -1150,6 +1150,8 @@ fn record_gc_mark_metrics(stats: &GcMarkStats) {
     metrics::counter!("zerofs_gc_roots_scanned_total").increment(stats.roots_enumerated);
     metrics::counter!("zerofs_gc_references_scanned_total").increment(stats.references_enumerated);
     metrics::counter!("zerofs_gc_unique_segments_marked_total").increment(stats.unique_segments);
+    metrics::gauge!("zerofs_gc_max_record_write_passes", "phase" => "mark")
+        .set(f64::from(stats.max_write_passes));
 }
 
 fn record_gc_inventory_metrics(stats: &GcInventoryStats) {
@@ -1158,6 +1160,8 @@ fn record_gc_inventory_metrics(stats: &GcInventoryStats) {
     metrics::counter!("zerofs_gc_quarantined_bytes_total").increment(stats.candidate_bytes);
     metrics::counter!("zerofs_gc_backlog_upper_bound_bytes_added_total")
         .increment(stats.candidate_bytes);
+    metrics::gauge!("zerofs_gc_max_record_write_passes", "phase" => "inventory")
+        .set(f64::from(stats.max_write_passes));
 }
 
 fn record_gc_report_metrics(stats: &GcInventoryStats) {
@@ -1165,6 +1169,8 @@ fn record_gc_report_metrics(stats: &GcInventoryStats) {
     metrics::counter!("zerofs_gc_reported_candidate_objects_total")
         .increment(stats.candidate_objects);
     metrics::counter!("zerofs_gc_reported_candidate_bytes_total").increment(stats.candidate_bytes);
+    metrics::gauge!("zerofs_gc_max_record_write_passes", "phase" => "report")
+        .set(f64::from(stats.max_write_passes));
 }
 
 fn record_gc_revalidation_metrics(mark: &GcMarkStats, stats: &GcRevalidationStats) {
@@ -1455,6 +1461,10 @@ mod tests {
         roots: u64,
         references: u64,
         inventory_objects: u64,
+        mark_intermediate_runs: u64,
+        mark_max_write_passes: u32,
+        inventory_intermediate_runs: u64,
+        inventory_max_write_passes: u32,
         mark_gets: u64,
         mark_puts: u64,
         mark_lists: u64,
@@ -1541,7 +1551,7 @@ mod tests {
                 let store = Arc::clone(&store);
                 let path = Path::from(format!(
                     "{segment_pool}/{}",
-                    Segid::new(8, index).object_key()
+                    Segid::new(8, index * 256).object_key()
                 ));
                 async move {
                     store
@@ -1574,10 +1584,11 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
+        let catalog_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = Arc::new(
             SlateDbCatalog::open(
                 Path::from(format!("gc-scale/{label}/catalog")),
-                Arc::clone(&store),
+                catalog_store,
             )
             .await
             .unwrap(),
@@ -1630,6 +1641,10 @@ mod tests {
             roots: mark.roots_enumerated,
             references: mark.references_enumerated,
             inventory_objects: inventory.objects_seen,
+            mark_intermediate_runs: mark.intermediate_runs,
+            mark_max_write_passes: mark.max_write_passes,
+            inventory_intermediate_runs: inventory.intermediate_runs,
+            inventory_max_write_passes: inventory.max_write_passes,
             mark_gets,
             mark_puts,
             mark_lists,
@@ -1668,6 +1683,8 @@ mod tests {
         let roots_large = gc_pipeline_probe("roots-large", 4, 1_024, 1, 1).await;
         assert_eq!(roots_large.roots, roots_small.roots * 2);
         assert_eq!(roots_large.references, roots_small.references * 2);
+        assert_gc_write_bounds(&roots_small);
+        assert_gc_write_bounds(&roots_large);
 
         let references_small = gc_pipeline_probe("references-small", 1, 20_000, 1, 256).await;
         let references_large = gc_pipeline_probe("references-large", 1, 40_000, 1, 256).await;
@@ -1675,9 +1692,11 @@ mod tests {
         assert_eq!(references_large.references, references_small.references * 2);
         assert!(references_small.mark_multipart_parts > 0);
         assert!(references_large.mark_multipart_parts > 0);
+        assert_gc_write_bounds(&references_small);
+        assert_gc_write_bounds(&references_large);
 
-        let inventory_small = gc_pipeline_probe("inventory-small", 1, 1, 2_048, 1).await;
-        let inventory_large = gc_pipeline_probe("inventory-large", 1, 1, 4_096, 1).await;
+        let inventory_small = gc_pipeline_probe("inventory-small", 1, 1, 20_000, 1).await;
+        let inventory_large = gc_pipeline_probe("inventory-large", 1, 1, 40_000, 1).await;
         assert_eq!(
             inventory_large.inventory_objects,
             inventory_small.inventory_objects * 2
@@ -1690,12 +1709,20 @@ mod tests {
             inventory_large.report_listed_object_bytes,
             inventory_small.report_listed_object_bytes * 2
         );
+        assert!(inventory_small.report_multipart_parts > 0);
+        assert!(inventory_large.report_multipart_parts > 0);
+        assert_gc_write_bounds(&inventory_small);
+        assert_gc_write_bounds(&inventory_large);
 
         let render = |probe: &GcPipelineProbe| {
             serde_json::json!({
                 "roots": probe.roots,
                 "references": probe.references,
                 "inventory_objects": probe.inventory_objects,
+                "mark_intermediate_runs": probe.mark_intermediate_runs,
+                "mark_max_write_passes": probe.mark_max_write_passes,
+                "inventory_intermediate_runs": probe.inventory_intermediate_runs,
+                "inventory_max_write_passes": probe.inventory_max_write_passes,
                 "mark": {
                     "ms": probe.mark_ms,
                     "gets": probe.mark_gets,
@@ -1739,6 +1766,40 @@ mod tests {
         );
     }
 
+    fn assert_gc_write_bounds(probe: &GcPipelineProbe) {
+        let mark_record_bound = probe
+            .references
+            .checked_mul(crate::catalog::gc_mark::MARK_RECORD_BYTES)
+            .and_then(|bytes| bytes.checked_mul(u64::from(probe.mark_max_write_passes)))
+            .unwrap();
+        let mark_files = probe.mark_puts + probe.mark_multipart_initiates;
+        let mark_bound =
+            mark_record_bound + mark_files * crate::catalog::gc_mark::MARK_FILE_OVERHEAD_BYTES;
+        let mark_observed = probe.mark_put_bytes + probe.mark_multipart_bytes;
+        assert!(
+            mark_observed <= mark_bound,
+            "mark writes exceed derived bound: {mark_observed} > {mark_bound}"
+        );
+
+        let inventory_record_bound = probe
+            .inventory_objects
+            .checked_mul(crate::catalog::gc_inventory::INVENTORY_RECORD_BYTES)
+            .and_then(|bytes| {
+                bytes.checked_mul(u64::from(
+                    probe.inventory_max_write_passes.saturating_add(1),
+                ))
+            })
+            .unwrap();
+        let inventory_files = probe.report_puts + probe.report_multipart_initiates;
+        let inventory_bound = inventory_record_bound
+            + inventory_files * crate::catalog::gc_inventory::INVENTORY_FILE_OVERHEAD_BYTES;
+        let inventory_observed = probe.report_put_bytes + probe.report_multipart_bytes;
+        assert!(
+            inventory_observed <= inventory_bound,
+            "inventory writes exceed derived bound: {inventory_observed} > {inventory_bound}"
+        );
+    }
+
     async fn reopen_gc_lifecycle(
         catalog: Arc<SlateDbCatalog>,
         store: Arc<dyn ObjectStore>,
@@ -1772,6 +1833,7 @@ mod tests {
                 references_enumerated: 7,
                 intermediate_runs: 1,
                 unique_segments: 5,
+                max_write_passes: 2,
             });
             record_gc_inventory_metrics(&GcInventoryStats {
                 objects_seen: 11,
@@ -1780,6 +1842,7 @@ mod tests {
                 candidate_objects: 4,
                 candidate_bytes: 4096,
                 intermediate_runs: 1,
+                max_write_passes: 2,
             });
             record_gc_report_metrics(&GcInventoryStats {
                 objects_seen: 3,
@@ -1788,6 +1851,7 @@ mod tests {
                 candidate_objects: 2,
                 candidate_bytes: 2048,
                 intermediate_runs: 1,
+                max_write_passes: 2,
             });
             record_gc_retained_on_error(GcBlockerKind::CorruptMetadata, 1);
             record_gc_root_open_failure("capture", GcBlockerKind::MissingRoot);
@@ -1801,6 +1865,8 @@ mod tests {
         assert!(rendered.contains("zerofs_gc_reported_candidate_bytes_total 2048"));
         assert!(rendered.contains("zerofs_gc_quarantined_bytes_total 4096"));
         assert!(rendered.contains("zerofs_gc_backlog_upper_bound_bytes_added_total 4096"));
+        assert!(rendered.contains("zerofs_gc_max_record_write_passes{phase=\"mark\"} 2"));
+        assert!(rendered.contains("zerofs_gc_max_record_write_passes{phase=\"inventory\"} 2"));
         assert!(rendered.contains(
             "zerofs_gc_retained_on_error_lower_bound_total{reason=\"corrupt_metadata\"} 1"
         ));

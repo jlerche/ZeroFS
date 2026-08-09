@@ -1,4 +1,6 @@
-use super::gc_mark::{GcMarkError, MarkReader, decode_digest, encode_digest};
+use super::gc_mark::{
+    GcMarkError, MarkReader, binary_carry_max_write_passes, decode_digest, encode_digest,
+};
 use super::{
     GcInventoryStats, GcMarkShard, GcQuarantineShard, GcRevalidationRecord, GcRevalidationStats,
     GcRunRecord, SlateDbRootStore,
@@ -22,6 +24,10 @@ const RECORD_LEN: usize = 16 + 8 + 8 + 4 + 32;
 const FOOTER_LEN: usize = 8 + 8 + 32;
 const INVENTORY_BUFFER_OBJECTS: usize = 8_192;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
+#[cfg(test)]
+pub(crate) const INVENTORY_RECORD_BYTES: u64 = RECORD_LEN as u64;
+#[cfg(test)]
+pub(crate) const INVENTORY_FILE_OVERHEAD_BYTES: u64 = (HEADER_LEN + FOOTER_LEN) as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InventoryRecord {
@@ -113,6 +119,7 @@ impl GcInventoryStore {
             candidate_objects: 0,
             candidate_bytes: 0,
             intermediate_runs: 0,
+            max_write_passes: 0,
         };
         let mut quarantine = Vec::with_capacity(256);
         for shard in 0u8..=u8::MAX {
@@ -181,17 +188,9 @@ impl GcInventoryStore {
             )
             .await?;
         }
-        let final_path = inventory_final_path(run.id, shard);
-        merge_inventory_files(
-            Arc::clone(&self.object_store),
-            run.id,
-            digest,
-            shard,
-            &runs.into_paths(),
-            &final_path,
-        )
-        .await?;
-        Ok(final_path)
+        stats.max_write_passes = stats.max_write_passes.max(runs.max_write_passes());
+        self.finalize_inventory_runs(run.id, digest, shard, runs.into_paths())
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -240,6 +239,10 @@ impl GcInventoryStore {
         mut carry: Path,
         runs: &mut OnlineRuns,
     ) -> Result<(), GcInventoryError> {
+        runs.initial_runs = runs
+            .initial_runs
+            .checked_add(1)
+            .ok_or_else(|| GcInventoryError::Corrupt("inventory run count overflow".to_string()))?;
         let mut level = 0usize;
         loop {
             let Some((left, right)) = runs.add_or_pair(level, carry) else {
@@ -260,6 +263,47 @@ impl GcInventoryStore {
                 GcInventoryError::Corrupt("inventory merge level overflow".to_string())
             })?;
         }
+    }
+
+    async fn finalize_inventory_runs(
+        &self,
+        run_id: Uuid,
+        digest: [u8; 32],
+        shard: u8,
+        mut paths: Vec<Path>,
+    ) -> Result<Path, GcInventoryError> {
+        let mut round = 0u32;
+        while paths.len() > 1 {
+            let mut next = Vec::with_capacity(paths.len().div_ceil(2));
+            for (pair, chunk) in paths.chunks(2).enumerate() {
+                let output = inventory_merge_path(run_id, shard, round, pair as u64);
+                merge_inventory_files(
+                    Arc::clone(&self.object_store),
+                    run_id,
+                    digest,
+                    shard,
+                    chunk,
+                    &output,
+                )
+                .await?;
+                next.push(output);
+            }
+            paths = next;
+            round = round.checked_add(1).ok_or_else(|| {
+                GcInventoryError::Corrupt("inventory merge round overflow".to_string())
+            })?;
+        }
+        let final_path = inventory_final_path(run_id, shard);
+        merge_inventory_files(
+            Arc::clone(&self.object_store),
+            run_id,
+            digest,
+            shard,
+            &paths,
+            &final_path,
+        )
+        .await?;
+        Ok(final_path)
     }
 
     async fn join_shard(
@@ -712,6 +756,7 @@ impl GcInventoryStore {
 #[derive(Default)]
 struct OnlineRuns {
     levels: Vec<Option<Path>>,
+    initial_runs: u64,
 }
 
 impl OnlineRuns {
@@ -730,6 +775,10 @@ impl OnlineRuns {
 
     fn into_paths(self) -> Vec<Path> {
         self.levels.into_iter().flatten().collect()
+    }
+
+    fn max_write_passes(&self) -> u32 {
+        binary_carry_max_write_passes(self.initial_runs)
     }
 }
 
@@ -1070,6 +1119,12 @@ fn inventory_run_path(run_id: Uuid, shard: u8, sequence: u64) -> Path {
 fn inventory_online_path(run_id: Uuid, shard: u8, level: usize, sequence: u64) -> Path {
     Path::from(format!(
         "__zerofs_gc/{run_id}/inventory-online/{shard:02x}/{level:08}/{sequence:020}.bin"
+    ))
+}
+
+fn inventory_merge_path(run_id: Uuid, shard: u8, round: u32, pair: u64) -> Path {
+    Path::from(format!(
+        "__zerofs_gc/{run_id}/inventory-merge/{shard:02x}/{round:08}/{pair:020}.bin"
     ))
 }
 
@@ -1425,5 +1480,38 @@ mod tests {
         }
         reader.finish().await.unwrap();
         assert_eq!(counters, vec![1, 2, 4, 5, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn finalization_merges_more_than_two_resident_runs_in_bounded_rounds() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let run_id = Uuid::new_v4();
+        let digest = [9u8; 32];
+        let mut paths = Vec::new();
+        for (index, counters) in [vec![1, 7], vec![2, 8], vec![3, 9]].into_iter().enumerate() {
+            let path = Path::from(format!("resident-{index}"));
+            let records = counters.into_iter().map(record).collect::<Vec<_>>();
+            write_inventory_file(Arc::clone(&store), &path, run_id, digest, 0, &records)
+                .await
+                .unwrap();
+            paths.push(path);
+        }
+        let inventory = GcInventoryStore::new(&SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("branches"),
+        ));
+        let output = inventory
+            .finalize_inventory_runs(run_id, digest, 0, paths)
+            .await
+            .unwrap();
+        let mut reader = InventoryReader::open(store, &output, run_id, digest, 0)
+            .await
+            .unwrap();
+        let mut counters = Vec::new();
+        while let Some(record) = reader.next().await.unwrap() {
+            counters.push(record.segid.counter);
+        }
+        reader.finish().await.unwrap();
+        assert_eq!(counters, vec![1, 2, 3, 7, 8, 9]);
     }
 }

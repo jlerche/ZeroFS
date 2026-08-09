@@ -976,27 +976,45 @@ reproducible ignored release probe
 256-checkpoint-per-branch ceiling. On the 2026-08-09 qualification host it
 validated 1,052,672 unique roots in 377 ms, collected/canonicalized them in
 169 ms, and hashed them in 158 ms. Their canonical JSON is 117,710,537 bytes.
-These figures qualify in-process root extraction only. Mark-generation object
-I/O, its linearity on a representative backend, and concurrent foreground
+These figures qualify in-process root extraction only. Supported-envelope mark
+generation, representative-backend service latency, and concurrent foreground
 latency remain separate open release gates; the probe deliberately does not
 turn synthetic memory-store timings into those claims.
 
-The ignored release probe `gc_external_work_amplification_probe` separately drives
-the real SlateDB catalog and mark/report pipeline through a counting
+The ignored release probe `gc_external_work_amplification_probe` separately
+drives the real SlateDB catalog and mark/report pipeline through a counting
 object-store boundary. Doubling roots, references, or inventory doubles the
 corresponding logical work exactly and records ordinary requests, transferred
-payload bytes, multipart operations, and streamed list results. The
-20,000- and 40,000-reference fixtures place references in one shard so both
-cross the 256 KiB artifact threshold; multipart initiation, part, completion,
-and successful-byte counters are measured as well. In the inventory
-pair, streamed list results double exactly from 2,048 objects and 18,432 object
-bytes to 4,096 objects and 36,864 bytes. However, reference multipart bytes grow
-from 902,447 to 2,329,081 (2.58x) when references double because the
-binary-carry sorter crosses another merge level. The linear external-work gate
-therefore remains open pending a derived envelope-aware bound or a linear-sort
-redesign. The probe also does not treat in-memory timings or list-call
-pagination as representative backend latency; supported-envelope mark duration
-and concurrent foreground latency remain separate release gates.
+payload bytes, multipart operations, and streamed list results. The 20,000- and
+40,000-record reference and inventory fixtures place records in one shard so
+both pairs cross the 8,192-record spill and 256 KiB multipart thresholds. The
+initial reference result grew multipart bytes from 902,447 to 2,329,081 (2.58x)
+when references doubled because the binary-carry sorter crossed another merge
+level; this disproved strict linear amplification.
+
+The production contract consequently uses a derived merge bound. For `R > 0`
+initial runs in one shard, any record is written at most
+`2 + floor(log2(R)) + ceil(log2(popcount(R)))` times: once into its initial
+sorted run, through possible binary-carry levels, through bounded pairwise
+finalization, and once into the authoritative file. Empty shards write no
+records. Mark and inventory persist the maximum derived value in their bounded
+statistics and export `zerofs_gc_max_record_write_passes{phase=...}`. Inventory
+finalization uses pairwise rounds as well; it no longer fails when more than two
+carry levels remain resident. Durable validation uses a monotone envelope from
+the global run total because the exact per-shard formula drops at powers of two;
+for example, a valid seven-run shard plus a one-run shard must not be rejected
+as though all eight runs belonged to one shard. Legacy statistics without the
+field retain their serde-default zero.
+
+The probe separates catalog storage from counted root/artifact storage. It
+asserts mark writes against the fixed 16-byte record size times the derived
+pass count plus exact file framing. Inventory uses the fixed 68-byte record
+size, the same derived passes, one additional quarantine-output pass, and exact
+framing. The 20,000/40,000 pairs produce 3/5 initial runs and 4/5 maximum write
+passes for both mark and inventory. This is an explicit, observable bound rather
+than a linearity claim. In-memory timings and list pagination still do not
+qualify representative backend latency; supported-envelope mark duration and
+concurrent foreground latency remain separate release gates.
 
 ### Private fast path and cleanup
 

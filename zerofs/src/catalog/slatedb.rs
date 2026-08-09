@@ -6661,6 +6661,7 @@ mod tests {
                     references_enumerated: 0,
                     intermediate_runs: 0,
                     unique_segments: 0,
+                    max_write_passes: 0,
                 },
                 now,
             )
@@ -6694,6 +6695,7 @@ mod tests {
                         candidate_objects: 0,
                         candidate_bytes: 0,
                         intermediate_runs: 0,
+                        max_write_passes: 0,
                     },
                     quarantine_at: now,
                 })
@@ -6769,6 +6771,7 @@ mod tests {
             references_enumerated: 0,
             intermediate_runs: 0,
             unique_segments: 0,
+            max_write_passes: 0,
         };
         catalog
             .publish_gc_marks(run_id, 1, digest.clone(), marks, mark_stats.clone(), now)
@@ -6797,6 +6800,7 @@ mod tests {
                     candidate_objects: 0,
                     candidate_bytes: 0,
                     intermediate_runs: 0,
+                    max_write_passes: 0,
                 },
                 quarantine_at: now,
             })

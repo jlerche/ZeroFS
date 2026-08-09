@@ -17,6 +17,45 @@ const MARK_RECORD_LEN: usize = 16;
 const MARK_FOOTER_LEN: usize = 8 + 32;
 const ENUMERATION_BUFFER_SEGMENTS: usize = 8_192;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
+#[cfg(test)]
+pub(crate) const MARK_FILE_OVERHEAD_BYTES: u64 = (MARK_HEADER_LEN + MARK_FOOTER_LEN) as u64;
+#[cfg(test)]
+pub(crate) const MARK_RECORD_BYTES: u64 = MARK_RECORD_LEN as u64;
+
+/// Maximum number of times any record is written after `initial_runs` sorted
+/// runs enter the binary-carry pipeline: once for its initial run, once per
+/// possible carry level, once per bounded finalization round, and once for the
+/// authoritative final file.
+pub(crate) fn binary_carry_max_write_passes(initial_runs: u64) -> u32 {
+    if initial_runs == 0 {
+        return 0;
+    }
+    let carry_levels = u64::BITS - 1 - initial_runs.leading_zeros();
+    let resident_runs = initial_runs.count_ones();
+    let final_rounds = if resident_runs <= 1 {
+        0
+    } else {
+        u32::BITS - (resident_runs - 1).leading_zeros()
+    };
+    2 + carry_levels + final_rounds
+}
+
+/// Monotone validation envelope when only the total runs across all shards is
+/// available. For every `r <= total_runs`, the carry depth is at most the
+/// global floor and `popcount(r)` is at most that floor plus one.
+pub(crate) fn binary_carry_global_write_pass_upper_bound(total_runs: u64) -> u32 {
+    if total_runs == 0 {
+        return 0;
+    }
+    let global_floor = u64::BITS - 1 - total_runs.leading_zeros();
+    let max_popcount = global_floor + 1;
+    let final_rounds = if max_popcount <= 1 {
+        0
+    } else {
+        u32::BITS - (max_popcount - 1).leading_zeros()
+    };
+    2 + global_floor + final_rounds
+}
 
 pub(crate) struct GcMarkStore {
     roots: SlateDbRootStore,
@@ -106,6 +145,11 @@ impl GcMarkStore {
         }
 
         let mut shards = Vec::with_capacity(256);
+        let max_write_passes = run_paths
+            .iter()
+            .map(OnlineRuns::max_write_passes)
+            .max()
+            .unwrap_or(0);
         for shard in 0u8..=u8::MAX {
             shards.push(
                 self.merge_shard(
@@ -130,6 +174,7 @@ impl GcMarkStore {
                 references_enumerated,
                 intermediate_runs,
                 unique_segments,
+                max_write_passes,
             },
         })
     }
@@ -186,6 +231,10 @@ impl GcMarkStore {
         mut carry: Path,
         runs: &mut OnlineRuns,
     ) -> Result<(), GcMarkError> {
+        runs.initial_runs = runs
+            .initial_runs
+            .checked_add(1)
+            .ok_or_else(|| GcMarkError::Corrupt("mark-run count overflow".to_string()))?;
         let mut level = 0usize;
         loop {
             let Some(existing) = runs.add_or_pair(level, carry) else {
@@ -293,6 +342,7 @@ impl GcMarkStore {
 #[derive(Default)]
 struct OnlineRuns {
     levels: Vec<Option<Path>>,
+    initial_runs: u64,
 }
 
 impl OnlineRuns {
@@ -313,6 +363,10 @@ impl OnlineRuns {
 
     fn into_paths(self) -> Vec<Path> {
         self.levels.into_iter().flatten().collect()
+    }
+
+    fn max_write_passes(&self) -> u32 {
+        binary_carry_max_write_passes(self.initial_runs)
     }
 
     #[cfg(test)]
@@ -618,6 +672,25 @@ pub(crate) enum GcMarkError {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[test]
+    fn binary_carry_write_pass_bound_covers_merge_level_transitions() {
+        assert_eq!(binary_carry_max_write_passes(0), 0);
+        assert_eq!(binary_carry_max_write_passes(1), 2);
+        assert_eq!(binary_carry_max_write_passes(2), 3);
+        assert_eq!(binary_carry_max_write_passes(3), 4);
+        assert_eq!(binary_carry_max_write_passes(4), 4);
+        assert_eq!(binary_carry_max_write_passes(5), 5);
+        assert_eq!(binary_carry_max_write_passes(7), 6);
+        assert_eq!(binary_carry_max_write_passes(8), 5);
+        assert_eq!(binary_carry_max_write_passes(1_000_000), 24);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(0), 0);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(1), 2);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(7), 6);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(8), 7);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(15), 7);
+        assert_eq!(binary_carry_global_write_pass_upper_bound(16), 9);
+    }
 
     fn raw_mark_file(run_id: Uuid, digest: [u8; 32], shard: u8, values: &[Segid]) -> Vec<u8> {
         let mut bytes = mark_header(run_id, digest, shard).to_vec();

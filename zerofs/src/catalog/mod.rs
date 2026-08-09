@@ -970,6 +970,10 @@ pub struct GcMarkStats {
     pub references_enumerated: u64,
     pub intermediate_runs: u64,
     pub unique_segments: u64,
+    /// Derived worst-case writes of one record through initial, carry,
+    /// finalization, and authoritative-output stages for this observation.
+    #[serde(default)]
+    pub max_write_passes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -989,6 +993,9 @@ pub struct GcInventoryStats {
     pub candidate_objects: u64,
     pub candidate_bytes: u64,
     pub intermediate_runs: u64,
+    /// Maximum derived record-write passes among inventory shards.
+    #[serde(default)]
+    pub max_write_passes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1322,6 +1329,7 @@ impl GcRunRecord {
             if stats.roots_enumerated != self.roots.len() as u64
                 || stats.unique_segments != unique_segments
                 || stats.unique_segments > stats.references_enumerated
+                || !valid_gc_write_pass_bound(stats.intermediate_runs, stats.max_write_passes)
             {
                 return Err(CatalogError::Invalid(
                     "GC mark statistics disagree with roots or shards".to_string(),
@@ -1350,6 +1358,7 @@ impl GcRunRecord {
             if stats.objects_seen != classified
                 || stats.candidate_objects != candidate_objects
                 || stats.candidate_bytes != candidate_bytes
+                || !valid_gc_write_pass_bound(stats.intermediate_runs, stats.max_write_passes)
             {
                 return Err(CatalogError::Invalid(
                     "GC inventory statistics disagree with quarantine shards".to_string(),
@@ -1513,6 +1522,7 @@ impl GcRevalidationRecord {
             if stats.roots_enumerated != self.roots.len() as u64
                 || stats.unique_segments != unique_segments
                 || stats.unique_segments > stats.references_enumerated
+                || !valid_gc_write_pass_bound(stats.intermediate_runs, stats.max_write_passes)
             {
                 return Err(CatalogError::Invalid(
                     "GC revalidation mark statistics are inconsistent".to_string(),
@@ -2078,6 +2088,16 @@ fn canonicalize_gc_root_pins(pins: &mut Vec<GcRootPin>) {
             ))
     });
     pins.dedup();
+}
+
+fn valid_gc_write_pass_bound(intermediate_runs: u64, max_write_passes: u32) -> bool {
+    // Zero preserves compatibility with run records written before the bound
+    // became durable. New nonempty observations publish at least two passes.
+    max_write_passes == 0
+        || (intermediate_runs != 0
+            && max_write_passes >= 2
+            && max_write_passes
+                <= gc_mark::binary_carry_global_write_pass_upper_bound(intermediate_runs))
 }
 
 #[derive(Debug, Clone)]
@@ -2913,6 +2933,22 @@ fn validate_timestamp(value: DateTime<Utc>, field: &str) -> Result<(), CatalogEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_gc_write_pass_bound_accepts_legacy_zero_and_rejects_impossible_values() {
+        assert!(valid_gc_write_pass_bound(0, 0));
+        assert!(valid_gc_write_pass_bound(5, 0));
+        assert!(valid_gc_write_pass_bound(1, 2));
+        assert!(valid_gc_write_pass_bound(5, 5));
+        // Seven runs in one shard plus one in another legitimately publish a
+        // six-pass maximum even though the exact eight-run formula is five.
+        assert!(valid_gc_write_pass_bound(8, 6));
+        assert!(valid_gc_write_pass_bound(8, 7));
+        assert!(!valid_gc_write_pass_bound(0, 2));
+        assert!(!valid_gc_write_pass_bound(5, 1));
+        assert!(!valid_gc_write_pass_bound(5, 7));
+        assert!(!valid_gc_write_pass_bound(8, 8));
+    }
 
     fn gc_scale_snapshot(branch_count: usize, checkpoints_per_branch: usize) -> CatalogSnapshot {
         let now = catalog_timestamp(Utc::now());
