@@ -1032,6 +1032,30 @@ opening 1,052,672 physical SlateDB checkpoints and excludes provider/network
 latency. Those costs remain an explicit representative-backend release gate;
 they are not inferred from the memory-store result.
 
+The manual release harness
+`gc_physical_checkpoint_open_representative_backend` supplies that gate without
+silently substituting a smaller fixture. It creates 4,096 independent SlateDB
+databases below one unique configured object-store prefix, creates one branch
+root plus 256 checkpoint roots in each, and runs the production physical reader
+and mark pipeline across all 1,052,672 roots. The mark must finish before the
+15-minute stalled-phase alert boundary. The harness requires a remote URL in
+`ZEROFS_GC_BENCHMARK_URL`, ordinary provider credentials in the environment,
+and the exact acknowledgement
+`ZEROFS_GC_BENCHMARK_CONFIRM=provision-1052672-roots-without-automatic-cleanup`.
+Run it only as the library target:
+
+```text
+cargo test --release --lib gc_physical_checkpoint_open_representative_backend -- --ignored --nocapture
+```
+
+The unique prefix is printed before provisioning and deliberately retained on
+success or failure for audit and operator-approved cleanup. Marking is bounded
+by a real 15-minute timeout; timeout JSON includes the retained prefix and
+partial request counters and cannot be confused with the completion event. A
+result qualifies the gate only when the target is representative of production
+and the emitted JSON, provider telemetry, cost, and retained prefix have been
+reviewed.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

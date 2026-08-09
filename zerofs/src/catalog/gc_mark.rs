@@ -737,10 +737,51 @@ pub(crate) enum GcMarkError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{MAX_CHECKPOINTS_PER_BRANCH, MAX_LIVE_BRANCHES};
+    use crate::catalog::{GcRootKind, MAX_CHECKPOINTS_PER_BRANCH, MAX_LIVE_BRANCHES};
     use crate::fault_store::FaultStore;
+    use futures::StreamExt;
     use object_store::memory::InMemory;
+    use slatedb::Db;
+    use slatedb::config::{CheckpointOptions, CheckpointScope};
     use std::time::Instant;
+
+    const REPRESENTATIVE_CHECKPOINT_CONFIRMATION: &str =
+        "provision-1052672-roots-without-automatic-cleanup";
+    const REPRESENTATIVE_MARK_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    fn representative_benchmark_url(
+        raw_url: &str,
+        confirmation: Option<&str>,
+    ) -> Result<url::Url, String> {
+        let url: url::Url = raw_url
+            .parse()
+            .map_err(|error| format!("ZEROFS_GC_BENCHMARK_URL is invalid: {error}"))?;
+        if !matches!(
+            url.scheme(),
+            "s3" | "s3a" | "gs" | "gcs" | "az" | "adl" | "azure" | "abfs" | "abfss" | "https"
+        ) {
+            return Err(
+                "representative qualification rejects local, memory, and plain HTTP stores"
+                    .to_string(),
+            );
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "benchmark credentials and options must come from the environment, not the URL"
+                    .to_string(),
+            );
+        }
+        if confirmation != Some(REPRESENTATIVE_CHECKPOINT_CONFIRMATION) {
+            return Err(format!(
+                "ZEROFS_GC_BENCHMARK_CONFIRM must equal {REPRESENTATIVE_CHECKPOINT_CONFIRMATION}"
+            ));
+        }
+        Ok(url)
+    }
 
     /// Qualifies the mark buffering, spill, merge, finalization, verification,
     /// and artifact-I/O path at the declared maximum logical root count. The
@@ -813,6 +854,223 @@ mod tests {
                     "multipart_bytes": counters.multipart_bytes(),
                 },
             })
+        );
+    }
+
+    /// Expensive manual qualification against the production-class object
+    /// store named by `ZEROFS_GC_BENCHMARK_URL`. This provisions the exact
+    /// supported physical shape below a unique retained prefix: 4,096 SlateDB
+    /// databases with one branch root and 256 checkpoint roots apiece. It does
+    /// not clean up automatically so a failed run remains auditable.
+    ///
+    /// Run only the library target to keep expensive qualification selection
+    /// narrow and auditable:
+    /// `ZEROFS_GC_BENCHMARK_URL=s3://bucket/prefix \
+    ///  ZEROFS_GC_BENCHMARK_CONFIRM=provision-1052672-roots-without-automatic-cleanup \
+    ///  cargo test --release --lib gc_physical_checkpoint_open_representative_backend \
+    ///  -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires an explicitly acknowledged representative object-store target"]
+    async fn gc_physical_checkpoint_open_representative_backend() {
+        let raw_url = std::env::var("ZEROFS_GC_BENCHMARK_URL")
+            .expect("ZEROFS_GC_BENCHMARK_URL must name a representative object-store prefix");
+        let confirmation = std::env::var("ZEROFS_GC_BENCHMARK_CONFIRM").ok();
+        let url = representative_benchmark_url(&raw_url, confirmation.as_deref())
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let (parsed, configured_prefix) =
+            object_store::parse_url_opts(&url, std::env::vars()).unwrap();
+        let qualification_id = Uuid::new_v4();
+        let qualification_prefix = configured_prefix
+            .join("zerofs-gc-physical-open-qualification")
+            .join(qualification_id.to_string());
+        let qualification_prefix_text = qualification_prefix.to_string();
+        let scoped = object_store::prefix::PrefixStore::new(parsed, qualification_prefix);
+        let (counting, counters) = FaultStore::new(Arc::new(scoped));
+        let store: Arc<dyn ObjectStore> = counting;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "fixture_started",
+                "backend_scheme": url.scheme(),
+                "qualification_id": qualification_id,
+                "retained_object_prefix": qualification_prefix_text,
+                "automatic_cleanup": false,
+            })
+        );
+
+        let fixture_started = Instant::now();
+        let branch_pin_sets = futures::stream::iter(0..MAX_LIVE_BRANCHES)
+            .map(|branch_index| {
+                let store = Arc::clone(&store);
+                let database_path = Path::from("databases").join(format!("{branch_index:04x}"));
+                async move {
+                    let db = Db::builder(database_path.clone(), store)
+                        .with_segment_extractor(Arc::new(
+                            crate::segment_extractor::ZeroFsSegmentExtractor,
+                        ))
+                        .build()
+                        .await
+                        .unwrap();
+                    db.put(
+                        &KeyCodec::new().extent_key(1, 0),
+                        &FrameLoc {
+                            segid: Segid::new(branch_index as u64 + 1, 0),
+                            frame_index: 0,
+                            byte_offset: 0,
+                            byte_len: 1,
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .unwrap();
+                    db.flush().await.unwrap();
+                    let mut pins = Vec::with_capacity(MAX_CHECKPOINTS_PER_BRANCH + 1);
+                    for root_index in 0..=MAX_CHECKPOINTS_PER_BRANCH {
+                        let checkpoint = db
+                            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+                            .await
+                            .unwrap();
+                        pins.push(GcRootPin {
+                            kind: if root_index == 0 {
+                                GcRootKind::Branch
+                            } else {
+                                GcRootKind::Checkpoint
+                            },
+                            root: crate::catalog::ImmutableCheckpoint {
+                                database_path: database_path.clone(),
+                                checkpoint_id: checkpoint.id,
+                                manifest_id: checkpoint.manifest_id,
+                            }
+                            .durable_root(),
+                        });
+                    }
+                    db.close().await.unwrap();
+                    pins
+                }
+            })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+        let mut pins = branch_pin_sets.into_iter().flatten().collect::<Vec<_>>();
+        pins.sort_by(|left, right| {
+            (&left.root.identity, &left.root.manifest_id)
+                .cmp(&(&right.root.identity, &right.root.manifest_id))
+        });
+        let expected_roots = MAX_LIVE_BRANCHES
+            .checked_mul(MAX_CHECKPOINTS_PER_BRANCH + 1)
+            .unwrap();
+        assert_eq!(pins.len(), expected_roots);
+        let fixture_elapsed = fixture_started.elapsed();
+
+        counters.reset_counts();
+        let marker = GcMarkStore::new(SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("branch-roots"),
+        ));
+        let mark_started = Instant::now();
+        let build = match tokio::time::timeout(
+            REPRESENTATIVE_MARK_BUDGET,
+            marker.build_observation(Uuid::new_v4(), &"07".repeat(32), &pins),
+        )
+        .await
+        {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                let mark_elapsed = mark_started.elapsed();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "qualification_failed",
+                        "reason": "mark_timeout",
+                        "backend_scheme": url.scheme(),
+                        "qualification_id": qualification_id,
+                        "retained_object_prefix": qualification_prefix_text,
+                        "automatic_cleanup": false,
+                        "physical_roots": expected_roots,
+                        "fixture_ms": fixture_elapsed.as_millis(),
+                        "mark_ms": mark_elapsed.as_millis(),
+                        "mark_budget_ms": REPRESENTATIVE_MARK_BUDGET.as_millis(),
+                        "object_store": {
+                            "gets": counters.get_count(),
+                            "puts": counters.put_count(),
+                            "lists": counters.list_count(),
+                            "get_bytes": counters.get_bytes(),
+                            "put_bytes": counters.put_bytes(),
+                            "multipart_initiates": counters.multipart_initiate_count(),
+                            "multipart_parts": counters.multipart_part_count(),
+                            "multipart_completes": counters.multipart_complete_count(),
+                            "multipart_bytes": counters.multipart_bytes(),
+                        },
+                    })
+                );
+                panic!(
+                    "physical checkpoint mark exceeded the {REPRESENTATIVE_MARK_BUDGET:?} timeout"
+                );
+            }
+        };
+        let mark_elapsed = mark_started.elapsed();
+        assert_eq!(build.stats.roots_enumerated, expected_roots as u64);
+        assert_eq!(build.stats.references_enumerated, expected_roots as u64);
+        assert_eq!(build.stats.unique_segments, MAX_LIVE_BRANCHES as u64);
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "qualification_completed",
+                "backend_scheme": url.scheme(),
+                "qualification_id": qualification_id,
+                "retained_object_prefix": qualification_prefix_text,
+                "automatic_cleanup": false,
+                "branches": MAX_LIVE_BRANCHES,
+                "checkpoints_per_branch": MAX_CHECKPOINTS_PER_BRANCH,
+                "physical_roots": expected_roots,
+                "references": build.stats.references_enumerated,
+                "unique_segments": build.stats.unique_segments,
+                "fixture_ms": fixture_elapsed.as_millis(),
+                "mark_ms": mark_elapsed.as_millis(),
+                "mark_budget_ms": REPRESENTATIVE_MARK_BUDGET.as_millis(),
+                "object_store": {
+                    "gets": counters.get_count(),
+                    "puts": counters.put_count(),
+                    "lists": counters.list_count(),
+                    "get_bytes": counters.get_bytes(),
+                    "put_bytes": counters.put_bytes(),
+                    "multipart_initiates": counters.multipart_initiate_count(),
+                    "multipart_parts": counters.multipart_part_count(),
+                    "multipart_completes": counters.multipart_complete_count(),
+                    "multipart_bytes": counters.multipart_bytes(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn representative_backend_guard_requires_remote_secret_free_acknowledged_target() {
+        assert!(
+            representative_benchmark_url(
+                "s3://qualification-bucket/prefix",
+                Some(REPRESENTATIVE_CHECKPOINT_CONFIRMATION),
+            )
+            .is_ok()
+        );
+        for url in [
+            "memory:///prefix",
+            "file:///tmp/prefix",
+            "http://example.com/prefix",
+            "s3://user:secret@qualification-bucket/prefix",
+            "s3://qualification-bucket/prefix?secret=value",
+            "s3://qualification-bucket/prefix#fragment",
+        ] {
+            assert!(
+                representative_benchmark_url(url, Some(REPRESENTATIVE_CHECKPOINT_CONFIRMATION))
+                    .is_err(),
+                "unsafe qualification target unexpectedly accepted: {url}"
+            );
+        }
+        assert!(representative_benchmark_url("s3://qualification-bucket/prefix", None).is_err());
+        assert!(
+            representative_benchmark_url("s3://qualification-bucket/prefix", Some("wrong"))
+                .is_err()
         );
     }
 
