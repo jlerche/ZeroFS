@@ -133,11 +133,11 @@
   - [x] Prevent deletion or replacement of that exact source while clone publication is incomplete.
   - [x] Create the destination's independent durable root.
   - [x] Publish the branch as `Ready` only after the root is durable.
-- [ ] Support creation from live head only if it can be reduced to the same checkpoint-based primitive.
-  - [ ] Flush the parent to a durable point.
-  - [ ] Create a temporary internal checkpoint with a stable identity.
-  - [ ] Clone from that checkpoint.
-  - [ ] Remove the temporary public dependency after the destination root is independently pinned.
+- [x] Keep live-head creation out of the production API; require the same explicit named-checkpoint primitive instead.
+  - [x] Checkpoint creation flushes the parent to a durable point.
+  - [x] The customer retains the stable checkpoint identity used by the branch operation.
+  - [x] Branch creation clones from that exact immutable checkpoint.
+  - [x] The customer may delete the named checkpoint after destination publication without affecting the independent branch root.
 - [x] Keep the recovery record minimal.
   - [x] Persist an operation ID and immutable source/destination identities.
   - [x] Resume or safely roll back an incomplete create.
@@ -795,3 +795,8 @@
 - The configured server now owns the complete lifecycle release surface: default-off independent controls guard branch creation, writer mount admission, checkpoint deletion, and descendant-preserving branch deletion before authoritative work, while branch/checkpoint list and inspection remain read-only. The active mount renews before serving, stops serving on renewal uncertainty, and publishes its immutable head after shutdown. Every successful mutation commits to SlateDB first and only then reconciles the selected identical root-free JSON/PostgreSQL projection on a best-effort basis.
 - The current tree passes `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, the complete default unit/integration suite, the 61-case failpoint crash suite, strict DST Clippy, all six deterministic simulation/model tests, and the seeded failpoint-crash DST case. The audit repaired both specialized harnesses after the production constructor gained an optional pool-global segment-writer epoch reservation argument, preventing those gates from silently drifting outside normal compilation.
 - The implementation remains divided across storage/root, independently keyed SlateDB catalog, lifecycle/lease/deletion, streaming global/local GC, customer projection, RPC/CLI, and serving-assembly commits instead of importing the research implementation. Production limits, fail-closed semantics, metrics, Prometheus alerts, bounded administration/cleanup, independent release controls, conservative deletion policy, and the rapid deletion kill switch are documented and executable. `jacob/cow-branches-poc-research` remains a separate reference branch and is not an ancestor or wholesale merge of this main-based production history.
+
+### 2026-08-09: explicit checkpoint-only branch creation
+
+- The production API intentionally does not expose a create-from-live-head shortcut. Its only branch source is an exact named checkpoint UUID/manifest resolved once by SlateDB authority. Checkpoint creation already seals and flushes the mounted writer before publishing that immutable source, and the independently rooted destination permits immediate logical deletion of the source checkpoint after branch publication.
+- A transparent live-head shortcut would require a second hidden checkpoint class in the catalog: source reservation must retain it across crashes, projection reconciliation must never expose it, exact retry must distinguish it after cleanup and tombstone compaction, and physical checkpoint cleanup must remain recoverable. That additional metadata protocol provides convenience rather than a new storage invariant, so it is excluded in favor of the existing composable checkpoint-create, branch-create, checkpoint-delete operations.

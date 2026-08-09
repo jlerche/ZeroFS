@@ -187,9 +187,11 @@ checkpoint UUID and immutable manifest identity, and (for history) parent UUID.
 - A process/object-store failure before a known durable destination root leaves
   `Creating`. Recovery retries the same idempotent storage operation or proves
   the orphan safe to remove. Ambiguity retains data.
-- Creating from a live head first flushes it, creates an internal immutable
-  checkpoint, and invokes this exact checkpoint-based primitive. The internal
-  named dependency is removed after independent destination publication.
+- Creating directly from a live head is not a production API. A caller first
+  creates an explicit named checkpoint, which seals and flushes the mounted
+  writer, then invokes this exact checkpoint-based primitive. After independent
+  destination publication the caller may logically delete that named checkpoint;
+  retries continue to use its stable UUID and the destination remains valid.
 
 For `Creating` to tombstone, the same create/cancel operation observes the
 recorded phase and idempotently completes cleanup or retention before publishing
