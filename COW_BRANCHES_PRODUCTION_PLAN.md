@@ -250,9 +250,9 @@
 
 - [x] Define a proof that a segment is private to one exact branch incarnation.
 - [ ] Reclaim private segments without consulting every other branch or checkpoint.
-- [ ] Continue using global GC for inherited, shared, or ambiguous segments.
-- [ ] Ensure local GC respects checkpoints and active leases on the same branch.
-- [ ] Fall back to global retention whenever private ownership cannot be proven.
+- [x] Continue using global GC for inherited, shared, or ambiguous segments.
+- [x] Ensure local GC respects checkpoints and active leases on the same branch.
+- [x] Fall back to global retention whenever private ownership cannot be proven.
 
 ### Epic 4.6: Clean up metadata
 
@@ -551,3 +551,10 @@
 - The recovered coordinator reuses the same continuous publication-barrier worker. After confirmed absence it conditionally validates and removes the exact zero-live local segment counter before publishing progress, preventing an already absent low-sorted candidate from monopolizing every later bounded batch.
 - Delayed old object-store requests cannot restore reachability: admitted segment writes are immutable conditional creates, while the only operation that can publish their `FrameLoc` is rejected by the newer SlateDB writer epoch. A delayed exact create after deletion can only recreate an unreferenced orphan for global two-observation GC; it cannot cause reachable-data loss or authorize local progress for changed bytes.
 - Executable proof deletes one guarded batch live, prepares a second exact dead segment, rejects recovery from the equal writer incarnation, cleanly reopens the same identity at a strictly newer writer epoch, rejects that newer database when its allocator is incorrectly bound to the guarded sealed epoch, then resumes through the authenticated open successor and deletes the second guarded batch. It confirms both physical absence and completed audit and rejects private binding on an ownerless database.
+
+### 2026-08-08: explicit bounded private-GC coordinator
+
+- Private physical deletion now has one disabled-by-default per-pass policy. An enabled call validates the candidate and epoch-scan bounds, performs at most one batch, and returns durable authority after that batch; there is still no implicit normal-server enablement.
+- Recovery has priority: the coordinator resumes the oldest exact-branch/database durable guard before creating new work, using same-publisher replay only for the exact process/writer incarnation and the strict writer-fenced path otherwise. With no guard, it inspects only the configured bounded number of authoritative `sealed_private` epochs for that exact owner.
+- Candidate preparation remains local and bounded. Atomic guard acquisition rechecks sealed revision, ready branch state, checkpoints, leases, incomplete descendant creation, and root-retaining global GC runs. Races or uncertainty retain data; inherited, exposed, legacy, shared, corrupt, or otherwise ambiguous segments remain exclusively global-GC work.
+- Executable proof confirms the default policy is inert, resumes a crash-left guard after exact-database writer fencing, starts and completes a fresh one-candidate batch, proves physical absence, and then reports no further local work.

@@ -536,6 +536,16 @@ which remains eligible for the global two-observation collector. If the exact
 database identity or strictly newer writer epoch cannot be proven, recovery
 retains the guard and every candidate.
 
+Private collection is driven only through an explicit policy that defaults to
+disabled. One invocation resumes the oldest durable guard for the exact mounted
+branch/database before considering new work; otherwise it inspects a configured
+bounded number of authoritative `sealed_private` epochs and can complete at
+most one bounded batch. Guard acquisition atomically rechecks same-branch
+checkpoints, active lease/root uncertainty, incomplete descendant creation, and
+root-retaining global GC runs. A blocker or any ambiguous ownership retains the
+object for global GC. Normal ownerless mounts cannot construct this coordinator,
+and no normal-server configuration enables it yet.
+
 Epoch reservations are globally unique but not numerically ordered. No local-GC
 decision interprets a smaller integer as older: preparation excludes the exact
 active writer, and authoritative guard attachment proves the requested term was

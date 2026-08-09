@@ -165,7 +165,7 @@ impl PersistedPrivateGcArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+#[allow(dead_code)] // The normal server does not yet mount authenticated branches.
 pub(crate) struct DecodedPrivateGcArtifact {
     guard_id: uuid::Uuid,
     batch: PreparedPrivateGcBatch,
@@ -269,7 +269,7 @@ impl PrivateGcBarrier {
     }
 }
 
-#[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+#[allow(dead_code)] // The normal server does not yet mount authenticated branches.
 impl DecodedPrivateGcArtifact {
     pub(crate) fn guard_id(&self) -> uuid::Uuid {
         self.guard_id
@@ -531,7 +531,7 @@ impl ExtentStore {
 
     /// Recover and strictly decode one immutable candidate artifact. This is
     /// read-only: catalog guard revalidation still precedes any future delete.
-    #[allow(dead_code)] // Consumed by the next barrier-through-delete slice.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn load_private_gc_artifact(
         &self,
         guard_id: uuid::Uuid,
@@ -550,7 +550,7 @@ impl ExtentStore {
     /// Publish the exact bounded candidate descriptor set under an immutable
     /// operation key. Exact retries reconcile byte-for-byte; a conflicting use
     /// of the UUID fails and cannot be attached to catalog authority.
-    #[allow(dead_code)] // The private catalog coordinator remains disabled.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn persist_private_gc_batch(
         &self,
         guard_id: uuid::Uuid,
@@ -594,7 +594,7 @@ impl ExtentStore {
     /// make both the durable zero-live counters and forward-map verification
     /// one stable local observation. Ambiguous/corrupt/live objects are simply
     /// retained for global GC; storage errors abort the whole preparation.
-    #[allow(dead_code)] // The private catalog coordinator remains disabled.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn prepare_private_gc_batch(
         &self,
         epoch: u64,

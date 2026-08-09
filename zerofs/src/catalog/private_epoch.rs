@@ -41,6 +41,25 @@ pub struct PrivateGcGuardRequest {
     pub created_at: DateTime<Utc>,
 }
 
+/// Explicit per-pass enablement for private physical deletion. The normal
+/// construction is inert; callers must opt in and retain the bounded limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivateGcPolicy {
+    pub enabled: bool,
+    pub batch_size: u32,
+    pub epoch_scan_limit: u32,
+}
+
+impl Default for PrivateGcPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 256,
+            epoch_scan_limit: 32,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PrivateEpochLifecycle {
     catalog: Arc<dyn Catalog>,
@@ -76,10 +95,123 @@ impl PrivateEpochLifecycle {
         self
     }
 
+    /// Run at most one bounded private-GC batch. Durable guards are resumed
+    /// before new work; otherwise only a bounded number of exact sealed epochs
+    /// are inspected. `None` means disabled or no provable local candidate.
+    #[allow(dead_code)] // Production mount wiring remains behind explicit rollout controls.
+    pub(crate) async fn collect_one_private_gc_batch(
+        &self,
+        extent_store: &ExtentStore,
+        policy: PrivateGcPolicy,
+    ) -> Result<Option<LocalGcProgressRecord>, PrivateEpochLifecycleError> {
+        if !policy.enabled {
+            return Ok(None);
+        }
+        if policy.batch_size == 0
+            || policy.batch_size as usize > crate::fs::MAX_LOCAL_GC_CANDIDATES
+            || policy.epoch_scan_limit == 0
+        {
+            return Err(
+                CatalogError::Invalid("private GC policy bounds are invalid".to_string()).into(),
+            );
+        }
+        let publisher = self.publisher.as_ref().ok_or_else(|| {
+            CatalogError::OperationConflict("private GC publisher is not bound".to_string())
+        })?;
+        if extent_store.private_publisher_identity().as_ref() != Some(publisher) {
+            return Err(CatalogError::OperationConflict(
+                "private GC coordinator publisher identity".to_string(),
+            )
+            .into());
+        }
+
+        let snapshot = self.catalog.snapshot().await?;
+        let active = snapshot
+            .local_gc_guards
+            .values()
+            .filter(|guard| {
+                snapshot
+                    .private_epochs
+                    .get(&guard.epoch)
+                    .is_some_and(|epoch| {
+                        epoch.branch_id == publisher.branch_id
+                            && epoch.database_identity == publisher.database_identity
+                    })
+            })
+            .min_by_key(|guard| (guard.created_at, guard.id));
+        if let Some(guard) = active {
+            let decoded = extent_store
+                .load_private_gc_artifact(guard.id)
+                .await
+                .map_err(|_| {
+                    SegmentStoreError::ObjectStore("private GC active artifact decode".to_string())
+                })?;
+            let batch = decoded.batch();
+            if batch.publisher_id == publisher.publisher_id
+                && batch.data_writer_epoch == publisher.data_writer_epoch
+                && batch.branch_id == publisher.branch_id
+                && batch.database_identity == publisher.database_identity
+            {
+                return self
+                    .run_decoded_gc_guard(extent_store, decoded)
+                    .await
+                    .map(Some);
+            }
+            return self
+                .run_recovered_gc_guard(extent_store, guard.id)
+                .await
+                .map(Some);
+        }
+
+        for epoch in snapshot
+            .private_epochs
+            .values()
+            .filter(|epoch| {
+                epoch.state == PrivateEpochState::SealedPrivate
+                    && epoch.branch_id == publisher.branch_id
+                    && epoch.database_identity == publisher.database_identity
+            })
+            .take(policy.epoch_scan_limit as usize)
+        {
+            let batch = extent_store
+                .prepare_private_gc_batch(epoch.epoch, policy.batch_size as usize)
+                .await
+                .map_err(|_| {
+                    SegmentStoreError::ObjectStore("private GC candidate preparation".to_string())
+                })?;
+            if batch.candidates.is_empty() {
+                continue;
+            }
+            let guard_id = Uuid::new_v4();
+            let artifact = extent_store
+                .persist_private_gc_batch(guard_id, &batch)
+                .await
+                .map_err(|_| {
+                    SegmentStoreError::ObjectStore("private GC artifact publication".to_string())
+                })?;
+            self.acquire_gc_guard(
+                PrivateGcGuardRequest {
+                    id: guard_id,
+                    branch_id: epoch.branch_id,
+                    epoch: epoch.epoch,
+                    expected_epoch_revision: epoch.revision,
+                    created_at: Utc::now(),
+                },
+                &artifact,
+            )
+            .await?;
+            return self
+                .run_live_gc_guard(extent_store, &artifact)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     /// Run an already guarded batch only in the exact live publisher process
     /// that prepared it. Crash recovery intentionally cannot use this entry
     /// point: it requires a separate durable writer-fence/quiescence proof.
-    #[allow(dead_code)] // Production scheduling remains disabled pending restart fencing.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn run_live_gc_guard(
         &self,
         extent_store: &ExtentStore,
@@ -128,7 +260,7 @@ impl PrivateEpochLifecycle {
     /// incarnation for the same exact branch database. The newer manifest
     /// epoch is the metadata fence: the old process can no longer publish a
     /// FrameLoc even if a delayed immutable object PUT eventually completes.
-    #[allow(dead_code)] // Production scheduling remains disabled pending review.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn run_recovered_gc_guard(
         &self,
         extent_store: &ExtentStore,
@@ -333,7 +465,7 @@ impl PrivateEpochLifecycle {
     /// guard state. Storage ownership and catalog epoch identity are
     /// reauthenticated; the atomic guard mutation still rechecks all root
     /// blockers and the exact sealed revision.
-    #[allow(dead_code)] // Invoked once mounted branches enable private collection.
+    #[allow(dead_code)] // The normal server does not yet mount authenticated branches.
     pub(crate) async fn acquire_gc_guard(
         &self,
         request: PrivateGcGuardRequest,
@@ -1060,6 +1192,40 @@ mod tests {
             .unwrap();
         extent.apply_tail_update(2, second_replacement_tail);
         extent.seal_open().await.unwrap();
+        let mut third_first_txn = db.new_transaction().unwrap();
+        let third_first_tail = extent
+            .write(
+                &mut third_first_txn,
+                3,
+                0,
+                &Bytes::from_static(b"third-first"),
+                0,
+            )
+            .await
+            .unwrap();
+        extent
+            .commit_test_transaction(third_first_txn)
+            .await
+            .unwrap();
+        extent.apply_tail_update(3, third_first_tail);
+        extent.seal_open().await.unwrap();
+        let mut third_replacement_txn = db.new_transaction().unwrap();
+        let third_replacement_tail = extent
+            .write(
+                &mut third_replacement_txn,
+                3,
+                0,
+                &Bytes::from_static(b"third-replacement"),
+                11,
+            )
+            .await
+            .unwrap();
+        extent
+            .commit_test_transaction(third_replacement_txn)
+            .await
+            .unwrap();
+        extent.apply_tail_update(3, third_replacement_tail);
+        extent.seal_open().await.unwrap();
         let request = PrivateEpochSealRequest {
             branch_id: branch.id,
             epoch: old_epoch,
@@ -1371,9 +1537,37 @@ mod tests {
                 .data_writer_epoch
                 > recovery_artifact.data_writer_epoch()
         );
+        assert_eq!(
+            recovered_lifecycle
+                .collect_one_private_gc_batch(&recovered_extent, PrivateGcPolicy::default())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            recovered_lifecycle
+                .collect_one_private_gc_batch(
+                    &recovered_extent,
+                    PrivateGcPolicy {
+                        enabled: true,
+                        batch_size: 0,
+                        epoch_scan_limit: 1,
+                    },
+                )
+                .await,
+            Err(PrivateEpochLifecycleError::Catalog(CatalogError::Invalid(
+                _
+            )))
+        ));
+        let enabled_policy = PrivateGcPolicy {
+            enabled: true,
+            batch_size: 1,
+            epoch_scan_limit: 1,
+        };
         let recovered_progress = recovered_lifecycle
-            .run_recovered_gc_guard(&recovered_extent, recovery_guard_id)
+            .collect_one_private_gc_batch(&recovered_extent, enabled_policy)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(recovered_progress.deleted_objects, 1);
         assert!(recovered_progress.completed_at.is_some());
@@ -1381,6 +1575,32 @@ mod tests {
             pool.get(&Path::from(recovery_batch.candidates[0].segid.object_key()))
                 .await
                 .is_err()
+        );
+        let scheduled_batch = recovered_extent
+            .prepare_private_gc_batch(old_epoch, 1)
+            .await
+            .unwrap();
+        assert_eq!(scheduled_batch.candidates.len(), 1);
+        let scheduled_progress = recovered_lifecycle
+            .collect_one_private_gc_batch(&recovered_extent, enabled_policy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled_progress.deleted_objects, 1);
+        assert!(scheduled_progress.completed_at.is_some());
+        assert!(
+            pool.get(&Path::from(
+                scheduled_batch.candidates[0].segid.object_key()
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            recovered_lifecycle
+                .collect_one_private_gc_batch(&recovered_extent, enabled_policy)
+                .await
+                .unwrap(),
+            None
         );
         let delete_at = catalog_timestamp(now + chrono::Duration::microseconds(6));
         catalog
