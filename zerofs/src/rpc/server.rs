@@ -16,9 +16,19 @@ use std::sync::atomic::Ordering;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream, UnixListenerStream};
+use zerofs::catalog::{
+    CatalogError, CustomerCatalog, CustomerCatalogListRequest, CustomerResourceKind,
+};
 
 fn serving_authority_lost() -> Status {
     Status::unavailable("leader lease expired (not the current leader)")
+}
+
+fn customer_catalog_status(error: CatalogError) -> Status {
+    match error {
+        CatalogError::Invalid(message) => Status::invalid_argument(message),
+        error => Status::unavailable(format!("customer catalog query failed: {error}")),
+    }
 }
 
 /// Gate successful stream items at the admin service response boundary.
@@ -149,6 +159,7 @@ fn trash_sweep_lock() -> Arc<tokio::sync::Mutex<()>> {
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
+    customer_catalog: Option<CustomerCatalog>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 }
@@ -156,11 +167,13 @@ pub struct AdminRpcServer {
 impl AdminRpcServer {
     pub fn new(
         checkpoint_manager: Arc<CheckpointManager>,
+        customer_catalog: Option<CustomerCatalog>,
         fs: Arc<ZeroFS>,
         shutdown: CancellationToken,
     ) -> Self {
         let server = Self {
             checkpoint_manager,
+            customer_catalog,
             fs,
             shutdown,
         };
@@ -169,6 +182,14 @@ impl AdminRpcServer {
         // otherwise the leftovers sit there until the next RemoveDirectory.
         server.spawn_trash_sweep();
         server
+    }
+
+    fn customer_catalog(&self) -> Result<&CustomerCatalog, Status> {
+        self.customer_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "customer branch catalog is not configured or its projection is unavailable",
+            )
+        })
     }
 
     /// Construct a successful response only with current serving authority.
@@ -384,6 +405,61 @@ impl AdminService for AdminRpcServer {
                 name
             ))),
         }
+    }
+
+    async fn list_branches(
+        &self,
+        request: Request<proto::ListBranchesRequest>,
+    ) -> Result<Response<proto::ListBranchesResponse>, Status> {
+        let request = request.into_inner();
+        let after = request
+            .after
+            .map(|after| {
+                uuid::Uuid::parse_str(&after)
+                    .map_err(|_| Status::invalid_argument("after must be a valid non-nil UUID"))
+            })
+            .transpose()?;
+        let limit = if request.limit == 0 {
+            100
+        } else {
+            request.limit as usize
+        };
+        let page = self
+            .customer_catalog()?
+            .list(CustomerCatalogListRequest {
+                kind: Some(CustomerResourceKind::Branch),
+                after,
+                limit,
+            })
+            .await
+            .map_err(customer_catalog_status)?;
+        self.success_response(proto::ListBranchesResponse {
+            branches: page.records.into_iter().map(Into::into).collect(),
+            next_after: page.next_after.map(|id| id.to_string()),
+        })
+    }
+
+    async fn get_branch_info(
+        &self,
+        request: Request<proto::GetBranchInfoRequest>,
+    ) -> Result<Response<proto::GetBranchInfoResponse>, Status> {
+        let id = uuid::Uuid::parse_str(&request.into_inner().id)
+            .map_err(|_| Status::invalid_argument("branch id must be a valid non-nil UUID"))?;
+        if id.is_nil() {
+            return Err(Status::invalid_argument(
+                "branch id must be a valid non-nil UUID",
+            ));
+        }
+        let record = self
+            .customer_catalog()?
+            .record(id)
+            .await
+            .map_err(customer_catalog_status)?
+            .filter(|record| record.kind == CustomerResourceKind::Branch)
+            .ok_or_else(|| Status::not_found(format!("branch {id} was not found")))?;
+        self.success_response(proto::GetBranchInfoResponse {
+            branch: Some(record.into()),
+        })
     }
 
     async fn watch_file_access(
@@ -831,7 +907,8 @@ mod tests {
         let (fs, checkpoint_manager) = make_fs().await;
 
         let shutdown = CancellationToken::new();
-        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let service =
+            AdminRpcServer::new(checkpoint_manager, None, Arc::clone(&fs), shutdown.clone());
 
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("admin.sock");
@@ -854,6 +931,190 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("admin RPC client failed to connect");
+    }
+
+    async fn customer_catalog_fixture()
+    -> (CustomerCatalog, uuid::Uuid, uuid::Uuid, tempfile::TempDir) {
+        use zerofs::catalog::{
+            BranchRecord, BranchState, CatalogProjection, CatalogSnapshot, CheckpointRecord,
+            DurableRoot, JsonCatalogProjection, catalog_timestamp,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let projection = Arc::new(JsonCatalogProjection::new(
+            directory.path().join("catalog.json"),
+        ));
+        let volume_id = uuid::Uuid::new_v4();
+        let first_id = uuid::Uuid::from_u128(1);
+        let second_id = uuid::Uuid::from_u128(3);
+        let checkpoint_id = uuid::Uuid::from_u128(2);
+        let now = catalog_timestamp(chrono::Utc::now());
+        let mut snapshot = CatalogSnapshot {
+            generation: 7,
+            ..CatalogSnapshot::default()
+        };
+        for (id, name) in [(first_id, "first"), (second_id, "second")] {
+            snapshot.branches.insert(
+                id,
+                BranchRecord {
+                    id,
+                    revision: 1,
+                    name: name.to_string(),
+                    state: BranchState::Ready,
+                    root: Some(DurableRoot {
+                        identity: format!("storage-secret/{id}"),
+                        manifest_id: format!("manifest-secret-{id}"),
+                    }),
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        snapshot.checkpoints.insert(
+            checkpoint_id,
+            CheckpointRecord {
+                id: checkpoint_id,
+                revision: 1,
+                branch_id: first_id,
+                name: "checkpoint".to_string(),
+                root: DurableRoot {
+                    identity: "checkpoint-storage-secret".to_string(),
+                    manifest_id: "checkpoint-manifest-secret".to_string(),
+                },
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        projection.reconcile(volume_id, &snapshot).await.unwrap();
+        let projection: Arc<dyn CatalogProjection> = projection;
+        let customer_catalog = CustomerCatalog::new(volume_id, projection);
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "project".to_string(),
+            serde_json::Value::String("alpha".to_string()),
+        );
+        customer_catalog
+            .set_customer_metadata(first_id, metadata)
+            .await
+            .unwrap();
+        (customer_catalog, first_id, second_id, directory)
+    }
+
+    #[tokio::test]
+    async fn branch_rpc_pages_only_root_free_customer_projection_records() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let (customer_catalog, first_id, second_id, _directory) = customer_catalog_fixture().await;
+        let service = AdminRpcServer::new(
+            checkpoint_manager,
+            Some(customer_catalog),
+            fs,
+            CancellationToken::new(),
+        );
+
+        let first = service
+            .list_branches(Request::new(proto::ListBranchesRequest {
+                after: None,
+                limit: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.branches.len(), 1);
+        assert_eq!(first.branches[0].id, first_id.to_string());
+        assert_eq!(
+            first.next_after.as_deref(),
+            Some(first.branches[0].id.as_str())
+        );
+        let encoded = format!("{:?}", first.branches[0]);
+        assert!(!encoded.contains("storage-secret"));
+        assert!(!encoded.contains("manifest-secret"));
+
+        let second = service
+            .list_branches(Request::new(proto::ListBranchesRequest {
+                after: first.next_after,
+                limit: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second.branches.len(), 1);
+        assert_eq!(second.branches[0].id, second_id.to_string());
+        assert_eq!(second.next_after, None);
+
+        let info = service
+            .get_branch_info(Request::new(proto::GetBranchInfoRequest {
+                id: first_id.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap();
+        assert_eq!(info.observed_generation, 7);
+        assert_eq!(info.customer_metadata_json, r#"{"project":"alpha"}"#);
+
+        let error = service
+            .list_branches(Request::new(proto::ListBranchesRequest {
+                after: None,
+                limit: 257,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn branch_rpc_reports_unconfigured_projection() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let service = AdminRpcServer::new(checkpoint_manager, None, fs, CancellationToken::new());
+        let error = service
+            .list_branches(Request::new(proto::ListBranchesRequest {
+                after: None,
+                limit: 1,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn branch_rpc_client_round_trips_over_unix_socket() {
+        let (fs, checkpoint_manager) = make_fs().await;
+        let (customer_catalog, first_id, second_id, _projection_directory) =
+            customer_catalog_fixture().await;
+        let shutdown = CancellationToken::new();
+        let service = AdminRpcServer::new(
+            checkpoint_manager,
+            Some(customer_catalog),
+            fs,
+            shutdown.clone(),
+        );
+        let socket_directory = tempfile::tempdir().unwrap();
+        let socket = socket_directory.path().join("branch-admin.sock");
+        tokio::spawn({
+            let socket = socket.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = serve_unix(socket, service, shutdown).await;
+            }
+        });
+        let client = connect_with_retry(&socket).await;
+
+        let first = client.list_branches(None, 1).await.unwrap();
+        assert_eq!(first.records[0].resource_id, first_id);
+        assert_eq!(first.next_after, Some(first_id));
+        let second = client.list_branches(first.next_after, 1).await.unwrap();
+        assert_eq!(second.records[0].resource_id, second_id);
+        assert_eq!(second.next_after, None);
+        let info = client.get_branch_info(first_id).await.unwrap().unwrap();
+        assert_eq!(info.resource_id, first_id);
+        assert_eq!(
+            info.customer_metadata.get("project"),
+            Some(&serde_json::Value::String("alpha".to_string()))
+        );
+        shutdown.cancel();
     }
 
     fn root_creds() -> Credentials {
@@ -899,7 +1160,8 @@ mod tests {
         lease.renew(Duration::from_secs(60));
         let (fs, checkpoint_manager) = make_fs_with_lease(Some(Arc::clone(&lease))).await;
         let shutdown = CancellationToken::new();
-        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let service =
+            AdminRpcServer::new(checkpoint_manager, None, Arc::clone(&fs), shutdown.clone());
 
         // Hold the response at tonic's boundary until authority changes.
         let completed_unary = proto::FlushResponse {};
@@ -1096,7 +1358,8 @@ mod tests {
 
         // Constructing the server spawns the startup sweep.
         let shutdown = CancellationToken::new();
-        let _service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let _service =
+            AdminRpcServer::new(checkpoint_manager, None, Arc::clone(&fs), shutdown.clone());
 
         wait_for_trash_drained(&fs).await;
         assert_eq!(

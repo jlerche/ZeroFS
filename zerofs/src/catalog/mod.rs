@@ -2242,6 +2242,56 @@ pub struct CustomerCatalogPage {
     pub next_after: Option<Uuid>,
 }
 
+/// Read/write handle for the reconstructible customer view selected by server
+/// configuration. This capability contains no lifecycle or storage authority.
+#[derive(Clone)]
+pub struct CustomerCatalog {
+    volume_id: Uuid,
+    projection: Arc<dyn CatalogProjection>,
+}
+
+impl std::fmt::Debug for CustomerCatalog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CustomerCatalog")
+            .field("volume_id", &self.volume_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CustomerCatalog {
+    pub fn new(volume_id: Uuid, projection: Arc<dyn CatalogProjection>) -> Self {
+        Self {
+            volume_id,
+            projection,
+        }
+    }
+
+    pub async fn record(
+        &self,
+        resource_id: Uuid,
+    ) -> Result<Option<CustomerCatalogRecord>, CatalogError> {
+        self.projection.record(self.volume_id, resource_id).await
+    }
+
+    pub async fn list(
+        &self,
+        request: CustomerCatalogListRequest,
+    ) -> Result<CustomerCatalogPage, CatalogError> {
+        self.projection.list(self.volume_id, request).await
+    }
+
+    pub async fn set_customer_metadata(
+        &self,
+        resource_id: Uuid,
+        metadata: CustomerMetadata,
+    ) -> Result<(), CatalogError> {
+        self.projection
+            .set_customer_metadata(self.volume_id, resource_id, metadata)
+            .await
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog {resource} capacity of {limit} has been reached")]

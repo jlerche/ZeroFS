@@ -238,6 +238,7 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
@@ -246,7 +247,12 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone());
+    let service = crate::rpc::server::AdminRpcServer::new(
+        checkpoint_manager,
+        customer_catalog,
+        fs,
+        shutdown.clone(),
+    );
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -1401,6 +1407,9 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        catalog_runtime
+            .as_ref()
+            .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
         Arc::clone(&fs),
         shutdown.clone(),
     )
@@ -1467,6 +1476,9 @@ pub async fn run_server(
     let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
         let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
             checkpoint_manager_for_webui,
+            catalog_runtime
+                .as_ref()
+                .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
             Arc::clone(&fs),
             shutdown.clone(),
         );

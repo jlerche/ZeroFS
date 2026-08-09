@@ -13,6 +13,10 @@ service AdminService {
 
     rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
 
+    rpc ListBranches(ListBranchesRequest) returns (ListBranchesResponse);
+
+    rpc GetBranchInfo(GetBranchInfoRequest) returns (GetBranchInfoResponse);
+
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
     rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
@@ -84,6 +88,41 @@ message GetCheckpointInfoRequest {
 
 message GetCheckpointInfoResponse {
     CheckpointInfo checkpoint = 1;
+}
+
+// Root-free customer projection record. Storage paths, manifests, leases, and
+// writer capabilities are intentionally absent.
+message BranchInfo {
+    string volume_id = 1;
+    string id = 2;
+    string name = 3;
+    string state = 4;
+    optional string parent_id = 5;
+    optional string origin_checkpoint_id = 6;
+    uint64 observed_generation = 7;
+    google.protobuf.Timestamp created_at = 8;
+    google.protobuf.Timestamp updated_at = 9;
+    google.protobuf.Timestamp deleted_at = 10;
+    string customer_metadata_json = 11;
+}
+
+message ListBranchesRequest {
+    optional string after = 1;
+    // Zero selects the server default; otherwise must be within 1..=256.
+    uint32 limit = 2;
+}
+
+message ListBranchesResponse {
+    repeated BranchInfo branches = 1;
+    optional string next_after = 2;
+}
+
+message GetBranchInfoRequest {
+    string id = 1;
+}
+
+message GetBranchInfoResponse {
+    BranchInfo branch = 1;
 }
 
 message WatchFileAccessRequest {}

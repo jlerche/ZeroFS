@@ -370,6 +370,12 @@ UUID-ordered pages, optionally restricted to branches or checkpoints. A page is
 limited to 256 records and uses the last returned UUID as its exclusive cursor.
 Deleted and compacted `absent` records remain queryable for customer audit;
 pagination never consults or exposes SlateDB roots, leases, or storage proofs.
+The admin RPC exposes that boundary as `ListBranches` and `GetBranchInfo`.
+`zerofs branch list -c <config> [--after <uuid>] [--limit 1..256]` and
+`zerofs branch info -c <config> <uuid>` are thin clients over those calls.
+The wire record contains lifecycle identity, lineage, timestamps, observed
+projection generation, and customer metadata JSON; it has no field capable of
+carrying a durable root, manifest, lease, renewal secret, or writer proof.
 
 The server's optional `[catalog]` settings own a stable volume UUID, the
 authoritative SlateDB path, private branch-database root, default-off lifecycle

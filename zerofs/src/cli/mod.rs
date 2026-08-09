@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+pub mod branch;
 pub mod checkpoint;
 pub mod debug;
 pub mod fatrace;
@@ -61,6 +62,11 @@ pub enum Commands {
     Checkpoint {
         #[command(subcommand)]
         subcommand: CheckpointCommands,
+    },
+    /// Customer-safe copy-on-write branch inspection
+    Branch {
+        #[command(subcommand)]
+        subcommand: BranchCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -166,6 +172,27 @@ pub enum CheckpointCommands {
         config: PathBuf,
         /// Checkpoint name to query
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BranchCommands {
+    /// List a bounded UUID-ordered page of branch records
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Exclusive stable UUID cursor returned by a prior page
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        /// Page size (1-256)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Inspect one exact branch incarnation by stable UUID
+    Info {
+        #[arg(short, long)]
+        config: PathBuf,
+        id: uuid::Uuid,
     },
 }
 

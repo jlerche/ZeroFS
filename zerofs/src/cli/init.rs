@@ -37,6 +37,12 @@ pub(crate) struct CatalogRuntime {
 }
 
 impl CatalogRuntime {
+    pub(crate) fn customer_catalog(&self) -> Option<zerofs::catalog::CustomerCatalog> {
+        self.projection.as_ref().map(|projection| {
+            zerofs::catalog::CustomerCatalog::new(self.volume_id, Arc::clone(projection))
+        })
+    }
+
     pub(crate) async fn prepare_writer_mount(
         &self,
         config: &crate::config::ServerBranchMountConfig,

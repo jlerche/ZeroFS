@@ -145,6 +145,18 @@ async fn async_main() -> Result<()> {
                 cli::checkpoint::get_checkpoint_info(&config, &name).await?;
             }
         },
+        cli::Commands::Branch { subcommand } => match subcommand {
+            cli::BranchCommands::List {
+                config,
+                after,
+                limit,
+            } => {
+                cli::branch::list_branches(&config, after, limit).await?;
+            }
+            cli::BranchCommands::Info { config, id } => {
+                cli::branch::get_branch_info(&config, id).await?;
+            }
+        },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
         }

@@ -10,6 +10,8 @@ use tonic::Code;
 use tonic::Streaming;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
+use uuid::Uuid;
+use zerofs::catalog::{CustomerCatalogPage, CustomerCatalogRecord};
 
 pub struct RpcClient {
     client: AdminServiceClient<Channel>,
@@ -147,6 +149,55 @@ impl RpcClient {
                         .map_err(|e| anyhow!("Invalid UUID: {}", e))?,
                 ))
             }
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
+        }
+    }
+
+    pub async fn list_branches(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<CustomerCatalogPage> {
+        let limit = u32::try_from(limit).context("Branch list limit exceeds u32")?;
+        let response = self
+            .client
+            .clone()
+            .list_branches(proto::ListBranchesRequest {
+                after: after.map(|id| id.to_string()),
+                limit,
+            })
+            .await
+            .map_err(|status| anyhow!("RPC call failed: {}", status.message()))?
+            .into_inner();
+        let records = response
+            .branches
+            .into_iter()
+            .map(CustomerCatalogRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_after = response
+            .next_after
+            .map(|id| Uuid::parse_str(&id))
+            .transpose()
+            .context("Server returned an invalid branch cursor UUID")?;
+        Ok(CustomerCatalogPage {
+            records,
+            next_after,
+        })
+    }
+
+    pub async fn get_branch_info(&self, id: Uuid) -> Result<Option<CustomerCatalogRecord>> {
+        let result = self
+            .client
+            .clone()
+            .get_branch_info(proto::GetBranchInfoRequest { id: id.to_string() })
+            .await;
+        match result {
+            Ok(response) => response
+                .into_inner()
+                .branch
+                .ok_or_else(|| anyhow!("Empty response from server"))
+                .and_then(|branch| CustomerCatalogRecord::try_from(branch).map(Some)),
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
         }
