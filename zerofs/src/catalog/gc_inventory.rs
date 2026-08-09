@@ -55,10 +55,12 @@ impl InventoryRecord {
     }
 
     fn metadata_matches(self, other: Self) -> bool {
+        // S3 LIST can preserve fractional seconds while GET/HEAD exposes the
+        // HTTP Last-Modified value at whole-second precision. The streamed
+        // digest still provides the exact identity used for revalidation.
         self.segid == other.segid
             && self.size == other.size
             && self.modified_seconds == other.modified_seconds
-            && self.modified_nanos == other.modified_nanos
     }
 
     fn modified_at(self) -> Result<DateTime<Utc>, GcInventoryError> {
@@ -367,8 +369,14 @@ impl GcInventoryStore {
                 let identity = self.read_identity(&path, record.segid).await?;
                 if !record.metadata_matches(identity) {
                     return Err(GcInventoryError::Corrupt(format!(
-                        "candidate {:?} changed during first observation",
-                        record.segid
+                        "candidate {:?} changed during first observation: listed size={} modified={}.{:09}, read size={} modified={}.{:09}",
+                        record.segid,
+                        record.size,
+                        record.modified_seconds,
+                        record.modified_nanos,
+                        identity.size,
+                        identity.modified_seconds,
+                        identity.modified_nanos,
                     )));
                 }
                 writer.push(identity).await?;
@@ -1273,6 +1281,20 @@ mod tests {
         assert!(original.metadata_matches(replacement));
         assert_ne!(original, replacement);
         assert_ne!(encode_record(original), encode_record(replacement));
+    }
+
+    #[test]
+    fn metadata_comparison_accepts_s3_list_and_get_timestamp_precision() {
+        let listed = InventoryRecord {
+            modified_nanos: 533_000_000,
+            ..record(1)
+        };
+        let read = record(1);
+        assert!(listed.metadata_matches(read));
+        assert!(!listed.metadata_matches(InventoryRecord {
+            modified_seconds: listed.modified_seconds + 1,
+            ..read
+        }));
     }
 
     #[tokio::test]

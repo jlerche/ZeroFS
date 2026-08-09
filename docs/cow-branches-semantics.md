@@ -1072,6 +1072,36 @@ result qualifies the gate only when the target is representative of production
 and the emitted JSON, provider telemetry, cost, and retained prefix have been
 reviewed.
 
+The ignored `cow_minio_postgres_lifecycle_stress` harness is the smaller local
+systems test for branch lifecycle and terminal report behavior. It accepts an
+explicitly acknowledged S3-compatible URL (including plain-HTTP MinIO), a
+disposable PostgreSQL URL, and `ZEROFS_COW_STRESS_POSTGRES_TLS=false` for local
+plaintext PostgreSQL. It uses no Redis. The default workload concurrently
+creates and exactly retries 128 checkpoint-derived branches, scans 16,384
+references per root over 4,096 reachable segments, inventories another 512
+candidates, advances one writer head, races projection reconciliation with
+duplicate exact deletion, reopens the SlateDB catalog, and proves the rootless
+report classifies the complete inventory as candidates. JSON and PostgreSQL are
+compared through every bounded page; lifecycle/storage authority remains in
+SlateDB. Scale and concurrency are configurable with the
+`ZEROFS_COW_STRESS_*` variables documented by the test.
+
+Run it only against disposable local services and a dedicated bucket prefix:
+
+```text
+AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
+ZEROFS_COW_STRESS_URL=s3://bucket/local-qualification \
+ZEROFS_COW_STRESS_CONFIRM=run-cow-minio-postgres-stress-with-retained-prefix \
+ZEROFS_COW_STRESS_POSTGRES_URL=postgresql://user:password@127.0.0.1/database \
+ZEROFS_COW_STRESS_POSTGRES_TLS=false \
+cargo test --release --lib cow_minio_postgres_lifecycle_stress -- --ignored --nocapture
+```
+
+Every run creates and prints a unique child prefix and deliberately performs no
+automatic cleanup, on success or failure, so the exact object state remains
+inspectable. This local harness is adversarial integration evidence; it does
+not replace the supported-envelope representative-backend release gate.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

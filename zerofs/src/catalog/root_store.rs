@@ -18,6 +18,9 @@ const ROOT_RESULT_OBJECT: &str = "__zerofs_branch_root_result.json";
 const HEAD_RESULT_PREFIX: &str = "__zerofs_branch_head_result_";
 const ROOT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 const ROOT_VERIFY_HEAD_CONCURRENCY: usize = 32;
+const CONCURRENT_CLONE_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONCURRENT_CLONE_RECONCILE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RootOwner {
@@ -307,18 +310,37 @@ impl SlateDbRootStore {
         }
         let clone_error = builder.build().await.err().map(|error| error.to_string());
 
-        let manifest = destination_admin
-            .read_manifest(None)
-            .await?
-            .ok_or_else(|| {
-                clone_error.clone().map_or_else(
-                    || RootStoreError::MissingManifest(destination_path.to_string()),
-                    RootStoreError::Clone,
-                )
-            })?;
-        if !manifest.initialized() {
-            return Err(RootStoreError::Uninitialized(destination_path.to_string()));
-        }
+        let reconcile_deadline = tokio::time::Instant::now() + CONCURRENT_CLONE_RECONCILE_TIMEOUT;
+        let manifest = loop {
+            if let Some(result) = self.read_result(&destination_path).await? {
+                if result.owner != owner {
+                    return Err(RootStoreError::OwnershipConflict(
+                        destination_path.to_string(),
+                    ));
+                }
+                self.verify(&result.root).await?;
+                return Ok(result.root);
+            }
+            match destination_admin.read_manifest(None).await? {
+                Some(manifest) if manifest.initialized() => break manifest,
+                state
+                    if clone_error.is_some()
+                        && tokio::time::Instant::now() < reconcile_deadline =>
+                {
+                    tokio::time::sleep(CONCURRENT_CLONE_RECONCILE_INTERVAL).await;
+                    drop(state);
+                }
+                Some(_) => {
+                    return Err(RootStoreError::Uninitialized(destination_path.to_string()));
+                }
+                None => {
+                    return Err(clone_error.clone().map_or_else(
+                        || RootStoreError::MissingManifest(destination_path.to_string()),
+                        RootStoreError::Clone,
+                    ));
+                }
+            }
+        };
         let attached = manifest.external_dbs().iter().any(|external| {
             external.path == source.database_path.to_string()
                 && external.source_checkpoint_id == source.checkpoint_id

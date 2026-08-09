@@ -17,6 +17,8 @@ mod private_epoch;
 mod root_store;
 #[path = "slatedb.rs"]
 mod slate;
+#[cfg(test)]
+mod stress;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Timelike, Utc};
@@ -2716,7 +2718,13 @@ fn validate_branch_create_relationships(snapshot: &CatalogSnapshot) -> Result<()
             }
             BranchCreatePhase::Published => {
                 if let Some(branch) = snapshot.branches.get(&operation.destination_id) {
-                    if branch.state != BranchState::Ready
+                    let state_matches = branch.state == BranchState::Ready
+                        || (branch.state == BranchState::Deleting
+                            && snapshot.branch_delete_operations.values().any(|deletion| {
+                                deletion.branch_id == branch.id
+                                    && deletion.phase == BranchDeletePhase::Draining
+                            }));
+                    if !state_matches
                         || branch.parent_id != operation.parent_id
                         || branch.origin_checkpoint_id != Some(operation.source_checkpoint_id)
                     {
@@ -3254,5 +3262,68 @@ mod tests {
 
         snapshot.tombstones.get_mut(&id).unwrap().deleted_at = created_at;
         assert!(matches!(snapshot.validate(), Err(CatalogError::Corrupt(_))));
+    }
+
+    #[test]
+    fn snapshot_accepts_published_create_while_branch_delete_is_draining() {
+        let now = catalog_timestamp(Utc::now());
+        let branch_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let create_id = Uuid::new_v4();
+        let delete_id = Uuid::new_v4();
+        let root = DurableRoot {
+            identity: "branches/draining".to_string(),
+            manifest_id: "manifest-1".to_string(),
+        };
+        let mut snapshot = CatalogSnapshot::default();
+        snapshot.branches.insert(
+            branch_id,
+            BranchRecord {
+                id: branch_id,
+                revision: 3,
+                name: "draining".to_string(),
+                state: BranchState::Deleting,
+                root: Some(root.clone()),
+                parent_id: Some(parent_id),
+                origin_checkpoint_id: Some(checkpoint_id),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        snapshot.branch_create_operations.insert(
+            create_id,
+            BranchCreateOperation {
+                id: create_id,
+                revision: 3,
+                destination_id: branch_id,
+                destination_name: "draining".to_string(),
+                source_checkpoint_id: checkpoint_id,
+                source_root: root.clone(),
+                parent_id: Some(parent_id),
+                phase: BranchCreatePhase::Published,
+                destination_root: Some(root.clone()),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        snapshot.branch_delete_operations.insert(
+            delete_id,
+            BranchDeleteOperation {
+                id: delete_id,
+                revision: 1,
+                branch_id,
+                branch_name: "draining".to_string(),
+                expected_branch_revision: 2,
+                root,
+                parent_id: Some(parent_id),
+                origin_checkpoint_id: Some(checkpoint_id),
+                phase: BranchDeletePhase::Draining,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
+        snapshot.validate().unwrap();
     }
 }
