@@ -43,9 +43,10 @@ pub use lease::{
 pub use lifecycle::{
     AdministrativeInspectionKind, AdministrativeInspectionPage, AdministrativeInspectionRecord,
     AdministrativeInspectionRequest, AdministrativeLeaseRecord,
-    BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchInspection, BranchLifecycle,
-    BranchLifecycleError, BranchLineageInspection, BranchMountGrant, BranchMountRequest,
-    HistoricalResource, HistoricalResourceStatus, MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
+    BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchFeatureConfig,
+    BranchInspection, BranchLifecycle, BranchLifecycleError, BranchLineageInspection,
+    BranchMountGrant, BranchMountRequest, HistoricalResource, HistoricalResourceStatus,
+    MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
@@ -75,12 +76,16 @@ pub fn catalog_timestamp(value: DateTime<Utc>) -> DateTime<Utc> {
 #[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
     pub slatedb_path: String,
+    /// Default-off release controls for customer lifecycle mutations and mounts.
+    #[serde(default)]
+    pub features: BranchFeatureConfig,
 }
 
 impl Default for CatalogConfig {
     fn default() -> Self {
         Self {
             slatedb_path: ".zerofs/catalog".to_string(),
+            features: BranchFeatureConfig::default(),
         }
     }
 }
@@ -115,10 +120,11 @@ impl CatalogConfig {
         )?;
         let catalog: Arc<dyn Catalog> =
             Arc::new(SlateDbCatalog::open(catalog_path, Arc::clone(&object_store)).await?);
-        Ok(BranchLifecycle::new(
+        Ok(BranchLifecycle::new_with_features(
             catalog,
             SlateDbRootStore::new(object_store, branch_database_root)
                 .with_segment_pool_root(segment_pool_path),
+            self.features,
         ))
     }
 }

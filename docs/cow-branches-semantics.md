@@ -321,6 +321,17 @@ crash safety continues to rely on bounded expiry, not shutdown callbacks.
 
 ## Customer projection and administrative inspection
 
+Customer lifecycle mutations and data-plane mount admission are guarded by
+server-owned feature controls. Branch creation, branch mounting, checkpoint
+deletion, and branch deletion default off independently when a lifecycle is
+opened from `CatalogConfig`; read-only list and inspection remain available.
+Direct branch/checkpoint lease acquisition carries the same mount control, so
+callers cannot bypass admission through the lower-level lease API. Renewal,
+release, and expiry remain available after disablement so existing leases are
+not stranded. The controls authorize API entry only. They are not stored in
+the catalog and cannot substitute for SlateDB revision, lease, root, or
+deletion fences.
+
 PostgreSQL and JSON are identical customer-facing projections. Both contain
 reconstructible lifecycle and customer metadata, and neither is a mount, write,
 or GC authority. Durable roots, manifests, active leases, storage operation

@@ -1,7 +1,7 @@
 use super::catalog_timestamp;
 use super::{
-    BranchDeleteOperation, BranchDeletePhase, BranchRecord, Catalog, CatalogError, CatalogMutation,
-    TombstoneKind, TombstoneRecord,
+    BranchDeleteOperation, BranchDeletePhase, BranchFeatureConfig, BranchRecord, Catalog,
+    CatalogError, CatalogMutation, TombstoneKind, TombstoneRecord,
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ pub enum BranchDeleteResult {
 #[derive(Clone)]
 pub struct DeletionLifecycle {
     catalog: Arc<dyn Catalog>,
+    features: BranchFeatureConfig,
 }
 
 impl std::fmt::Debug for DeletionLifecycle {
@@ -42,8 +43,16 @@ impl std::fmt::Debug for DeletionLifecycle {
 }
 
 impl DeletionLifecycle {
+    #[cfg(test)]
     pub(crate) fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self { catalog }
+        Self::new_with_features(catalog, BranchFeatureConfig::all_enabled())
+    }
+
+    pub(crate) fn new_with_features(
+        catalog: Arc<dyn Catalog>,
+        features: BranchFeatureConfig,
+    ) -> Self {
+        Self { catalog, features }
     }
 
     /// Fence one exact branch incarnation, drain its writer lease, and then
@@ -52,6 +61,9 @@ impl DeletionLifecycle {
         &self,
         request: BranchDeleteRequest,
     ) -> Result<BranchDeleteResult, DeletionLifecycleError> {
+        if !self.features.branch_delete {
+            return Err(DeletionLifecycleError::FeatureDisabled("branch deletion"));
+        }
         let operation = match self
             .catalog
             .branch_delete_operation(request.operation_id)
@@ -221,6 +233,11 @@ impl DeletionLifecycle {
         &self,
         request: CheckpointDeleteRequest,
     ) -> Result<TombstoneRecord, DeletionLifecycleError> {
+        if !self.features.checkpoint_delete {
+            return Err(DeletionLifecycleError::FeatureDisabled(
+                "checkpoint deletion",
+            ));
+        }
         if let Some(tombstone) = self.catalog.tombstone(request.checkpoint_id).await? {
             return exact_checkpoint_tombstone(&request, tombstone);
         }
@@ -293,6 +310,8 @@ fn exact_checkpoint_tombstone(
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeletionLifecycleError {
+    #[error("{0} is disabled by server feature control")]
+    FeatureDisabled(&'static str),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 }

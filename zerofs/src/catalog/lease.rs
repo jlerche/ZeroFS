@@ -37,6 +37,7 @@ pub struct LeaseRenewRequest {
 pub struct LeaseLifecycle {
     catalog: Arc<dyn Catalog>,
     roots: SlateDbRootStore,
+    acquisition_enabled: bool,
 }
 
 impl std::fmt::Debug for LeaseLifecycle {
@@ -48,8 +49,21 @@ impl std::fmt::Debug for LeaseLifecycle {
 }
 
 impl LeaseLifecycle {
+    #[cfg(test)]
     pub(crate) fn new(catalog: Arc<dyn Catalog>, roots: SlateDbRootStore) -> Self {
-        Self { catalog, roots }
+        Self::new_with_acquisition_control(catalog, roots, true)
+    }
+
+    pub(crate) fn new_with_acquisition_control(
+        catalog: Arc<dyn Catalog>,
+        roots: SlateDbRootStore,
+        acquisition_enabled: bool,
+    ) -> Self {
+        Self {
+            catalog,
+            roots,
+            acquisition_enabled,
+        }
     }
 
     pub async fn acquire_branch_by_name(
@@ -57,6 +71,7 @@ impl LeaseLifecycle {
         name: &str,
         request: LeaseAcquireRequest,
     ) -> Result<LeaseGrant, LeaseLifecycleError> {
+        self.require_acquisition_enabled()?;
         if let Some(existing) = self.exact_retry(&request, LeaseSubjectKind::Branch).await? {
             self.roots.verify(&existing.lease.root).await?;
             return Ok(existing);
@@ -83,6 +98,7 @@ impl LeaseLifecycle {
         name: &str,
         request: LeaseAcquireRequest,
     ) -> Result<LeaseGrant, LeaseLifecycleError> {
+        self.require_acquisition_enabled()?;
         if request.access_mode != LeaseAccessMode::Read {
             return Err(
                 CatalogError::Invalid("checkpoint leases must be read-only".to_string()).into(),
@@ -265,6 +281,16 @@ impl LeaseLifecycle {
             token_hash,
         }
     }
+
+    fn require_acquisition_enabled(&self) -> Result<(), LeaseLifecycleError> {
+        if self.acquisition_enabled {
+            Ok(())
+        } else {
+            Err(LeaseLifecycleError::FeatureDisabled(
+                "mount lease acquisition",
+            ))
+        }
+    }
 }
 
 struct EndLease<'a> {
@@ -305,6 +331,8 @@ fn token_hash(token: Uuid) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseLifecycleError {
+    #[error("{0} is disabled by server feature control")]
+    FeatureDisabled(&'static str),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]

@@ -44,6 +44,35 @@ pub struct BranchMountGrant {
     pub lease: LeaseGrant,
 }
 
+/// Server-owned release controls for customer-visible lifecycle operations.
+///
+/// Defaults are deliberately off. Read-only list and inspection APIs remain
+/// available because they cannot publish roots, leases, or tombstones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchFeatureConfig {
+    #[serde(default)]
+    pub create: bool,
+    #[serde(default)]
+    pub mount: bool,
+    #[serde(default)]
+    pub checkpoint_delete: bool,
+    #[serde(default)]
+    pub branch_delete: bool,
+}
+
+impl BranchFeatureConfig {
+    #[cfg(test)]
+    pub(crate) const fn all_enabled() -> Self {
+        Self {
+            create: true,
+            mount: true,
+            checkpoint_delete: true,
+            branch_delete: true,
+        }
+    }
+}
+
 pub const MAX_ADMINISTRATIVE_INSPECTION_RECORDS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +182,7 @@ pub enum BranchInspection {
 pub struct BranchLifecycle {
     catalog: Arc<dyn Catalog>,
     roots: SlateDbRootStore,
+    features: BranchFeatureConfig,
 }
 
 impl std::fmt::Debug for BranchLifecycle {
@@ -165,16 +195,33 @@ impl std::fmt::Debug for BranchLifecycle {
 }
 
 impl BranchLifecycle {
+    #[cfg(test)]
     pub(crate) fn new(catalog: Arc<dyn Catalog>, roots: SlateDbRootStore) -> Self {
-        Self { catalog, roots }
+        Self::new_with_features(catalog, roots, BranchFeatureConfig::all_enabled())
+    }
+
+    pub(crate) fn new_with_features(
+        catalog: Arc<dyn Catalog>,
+        roots: SlateDbRootStore,
+        features: BranchFeatureConfig,
+    ) -> Self {
+        Self {
+            catalog,
+            roots,
+            features,
+        }
     }
 
     pub fn leases(&self) -> super::LeaseLifecycle {
-        super::LeaseLifecycle::new(Arc::clone(&self.catalog), self.roots.clone())
+        super::LeaseLifecycle::new_with_acquisition_control(
+            Arc::clone(&self.catalog),
+            self.roots.clone(),
+            self.features.mount,
+        )
     }
 
     pub fn deletions(&self) -> super::DeletionLifecycle {
-        super::DeletionLifecycle::new(Arc::clone(&self.catalog))
+        super::DeletionLifecycle::new_with_features(Arc::clone(&self.catalog), self.features)
     }
 
     /// Run one policy-bounded metadata cleanup pass. Eligible tombstones become
@@ -197,6 +244,9 @@ impl BranchLifecycle {
         &self,
         request: BranchMountRequest,
     ) -> Result<BranchMountGrant, BranchLifecycleError> {
+        if !self.features.mount {
+            return Err(BranchLifecycleError::FeatureDisabled("branch mount"));
+        }
         validate_name(&request.branch_name)?;
         let grant = self
             .leases()
@@ -301,6 +351,7 @@ impl BranchLifecycle {
         &self,
         request: BranchCreateFromCheckpointNameRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        self.require_create_enabled()?;
         if let Some(existing) = self
             .catalog
             .branch_create_operation(request.operation_id)
@@ -364,6 +415,7 @@ impl BranchLifecycle {
         &self,
         request: BranchCreateRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        self.require_create_enabled()?;
         let existing = self
             .catalog
             .branch_create_operation(request.operation_id)
@@ -487,6 +539,14 @@ impl BranchLifecycle {
             .branch_create_operation(operation_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()).into())
+    }
+
+    fn require_create_enabled(&self) -> Result<(), BranchLifecycleError> {
+        if self.features.create {
+            Ok(())
+        } else {
+            Err(BranchLifecycleError::FeatureDisabled("branch creation"))
+        }
     }
 
     async fn ready_branch(
@@ -674,6 +734,8 @@ fn transition_time(created_at: DateTime<Utc>) -> DateTime<Utc> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BranchLifecycleError {
+    #[error("{0} is disabled by server feature control")]
+    FeatureDisabled(&'static str),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
@@ -1765,6 +1827,113 @@ mod tests {
             },
             HistoricalResourceStatus::Missing
         );
+    }
+
+    #[tokio::test]
+    async fn configured_lifecycle_features_default_off_and_enable_independently() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = crate::catalog::CatalogConfig {
+            slatedb_path: "feature-controls/catalog".to_string(),
+            ..crate::catalog::CatalogConfig::default()
+        };
+        let lifecycle = config
+            .open_branch_lifecycle(
+                Arc::clone(&store),
+                Path::from("feature-controls/branches"),
+                Path::from("feature-controls/segments"),
+            )
+            .await
+            .unwrap();
+        assert!(lifecycle.list_branches().await.unwrap().is_empty());
+
+        let branch_id = Uuid::new_v4();
+        let mount = BranchMountRequest {
+            branch_name: "candidate".to_string(),
+            lease: LeaseAcquireRequest {
+                lease_id: Uuid::new_v4(),
+                renewal_token: Uuid::new_v4(),
+                subject_id: branch_id,
+                access_mode: LeaseAccessMode::Read,
+                duration: chrono::Duration::minutes(1),
+            },
+        };
+        assert!(matches!(
+            lifecycle.mount_branch_by_name(mount.clone()).await,
+            Err(BranchLifecycleError::FeatureDisabled("branch mount"))
+        ));
+        assert!(matches!(
+            lifecycle
+                .leases()
+                .acquire_branch_by_name(&mount.branch_name, mount.lease.clone())
+                .await,
+            Err(crate::catalog::LeaseLifecycleError::FeatureDisabled(
+                "mount lease acquisition"
+            ))
+        ));
+        assert!(matches!(
+            lifecycle
+                .create_from_checkpoint(BranchCreateRequest {
+                    operation_id: Uuid::new_v4(),
+                    destination_id: Uuid::new_v4(),
+                    destination_name: "child".to_string(),
+                    source: ImmutableCheckpoint {
+                        database_path: Path::from("feature-controls/source"),
+                        checkpoint_id: Uuid::new_v4(),
+                        manifest_id: 1,
+                    },
+                    created_at: catalog_timestamp(Utc::now()),
+                })
+                .await,
+            Err(BranchLifecycleError::FeatureDisabled("branch creation"))
+        ));
+        assert!(matches!(
+            lifecycle
+                .deletions()
+                .delete_branch(BranchDeleteRequest {
+                    operation_id: Uuid::new_v4(),
+                    branch_id,
+                    expected_revision: 1,
+                    name: "candidate".to_string(),
+                })
+                .await,
+            Err(crate::catalog::DeletionLifecycleError::FeatureDisabled(
+                "branch deletion"
+            ))
+        ));
+        assert!(matches!(
+            lifecycle
+                .deletions()
+                .delete_checkpoint(CheckpointDeleteRequest {
+                    checkpoint_id: Uuid::new_v4(),
+                    expected_revision: 1,
+                    name: "checkpoint".to_string(),
+                })
+                .await,
+            Err(crate::catalog::DeletionLifecycleError::FeatureDisabled(
+                "checkpoint deletion"
+            ))
+        ));
+
+        let enabled = crate::catalog::CatalogConfig {
+            slatedb_path: "feature-controls/enabled-catalog".to_string(),
+            features: BranchFeatureConfig {
+                mount: true,
+                ..BranchFeatureConfig::default()
+            },
+        }
+        .open_branch_lifecycle(
+            store,
+            Path::from("feature-controls/enabled-branches"),
+            Path::from("feature-controls/enabled-segments"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            enabled.mount_branch_by_name(mount).await,
+            Err(BranchLifecycleError::Lease(
+                crate::catalog::LeaseLifecycleError::Catalog(CatalogError::NotFound(_))
+            ))
+        ));
     }
 
     #[test]
