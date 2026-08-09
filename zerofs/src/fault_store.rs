@@ -11,10 +11,11 @@ use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    UploadPart,
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Knobs shared with the test driving the store. Everything defaults to "no fault".
 #[derive(Debug, Default)]
@@ -39,6 +40,15 @@ pub struct FaultControls {
     gets: AtomicUsize,
     puts: AtomicUsize,
     deletes: AtomicUsize,
+    lists: AtomicUsize,
+    get_bytes: AtomicU64,
+    put_bytes: AtomicU64,
+    listed_objects: AtomicU64,
+    listed_object_bytes: AtomicU64,
+    multipart_initiates: AtomicUsize,
+    multipart_parts: AtomicUsize,
+    multipart_completes: AtomicUsize,
+    multipart_bytes: AtomicU64,
 }
 
 impl FaultControls {
@@ -84,6 +94,47 @@ impl FaultControls {
     pub fn delete_count(&self) -> usize {
         self.deletes.load(Ordering::SeqCst)
     }
+    pub fn list_count(&self) -> usize {
+        self.lists.load(Ordering::SeqCst)
+    }
+    pub fn get_bytes(&self) -> u64 {
+        self.get_bytes.load(Ordering::SeqCst)
+    }
+    pub fn put_bytes(&self) -> u64 {
+        self.put_bytes.load(Ordering::SeqCst)
+    }
+    pub fn listed_objects(&self) -> u64 {
+        self.listed_objects.load(Ordering::SeqCst)
+    }
+    pub fn listed_object_bytes(&self) -> u64 {
+        self.listed_object_bytes.load(Ordering::SeqCst)
+    }
+    pub fn multipart_initiate_count(&self) -> usize {
+        self.multipart_initiates.load(Ordering::SeqCst)
+    }
+    pub fn multipart_part_count(&self) -> usize {
+        self.multipart_parts.load(Ordering::SeqCst)
+    }
+    pub fn multipart_complete_count(&self) -> usize {
+        self.multipart_completes.load(Ordering::SeqCst)
+    }
+    pub fn multipart_bytes(&self) -> u64 {
+        self.multipart_bytes.load(Ordering::SeqCst)
+    }
+    pub fn reset_counts(&self) {
+        self.gets.store(0, Ordering::SeqCst);
+        self.puts.store(0, Ordering::SeqCst);
+        self.deletes.store(0, Ordering::SeqCst);
+        self.lists.store(0, Ordering::SeqCst);
+        self.get_bytes.store(0, Ordering::SeqCst);
+        self.put_bytes.store(0, Ordering::SeqCst);
+        self.listed_objects.store(0, Ordering::SeqCst);
+        self.listed_object_bytes.store(0, Ordering::SeqCst);
+        self.multipart_initiates.store(0, Ordering::SeqCst);
+        self.multipart_parts.store(0, Ordering::SeqCst);
+        self.multipart_completes.store(0, Ordering::SeqCst);
+        self.multipart_bytes.store(0, Ordering::SeqCst);
+    }
 }
 
 /// Decrement `counter` if positive; returns whether a unit was taken.
@@ -102,6 +153,38 @@ fn take_one(counter: &AtomicUsize) -> bool {
 pub struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     ctl: Arc<FaultControls>,
+}
+
+#[derive(Debug)]
+struct CountingMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    ctl: Arc<FaultControls>,
+}
+
+#[async_trait]
+impl MultipartUpload for CountingMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let bytes = data.content_length() as u64;
+        self.ctl.multipart_parts.fetch_add(1, Ordering::SeqCst);
+        let part = self.inner.put_part(data);
+        let ctl = Arc::clone(&self.ctl);
+        Box::pin(async move {
+            let result = part.await;
+            if result.is_ok() {
+                ctl.multipart_bytes.fetch_add(bytes, Ordering::SeqCst);
+            }
+            result
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.ctl.multipart_completes.fetch_add(1, Ordering::SeqCst);
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
 }
 
 impl FaultStore {
@@ -147,11 +230,15 @@ impl ObjectStore for FaultStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
+        let payload_bytes = payload.content_length() as u64;
         self.check_writable("put")?;
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }
         let result = self.inner.put_opts(location, payload, opts).await?;
+        self.ctl
+            .put_bytes
+            .fetch_add(payload_bytes, Ordering::SeqCst);
         if take_one(&self.ctl.fail_after_puts) {
             return Err(Self::transient("put response"));
         }
@@ -164,7 +251,12 @@ impl ObjectStore for FaultStore {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.check_writable("put_multipart")?;
-        self.inner.put_multipart_opts(location, opts).await
+        self.ctl.multipart_initiates.fetch_add(1, Ordering::SeqCst);
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(CountingMultipartUpload {
+            inner,
+            ctl: Arc::clone(&self.ctl),
+        }))
     }
 
     async fn get_opts(
@@ -178,6 +270,12 @@ impl ObjectStore for FaultStore {
         }
         let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
+        if !head {
+            self.ctl.get_bytes.fetch_add(
+                result.range.end.saturating_sub(result.range.start) as u64,
+                Ordering::SeqCst,
+            );
+        }
         // Head replies carry no body; only short-circuit truncation for them.
         if head || !take_one(&self.ctl.truncate_next_gets) {
             return Ok(result);
@@ -230,11 +328,31 @@ impl ObjectStore for FaultStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        self.ctl.lists.fetch_add(1, Ordering::SeqCst);
+        let ctl = Arc::clone(&self.ctl);
+        self.inner
+            .list(prefix)
+            .inspect(move |result| {
+                if let Ok(meta) = result {
+                    ctl.listed_objects.fetch_add(1, Ordering::SeqCst);
+                    ctl.listed_object_bytes
+                        .fetch_add(meta.size, Ordering::SeqCst);
+                }
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
+        self.ctl.lists.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.list_with_delimiter(prefix).await?;
+        self.ctl
+            .listed_objects
+            .fetch_add(result.objects.len() as u64, Ordering::SeqCst);
+        self.ctl.listed_object_bytes.fetch_add(
+            result.objects.iter().map(|meta| meta.size).sum(),
+            Ordering::SeqCst,
+        );
+        Ok(result)
     }
 
     async fn copy_opts(
@@ -303,6 +421,53 @@ mod tests {
         let got = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(&got[..], b"b");
         assert_eq!(ctl.put_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn counts_lists_and_resets_operation_counts() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("prefix/k");
+        store.put(&path, b"v".to_vec().into()).await.unwrap();
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        let listed = store
+            .list(Some(&Path::from("prefix")))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(ctl.list_count(), 1);
+        assert_eq!(ctl.get_bytes(), 1);
+        assert_eq!(ctl.put_bytes(), 1);
+        assert_eq!(ctl.listed_objects(), 1);
+        assert_eq!(ctl.listed_object_bytes(), 1);
+
+        let multipart_path = Path::from("multipart");
+        let mut upload = store
+            .put_multipart_opts(&multipart_path, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"mp"))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+        assert_eq!(ctl.multipart_initiate_count(), 1);
+        assert_eq!(ctl.multipart_part_count(), 1);
+        assert_eq!(ctl.multipart_complete_count(), 1);
+        assert_eq!(ctl.multipart_bytes(), 2);
+
+        ctl.reset_counts();
+        assert_eq!(ctl.get_count(), 0);
+        assert_eq!(ctl.put_count(), 0);
+        assert_eq!(ctl.delete_count(), 0);
+        assert_eq!(ctl.list_count(), 0);
+        assert_eq!(ctl.get_bytes(), 0);
+        assert_eq!(ctl.put_bytes(), 0);
+        assert_eq!(ctl.listed_objects(), 0);
+        assert_eq!(ctl.listed_object_bytes(), 0);
+        assert_eq!(ctl.multipart_initiate_count(), 0);
+        assert_eq!(ctl.multipart_part_count(), 0);
+        assert_eq!(ctl.multipart_complete_count(), 0);
+        assert_eq!(ctl.multipart_bytes(), 0);
     }
 
     #[tokio::test]

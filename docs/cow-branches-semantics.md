@@ -981,6 +981,23 @@ I/O, its linearity on a representative backend, and concurrent foreground
 latency remain separate open release gates; the probe deliberately does not
 turn synthetic memory-store timings into those claims.
 
+The ignored release probe `gc_external_work_amplification_probe` separately drives
+the real SlateDB catalog and mark/report pipeline through a counting
+object-store boundary. Doubling roots, references, or inventory doubles the
+corresponding logical work exactly and records ordinary requests, transferred
+payload bytes, multipart operations, and streamed list results. The
+20,000- and 40,000-reference fixtures place references in one shard so both
+cross the 256 KiB artifact threshold; multipart initiation, part, completion,
+and successful-byte counters are measured as well. In the inventory
+pair, streamed list results double exactly from 2,048 objects and 18,432 object
+bytes to 4,096 objects and 36,864 bytes. However, reference multipart bytes grow
+from 902,447 to 2,329,081 (2.58x) when references double because the
+binary-carry sorter crosses another merge level. The linear external-work gate
+therefore remains open pending a derived envelope-aware bound or a linear-sort
+redesign. The probe also does not treat in-memory timings or list-call
+pagination as representative backend latency; supported-envelope mark duration
+and concurrent foreground latency remain separate release gates.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record

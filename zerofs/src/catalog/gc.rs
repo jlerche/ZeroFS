@@ -1441,6 +1441,7 @@ mod tests {
         BranchRecord, BranchState, CatalogMutation, CatalogSnapshot, CheckpointRecord, DurableRoot,
         GcRootPin, LeaseAccessMode, LeaseRecord, LeaseSubjectKind, SlateDbCatalog,
     };
+    use crate::fault_store::FaultStore;
     use crate::fs::key_codec::KeyCodec;
     use crate::segment::{FrameLoc, Segid};
     use object_store::{ObjectStore, ObjectStoreExt};
@@ -1448,6 +1449,295 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::{Db, WriteBatch};
+
+    #[derive(Debug)]
+    struct GcPipelineProbe {
+        roots: u64,
+        references: u64,
+        inventory_objects: u64,
+        mark_gets: u64,
+        mark_puts: u64,
+        mark_lists: u64,
+        mark_get_bytes: u64,
+        mark_put_bytes: u64,
+        mark_listed_objects: u64,
+        mark_listed_object_bytes: u64,
+        mark_multipart_initiates: u64,
+        mark_multipart_parts: u64,
+        mark_multipart_completes: u64,
+        mark_multipart_bytes: u64,
+        report_gets: u64,
+        report_puts: u64,
+        report_lists: u64,
+        report_get_bytes: u64,
+        report_put_bytes: u64,
+        report_listed_objects: u64,
+        report_listed_object_bytes: u64,
+        report_multipart_initiates: u64,
+        report_multipart_parts: u64,
+        report_multipart_completes: u64,
+        report_multipart_bytes: u64,
+        mark_ms: u128,
+        report_ms: u128,
+    }
+
+    async fn gc_pipeline_probe(
+        label: &str,
+        root_count: usize,
+        reference_count: usize,
+        inventory_count: usize,
+        reference_counter_stride: u64,
+    ) -> GcPipelineProbe {
+        let (counting, counters) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = counting;
+        let data_path = Path::from(format!("gc-scale/{label}/data"));
+        let db = Db::builder(data_path.clone(), Arc::clone(&store))
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        let codec = KeyCodec::new();
+        let mut batch = WriteBatch::new();
+        for index in 0..reference_count as u64 {
+            batch.put(
+                codec.extent_key(1, index),
+                FrameLoc {
+                    segid: Segid::new(7, index * reference_counter_stride),
+                    frame_index: 0,
+                    byte_offset: 0,
+                    byte_len: 1,
+                }
+                .encode(),
+            );
+        }
+        db.write(batch).await.unwrap();
+        db.flush().await.unwrap();
+        let mut pins = Vec::with_capacity(root_count);
+        for _ in 0..root_count {
+            let checkpoint = db
+                .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+                .await
+                .unwrap();
+            pins.push(GcRootPin {
+                kind: GcRootKind::Checkpoint,
+                root: ImmutableCheckpoint {
+                    database_path: data_path.clone(),
+                    checkpoint_id: checkpoint.id,
+                    manifest_id: checkpoint.manifest_id,
+                }
+                .durable_root(),
+            });
+        }
+        pins.sort_by(|left, right| {
+            (&left.root.identity, &left.root.manifest_id)
+                .cmp(&(&right.root.identity, &right.root.manifest_id))
+        });
+        pins.dedup();
+        db.close().await.unwrap();
+
+        let segment_pool = Path::from(format!("gc-scale/{label}/segment-pool"));
+        futures::stream::iter(0..inventory_count as u64)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let path = Path::from(format!(
+                    "{segment_pool}/{}",
+                    Segid::new(8, index).object_key()
+                ));
+                async move {
+                    store
+                        .put(&path, bytes::Bytes::from_static(b"candidate").into())
+                        .await
+                        .unwrap();
+                }
+            })
+            .buffer_unordered(64)
+            .collect::<Vec<_>>()
+            .await;
+
+        let now = catalog_timestamp(Utc::now());
+        let run = GcRunRecord {
+            id: Uuid::new_v4(),
+            revision: 1,
+            catalog_generation: 0,
+            inventory_cutoff: now,
+            root_digest: gc_root_digest(&pins).unwrap(),
+            segment_pool: segment_pool.to_string(),
+            roots: pins,
+            mark_shards: Vec::new(),
+            mark_stats: None,
+            quarantine_shards: Vec::new(),
+            inventory_stats: None,
+            phase: GcRunPhase::Captured,
+            quarantine_at: None,
+            revalidation: None,
+            deletion: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from(format!("gc-scale/{label}/catalog")),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        catalog.begin_gc_run(0, run.clone()).await.unwrap();
+        let lifecycle = RootCaptureLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(
+                Arc::clone(&store),
+                Path::from(format!("gc-scale/{label}/branches")),
+            )
+            .with_segment_pool_root(segment_pool),
+        );
+
+        counters.reset_counts();
+        let mark_started = Instant::now();
+        let marked = lifecycle.mark(run.id).await.unwrap();
+        let mark_ms = mark_started.elapsed().as_millis();
+        let mark_gets = counters.get_count() as u64;
+        let mark_puts = counters.put_count() as u64;
+        let mark_lists = counters.list_count() as u64;
+        let mark_get_bytes = counters.get_bytes();
+        let mark_put_bytes = counters.put_bytes();
+        let mark_listed_objects = counters.listed_objects();
+        let mark_listed_object_bytes = counters.listed_object_bytes();
+        let mark_multipart_initiates = counters.multipart_initiate_count() as u64;
+        let mark_multipart_parts = counters.multipart_part_count() as u64;
+        let mark_multipart_completes = counters.multipart_complete_count() as u64;
+        let mark_multipart_bytes = counters.multipart_bytes();
+
+        counters.reset_counts();
+        let report_started = Instant::now();
+        let reported = lifecycle.report(run.id).await.unwrap();
+        let report_ms = report_started.elapsed().as_millis();
+        let report_gets = counters.get_count() as u64;
+        let report_puts = counters.put_count() as u64;
+        let report_lists = counters.list_count() as u64;
+        let report_get_bytes = counters.get_bytes();
+        let report_put_bytes = counters.put_bytes();
+        let report_listed_objects = counters.listed_objects();
+        let report_listed_object_bytes = counters.listed_object_bytes();
+        let report_multipart_initiates = counters.multipart_initiate_count() as u64;
+        let report_multipart_parts = counters.multipart_part_count() as u64;
+        let report_multipart_completes = counters.multipart_complete_count() as u64;
+        let report_multipart_bytes = counters.multipart_bytes();
+        let mark = marked.mark_stats.unwrap();
+        let inventory = reported.inventory_stats.unwrap();
+        catalog.close().await.unwrap();
+        GcPipelineProbe {
+            roots: mark.roots_enumerated,
+            references: mark.references_enumerated,
+            inventory_objects: inventory.objects_seen,
+            mark_gets,
+            mark_puts,
+            mark_lists,
+            mark_get_bytes,
+            mark_put_bytes,
+            mark_listed_objects,
+            mark_listed_object_bytes,
+            mark_multipart_initiates,
+            mark_multipart_parts,
+            mark_multipart_completes,
+            mark_multipart_bytes,
+            report_gets,
+            report_puts,
+            report_lists,
+            report_get_bytes,
+            report_put_bytes,
+            report_listed_objects,
+            report_listed_object_bytes,
+            report_multipart_initiates,
+            report_multipart_parts,
+            report_multipart_completes,
+            report_multipart_bytes,
+            mark_ms,
+            report_ms,
+        }
+    }
+
+    /// Release-mode object-store work characterization. Each pair doubles one
+    /// independent dimension while retaining the others. The JSON result is
+    /// evidence for selecting and verifying a derived production work bound;
+    /// it deliberately makes no linearity claim by itself.
+    #[tokio::test]
+    #[ignore = "release-mode GC external-work characterization"]
+    async fn gc_external_work_amplification_probe() {
+        let roots_small = gc_pipeline_probe("roots-small", 2, 1_024, 1, 1).await;
+        let roots_large = gc_pipeline_probe("roots-large", 4, 1_024, 1, 1).await;
+        assert_eq!(roots_large.roots, roots_small.roots * 2);
+        assert_eq!(roots_large.references, roots_small.references * 2);
+
+        let references_small = gc_pipeline_probe("references-small", 1, 20_000, 1, 256).await;
+        let references_large = gc_pipeline_probe("references-large", 1, 40_000, 1, 256).await;
+        assert_eq!(references_large.roots, references_small.roots);
+        assert_eq!(references_large.references, references_small.references * 2);
+        assert!(references_small.mark_multipart_parts > 0);
+        assert!(references_large.mark_multipart_parts > 0);
+
+        let inventory_small = gc_pipeline_probe("inventory-small", 1, 1, 2_048, 1).await;
+        let inventory_large = gc_pipeline_probe("inventory-large", 1, 1, 4_096, 1).await;
+        assert_eq!(
+            inventory_large.inventory_objects,
+            inventory_small.inventory_objects * 2
+        );
+        assert_eq!(
+            inventory_large.report_listed_objects,
+            inventory_small.report_listed_objects * 2
+        );
+        assert_eq!(
+            inventory_large.report_listed_object_bytes,
+            inventory_small.report_listed_object_bytes * 2
+        );
+
+        let render = |probe: &GcPipelineProbe| {
+            serde_json::json!({
+                "roots": probe.roots,
+                "references": probe.references,
+                "inventory_objects": probe.inventory_objects,
+                "mark": {
+                    "ms": probe.mark_ms,
+                    "gets": probe.mark_gets,
+                    "puts": probe.mark_puts,
+                    "lists": probe.mark_lists,
+                    "get_bytes": probe.mark_get_bytes,
+                    "put_bytes": probe.mark_put_bytes,
+                    "listed_objects": probe.mark_listed_objects,
+                    "listed_object_bytes": probe.mark_listed_object_bytes,
+                    "multipart_initiates": probe.mark_multipart_initiates,
+                    "multipart_parts": probe.mark_multipart_parts,
+                    "multipart_completes": probe.mark_multipart_completes,
+                    "multipart_bytes": probe.mark_multipart_bytes,
+                },
+                "report": {
+                    "ms": probe.report_ms,
+                    "gets": probe.report_gets,
+                    "puts": probe.report_puts,
+                    "lists": probe.report_lists,
+                    "get_bytes": probe.report_get_bytes,
+                    "put_bytes": probe.report_put_bytes,
+                    "listed_objects": probe.report_listed_objects,
+                    "listed_object_bytes": probe.report_listed_object_bytes,
+                    "multipart_initiates": probe.report_multipart_initiates,
+                    "multipart_parts": probe.report_multipart_parts,
+                    "multipart_completes": probe.report_multipart_completes,
+                    "multipart_bytes": probe.report_multipart_bytes,
+                },
+            })
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "roots_small": render(&roots_small),
+                "roots_large": render(&roots_large),
+                "references_small": render(&references_small),
+                "references_large": render(&references_large),
+                "inventory_small": render(&inventory_small),
+                "inventory_large": render(&inventory_large),
+            })
+        );
+    }
 
     async fn reopen_gc_lifecycle(
         catalog: Arc<SlateDbCatalog>,
