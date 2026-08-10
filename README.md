@@ -228,6 +228,7 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
 # default_region = "us-east-1"
 # allow_http = "true"  # For non-HTTPS endpoints (e.g., MinIO)
+# copy_if_not_exists = "multipart"  # Immutable multipart segments on AWS S3/MinIO
 # conditional_put = "redis://localhost:6379"  # For stores without conditional-put support
 ```
 
@@ -243,6 +244,10 @@ url = "file:///path/to/storage" # Local disk; no credentials
 Further schemes (`s3a://`, `abfs://`, host-routed `https://`, `memory://`): [Configuration Guide](https://www.zerofs.net/configuration).
 
 ZeroFS requires conditional writes (put-if-not-exists) for fencing. AWS S3 supports this natively; for stores that don't, set `conditional_put` to a Redis URL.
+Shared-pool writers also publish large immutable segments through a staged
+multipart upload. Set `copy_if_not_exists = "multipart"` for AWS S3 and
+compatible MinIO releases so that final publication cannot replace an existing
+segment; this does not require Redis.
 
 An optional `storage_class` under `[storage]` is passed verbatim to the backend (S3 `x-amz-storage-class`, GCS `x-goog-storage-class`, Azure `x-ms-access-tier`). Use a hot, standard-access class: archive tiers render the volume unusable, and infrequent-access tiers charge retrieval on ZeroFS's constant reads, usually costing more.
 

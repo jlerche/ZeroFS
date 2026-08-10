@@ -1141,6 +1141,38 @@ automatic cleanup, on success or failure, so the exact object state remains
 inspectable. This local harness is adversarial integration evidence; it does
 not replace the supported-envelope representative-backend release gate.
 
+The separate `scripts/stress-postgres-branches.sh` systems harness places real
+PostgreSQL `PGDATA` directories on strict 9P/FUSE ZeroFS mounts. It creates a
+base cluster, bootstraps the parent catalog branch, fans out multiple branches,
+runs divergent pgbench mutations, kills and recovers PostgreSQL and ZeroFS,
+runs `pg_amcheck`, and verifies both inherited data and parent/child isolation.
+It requires an exact disposable-run acknowledgement:
+
+```text
+cd zerofs
+cargo build
+ZEROFS_STRESS_CONFIRM=run-disposable-postgres-branches-on-zerofs \
+  ./scripts/stress-postgres-branches.sh
+```
+
+The harness starts MinIO plus one PostgreSQL container for the identical
+root-free customer projection and one PostgreSQL data container per branch.
+Local projection transport is explicitly plaintext; production projection
+transport remains TLS by default. MinIO uses native conditional writes and no
+Redis. The S3 options must include `copy_if_not_exists = "multipart"` in
+addition to ordinary conditional PUT support, because a large immutable segment
+is staged as multipart data and then published create-only.
+
+Today the harness rotates one SlateDB catalog authority between branch servers.
+This is required for correctness, not a performance shortcut: opening the same
+catalog in simultaneous serving processes creates independent SlateDB writers,
+and the newest client fences the older ones. Older servers then fail lease
+renewal and stop serving. Concurrent branch lifecycle calls inside one authority
+remain supported, but simultaneous data-plane branch servers require a central
+catalog-authority RPC or equivalent single-writer service before qualification.
+The script retains its workspace on failure and cleans all generated resources
+on success.
+
 ### Private fast path and cleanup
 
 Local GC may bypass global marking only when an authenticated ownership record
