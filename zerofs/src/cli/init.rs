@@ -307,6 +307,69 @@ pub(crate) struct ConfiguredBranchMount {
     pub(crate) preparation: zerofs::catalog::ServerWriterMountPreparation,
 }
 
+/// Writer-lifecycle authority used by a serving branch. Local mode delegates
+/// directly to the sole SlateDB owner; remote mode carries the same private
+/// capability over the dedicated owner-only Unix socket.
+#[derive(Clone)]
+pub(crate) enum BranchWriterAuthority {
+    Local(CatalogRuntime),
+    Remote(crate::rpc::catalog_authority::CatalogWriterAuthorityClient),
+}
+
+impl BranchWriterAuthority {
+    pub(crate) fn checkpoint_catalog(
+        &self,
+        branch_id: uuid::Uuid,
+    ) -> Arc<dyn crate::rpc::server::CheckpointCatalogAuthority> {
+        match self {
+            Self::Local(runtime) => Arc::new(runtime.checkpoint_catalog(branch_id)),
+            Self::Remote(client) => Arc::new(client.checkpoint_catalog(branch_id)),
+        }
+    }
+
+    pub(crate) async fn prepare_writer_mount(
+        &self,
+        config: &crate::config::ServerBranchMountConfig,
+    ) -> Result<zerofs::catalog::ServerWriterMountPreparation> {
+        match self {
+            Self::Local(runtime) => runtime.prepare_writer_mount(config).await,
+            Self::Remote(client) => client.prepare_writer_mount(config).await,
+        }
+    }
+
+    pub(crate) async fn renew_writer_mount(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+        duration: chrono::Duration,
+    ) -> Result<zerofs::catalog::LeaseGrant> {
+        match self {
+            Self::Local(runtime) => runtime.renew_writer_mount(grant, duration).await,
+            Self::Remote(client) => client.renew_writer_mount(grant, duration).await,
+        }
+    }
+
+    pub(crate) async fn recover_writer_mount(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+        duration: chrono::Duration,
+    ) -> Result<zerofs::catalog::LeaseGrant> {
+        match self {
+            Self::Local(runtime) => runtime.recover_writer_mount(grant, duration).await,
+            Self::Remote(client) => client.recover_writer_mount(grant, duration).await,
+        }
+    }
+
+    pub(crate) async fn publish_writer_head(
+        &self,
+        grant: &zerofs::catalog::LeaseGrant,
+    ) -> Result<()> {
+        match self {
+            Self::Local(runtime) => runtime.publish_writer_head(grant).await,
+            Self::Remote(client) => client.publish_writer_head(grant).await,
+        }
+    }
+}
+
 pub(crate) async fn open_catalog_runtime(
     config: Option<&crate::config::BranchCatalogConfig>,
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -407,6 +470,10 @@ struct StartupContext {
     /// Opening capability retained across writer-open retries.
     opening: Option<crate::replication::leader_record::OpeningToken>,
     catalog_runtime: Option<CatalogRuntime>,
+    catalog_authority_listener:
+        Option<crate::rpc::catalog_authority::CatalogWriterAuthorityListener>,
+    customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
+    branch_writer_authority: Option<BranchWriterAuthority>,
     branch_mount: Option<ConfiguredBranchMount>,
 }
 
@@ -586,8 +653,39 @@ impl StartupContext {
             } else {
                 None
             };
+        let remote_authority_socket = settings
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .writer_authority
+                    .as_ref()
+                    .and_then(|authority| authority.connect_unix_socket.clone())
+            })
+            .filter(|_| !db_mode.is_read_only());
+        // Claim and bind the private authority endpoint before opening the
+        // SlateDB catalog. A second owner must fail before it can fence the
+        // established catalog writer.
+        let catalog_authority_listener = match settings.catalog.as_ref().and_then(|catalog| {
+            catalog
+                .writer_authority
+                .as_ref()
+                .and_then(|authority| authority.listen_unix_socket.clone())
+                .map(|socket| (socket, catalog.volume_id))
+        }) {
+            Some((socket, volume_id)) if !db_mode.is_read_only() => Some(
+                crate::rpc::catalog_authority::CatalogWriterAuthorityListener::bind(
+                    socket, volume_id,
+                )?,
+            ),
+            _ => None,
+        };
+        let local_catalog_config = settings
+            .catalog
+            .as_ref()
+            .filter(|_| remote_authority_socket.is_none());
         let catalog_runtime = open_catalog_runtime(
-            settings.catalog.as_ref(),
+            local_catalog_config,
             Arc::clone(&object_store),
             wal_object_store.clone(),
             &configured_db_path,
@@ -595,17 +693,44 @@ impl StartupContext {
             db_mode,
         )
         .await?;
+        let branch_writer_authority = match (catalog_runtime.as_ref(), remote_authority_socket) {
+            (Some(runtime), None) => Some(BranchWriterAuthority::Local(runtime.clone())),
+            (None, Some(socket)) => Some(BranchWriterAuthority::Remote(
+                crate::rpc::catalog_authority::CatalogWriterAuthorityClient::connect(socket)
+                    .await?,
+            )),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("remote authority suppresses local catalog open"),
+        };
+        let customer_catalog = if let Some(runtime) = &catalog_runtime {
+            runtime.customer_catalog()
+        } else if let Some(catalog) = settings.catalog.as_ref() {
+            match catalog.projection.open().await {
+                Ok(projection) => Some(zerofs::catalog::CustomerCatalog::new(
+                    catalog.volume_id,
+                    projection,
+                )),
+                Err(error) => {
+                    tracing::warn!(
+                        "Customer catalog projection could not open; lifecycle authority remains available: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let branch_mount_config = settings
             .catalog
             .as_ref()
             .and_then(|catalog| catalog.mount.clone())
             .filter(|_| !db_mode.is_read_only());
-        let branch_mount = match (&catalog_runtime, branch_mount_config) {
-            (Some(runtime), Some(config)) => Some(ConfiguredBranchMount {
-                preparation: runtime.prepare_writer_mount(&config).await?,
+        let branch_mount = match (&branch_writer_authority, branch_mount_config) {
+            (Some(authority), Some(config)) => Some(ConfiguredBranchMount {
+                preparation: authority.prepare_writer_mount(&config).await?,
                 config,
             }),
-            (None, Some(_)) => anyhow::bail!("configured branch mount requires catalog runtime"),
+            (None, Some(_)) => anyhow::bail!("configured branch mount requires writer authority"),
             _ => None,
         };
         let actual_db_path = branch_mount.as_ref().map_or(configured_db_path, |mount| {
@@ -746,6 +871,9 @@ impl StartupContext {
             recovering_handoff: false,
             opening: None,
             catalog_runtime,
+            catalog_authority_listener,
+            customer_catalog,
+            branch_writer_authority,
             branch_mount,
         })
     }
@@ -1372,6 +1500,9 @@ impl ReconciledDb {
             recovering_handoff: _,
             opening: _,
             catalog_runtime,
+            catalog_authority_listener,
+            customer_catalog,
+            branch_writer_authority,
             branch_mount,
         } = startup;
 
@@ -1596,6 +1727,9 @@ impl ReconciledDb {
             db_handle,
             authority,
             catalog_runtime,
+            catalog_authority_listener,
+            customer_catalog,
+            branch_writer_authority,
             branch_mount,
         })
     }
@@ -1813,6 +1947,7 @@ mod role_decision_tests {
             },
             branch_database_root: "runtime/branches".to_string(),
             mount: None,
+            writer_authority: None,
         };
         let runtime = open_catalog_runtime(
             Some(&config),
@@ -1845,6 +1980,7 @@ mod role_decision_tests {
             },
             branch_database_root: "runtime/fallback-branches".to_string(),
             mount: None,
+            writer_authority: None,
         };
         let fallback = open_catalog_runtime(
             Some(&unavailable_projection),
@@ -1874,6 +2010,7 @@ mod role_decision_tests {
             },
             branch_database_root: "runtime/other-branches".to_string(),
             mount: None,
+            writer_authority: None,
         };
         let error = open_catalog_runtime(
             Some(&overlapping),
@@ -1956,6 +2093,9 @@ mod role_decision_tests {
             recovering_handoff: false,
             opening: None,
             catalog_runtime: None,
+            catalog_authority_listener: None,
+            customer_catalog: None,
+            branch_writer_authority: None,
             branch_mount: None,
         };
         let election = tokio::spawn(async move {

@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package zerofs.catalog_authority;
+
+// Private writer-capability service. ZeroFS only exposes this service on a
+// dedicated owner-only Unix socket; it is never added to the public Admin RPC.
+service CatalogWriterAuthorityService {
+    rpc PrepareWriter(PrepareWriterRequest) returns (WriterPreparation);
+    rpc RenewWriter(WriterGrantRequest) returns (WriterGrant);
+    rpc RecoverWriter(WriterGrantRequest) returns (WriterGrant);
+    rpc PublishWriter(WriterGrant) returns (PublishWriterResponse);
+    rpc PublishCheckpoint(PublishCheckpointRequest) returns (CatalogRecord);
+    rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (CatalogRecord);
+}
+
+message PrepareWriterRequest {
+    string branch_name = 1;
+    string expected_branch_id = 2;
+    string server_id = 3;
+    string renewal_secret = 4;
+    uint64 lease_duration_seconds = 5;
+}
+
+message WriterGrantRequest {
+    bytes grant_json = 1;
+    uint64 lease_duration_seconds = 2;
+}
+
+message WriterGrant {
+    bytes grant_json = 1;
+}
+
+message WriterPreparation {
+    bytes preparation_json = 1;
+}
+
+message PublishWriterResponse {}
+
+message PublishCheckpointRequest {
+    string checkpoint_id = 1;
+    string branch_id = 2;
+    string name = 3;
+    string database_path = 4;
+    string physical_checkpoint_id = 5;
+    uint64 manifest_id = 6;
+    int64 created_at_seconds = 7;
+    uint32 created_at_nanos = 8;
+}
+
+message DeleteCheckpointRequest {
+    string branch_id = 1;
+    string checkpoint_id = 2;
+    string name = 3;
+}
+
+message CatalogRecord {
+    bytes record_json = 1;
+}

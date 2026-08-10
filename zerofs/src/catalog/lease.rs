@@ -19,7 +19,7 @@ pub struct LeaseAcquireRequest {
     pub duration: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseGrant {
     pub lease: LeaseRecord,
     pub renewal_token: Uuid,

@@ -1,3 +1,4 @@
+pub(crate) mod catalog_authority;
 pub mod client;
 pub mod convert;
 pub mod server;
@@ -8,4 +9,8 @@ pub mod proto {
     // package, and the lint fires on generated code we can't annotate inline.
     #![allow(clippy::enum_variant_names)]
     tonic::include_proto!("zerofs.admin");
+}
+
+pub(crate) mod authority_proto {
+    tonic::include_proto!("zerofs.catalog_authority");
 }

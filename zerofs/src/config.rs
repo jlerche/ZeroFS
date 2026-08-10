@@ -389,6 +389,20 @@ pub struct BranchCatalogConfig {
     /// allowing exact crash recovery without reusing a published lease UUID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount: Option<ServerBranchMountConfig>,
+    /// Private, Unix-socket-only catalog writer authority transport. A process
+    /// may either listen as the sole SlateDB catalog owner or connect as a
+    /// branch worker that never opens the catalog directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_authority: Option<CatalogWriterAuthorityConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogWriterAuthorityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_unix_socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_unix_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1063,6 +1077,20 @@ impl Settings {
                     );
                 }
             }
+            if let Some(authority) = &catalog.writer_authority {
+                match (
+                    authority.listen_unix_socket.as_ref(),
+                    authority.connect_unix_socket.as_ref(),
+                ) {
+                    (Some(_), Some(_)) | (None, None) => anyhow::bail!(
+                        "[catalog.writer_authority] requires exactly one of listen_unix_socket or connect_unix_socket"
+                    ),
+                    (None, Some(_)) if catalog.mount.is_none() => anyhow::bail!(
+                        "[catalog.writer_authority] connect_unix_socket requires [catalog.mount]"
+                    ),
+                    _ => {}
+                }
+            }
             if self.storage.segment_pool_path.is_none() {
                 anyhow::bail!(
                     "[catalog] requires storage.segment_pool_path so every branch shares one physical inventory"
@@ -1242,6 +1270,15 @@ impl Settings {
         toml_string.push_str("# server_id = \"00000000-0000-4000-8000-000000000003\"\n");
         toml_string.push_str("# renewal_secret = \"00000000-0000-4000-8000-000000000004\"\n");
         toml_string.push_str("# lease_duration_seconds = 300\n");
+        toml_string
+            .push_str("# A sole catalog owner may serve private writer capabilities locally:\n");
+        toml_string.push_str("# [catalog.writer_authority]\n");
+        toml_string.push_str("# Parent directory must already exist, be owned by the ZeroFS uid, and have mode 0700.\n");
+        toml_string.push_str(
+            "# All processes for one volume must run under that same operating-system uid.\n",
+        );
+        toml_string.push_str("# listen_unix_socket = \"/run/zerofs/catalog-writer.sock\"\n");
+        toml_string.push_str("# Branch workers instead set connect_unix_socket to that owner-only socket and never open catalog SlateDB.\n");
         toml_string.push_str("# [catalog.projection]\n");
         toml_string
             .push_str("# backend = \"json\"\n# path = \".zerofs/catalog-projection.json\"\n");
@@ -2299,6 +2336,68 @@ connection_string = "postgresql://catalog.invalid/zerofs"
         let error = format!("{:#}", write_and_load(&with_replication).unwrap_err());
         assert!(error.contains("cannot be combined with [replication]"));
         assert!(error.contains("replicated writer authority domain"));
+    }
+
+    #[test]
+    fn catalog_writer_authority_requires_one_unix_socket_role() {
+        let base = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+segment_pool_path = "volume/segments"
+
+[servers]
+
+[catalog]
+volume_id = "11111111-1111-4111-8111-111111111111"
+branch_database_root = "volume/branches"
+
+[catalog.authority]
+slatedb_path = "volume/catalog"
+
+[catalog.authority.features]
+mount = true
+
+[catalog.mount]
+branch_name = "main"
+expected_branch_id = "22222222-2222-4222-8222-222222222222"
+server_id = "33333333-3333-4333-8333-333333333333"
+renewal_secret = "44444444-4444-4444-8444-444444444444"
+
+[catalog.writer_authority]
+connect_unix_socket = "/run/zerofs/catalog-writer.sock"
+"#;
+        let catalog = write_and_load(base).unwrap().catalog.unwrap();
+        let authority = catalog.writer_authority.unwrap();
+        assert_eq!(
+            authority.connect_unix_socket.as_deref(),
+            Some(std::path::Path::new("/run/zerofs/catalog-writer.sock"))
+        );
+        assert!(authority.listen_unix_socket.is_none());
+
+        let both = base.replace(
+            "connect_unix_socket = \"/run/zerofs/catalog-writer.sock\"",
+            "connect_unix_socket = \"/run/zerofs/catalog-writer.sock\"\nlisten_unix_socket = \"/tmp/also.sock\"",
+        );
+        let error = format!("{:#}", write_and_load(&both).unwrap_err());
+        assert!(error.contains("requires exactly one"));
+
+        let no_mount = base.replace(
+            r#"[catalog.mount]
+branch_name = "main"
+expected_branch_id = "22222222-2222-4222-8222-222222222222"
+server_id = "33333333-3333-4333-8333-333333333333"
+renewal_secret = "44444444-4444-4444-8444-444444444444"
+
+"#,
+            "",
+        );
+        let error = format!("{:#}", write_and_load(&no_mount).unwrap_err());
+        assert!(error.contains("connect_unix_socket requires [catalog.mount]"));
     }
 
     #[test]

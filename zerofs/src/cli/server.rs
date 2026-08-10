@@ -828,6 +828,10 @@ pub struct InitResult {
     /// Retains the authoritative catalog lifecycle for the serving process;
     /// lifecycle APIs and stable mount wiring consume it incrementally.
     pub(crate) catalog_runtime: Option<crate::cli::init::CatalogRuntime>,
+    pub(crate) catalog_authority_listener:
+        Option<crate::rpc::catalog_authority::CatalogWriterAuthorityListener>,
+    pub(crate) customer_catalog: Option<zerofs::catalog::CustomerCatalog>,
+    pub(crate) branch_writer_authority: Option<crate::cli::init::BranchWriterAuthority>,
     pub(crate) branch_mount: Option<crate::cli::init::ConfiguredBranchMount>,
 }
 
@@ -931,7 +935,7 @@ type BranchWriterReconciler = Arc<
 
 impl BranchWriterLeaseSupervisor {
     async fn start(
-        runtime: crate::cli::init::CatalogRuntime,
+        authority: crate::cli::init::BranchWriterAuthority,
         config: crate::config::ServerBranchMountConfig,
         mount: zerofs::catalog::ServerWriterMountPreparation,
     ) -> Result<Self> {
@@ -943,16 +947,16 @@ impl BranchWriterLeaseSupervisor {
         let initial = confirm_branch_writer_before_serving(
             &mount.grant,
             branch_writer_renewal_safety_margin(lease_duration_seconds),
-            runtime.renew_writer_mount(&mount.grant, duration),
+            authority.renew_writer_mount(&mount.grant, duration),
         )
         .await?;
-        let reconcile_runtime = runtime.clone();
+        let reconcile_runtime = authority.clone();
         let reconciler: BranchWriterReconciler = Arc::new(move |current, duration| {
             let runtime = reconcile_runtime.clone();
             Box::pin(async move { runtime.recover_writer_mount(&current, duration).await })
         });
         let renewer: BranchWriterRenewer = Arc::new(move |current, duration| {
-            let runtime = runtime.clone();
+            let runtime = authority.clone();
             Box::pin(async move {
                 match runtime.renew_writer_mount(&current, duration).await {
                     Ok(renewed) => Ok(renewed),
@@ -998,10 +1002,33 @@ impl BranchWriterLeaseSupervisor {
         let worker_stop = task_stop.clone();
         let worker_lost = task_lost.clone();
         let worker = tokio::spawn(async move {
+            let mut next_attempt = interval;
             loop {
+                let before_sleep = task_grant.lock().await.clone();
+                let until_deadline = match branch_writer_time_to_safety_deadline(
+                    &before_sleep,
+                    safety_margin,
+                ) {
+                    Ok(remaining) => remaining,
+                    Err(_) => {
+                        tracing::error!(
+                            "configured branch writer lease reached its renewal safety deadline; stopping serving"
+                        );
+                        worker_lost.cancel();
+                        return;
+                    }
+                };
                 tokio::select! {
+                    biased;
                     _ = worker_stop.cancelled() => return,
-                    _ = tokio::time::sleep(interval) => {}
+                    _ = tokio::time::sleep(until_deadline) => {
+                        tracing::error!(
+                            "configured branch writer lease reached its renewal safety deadline; stopping serving"
+                        );
+                        worker_lost.cancel();
+                        return;
+                    }
+                    _ = tokio::time::sleep(next_attempt) => {}
                 }
                 let current = task_grant.lock().await.clone();
                 let remaining = match branch_writer_time_to_safety_deadline(&current, safety_margin)
@@ -1021,15 +1048,17 @@ impl BranchWriterLeaseSupervisor {
                     outcome = tokio::time::timeout(remaining, renewer(current, duration)) => outcome,
                 };
                 match outcome {
-                    Ok(Ok(renewed)) => *task_grant.lock().await = renewed,
+                    Ok(Ok(renewed)) => {
+                        *task_grant.lock().await = renewed;
+                        next_attempt = interval;
+                    }
                     Ok(Err(failure)) => {
                         *task_grant.lock().await = failure.latest;
-                        tracing::error!(
-                            "configured branch writer lease renewal failed; stopping serving: {:#}",
+                        tracing::warn!(
+                            "configured branch writer lease renewal failed; retrying before the safety deadline: {:#}",
                             failure.error
                         );
-                        worker_lost.cancel();
-                        return;
+                        next_attempt = interval.min(Duration::from_secs(1));
                     }
                     Err(_) => {
                         tracing::error!(
@@ -1108,6 +1137,7 @@ async fn close_unserved_filesystem(
     fs: &ZeroFS,
     db_mode: DatabaseMode,
     catalog_runtime: Option<&crate::cli::init::CatalogRuntime>,
+    writer_authority: Option<&crate::cli::init::BranchWriterAuthority>,
     branch_writer: Option<BranchWriterLeaseSupervisor>,
     branch_grant: Option<zerofs::catalog::LeaseGrant>,
 ) -> Result<()> {
@@ -1128,8 +1158,8 @@ async fn close_unserved_filesystem(
         let _ = close_catalog_runtime(catalog_runtime).await;
         return Err(error).context("Failed to close initialized but unserved database");
     }
-    let publication_result = match (catalog_runtime, branch_grant.as_ref()) {
-        (Some(runtime), Some(grant)) => runtime.publish_writer_head(grant).await,
+    let publication_result = match (writer_authority, branch_grant.as_ref()) {
+        (Some(authority), Some(grant)) => authority.publish_writer_head(grant).await,
         _ => Ok(()),
     };
     let catalog_close_result = close_catalog_runtime(catalog_runtime).await;
@@ -1222,7 +1252,13 @@ pub async fn run_server(
         || settings.servers.ninep.is_some()
         || settings.servers.nbd.is_some()
         || settings.servers.rpc.is_some()
-        || (cfg!(feature = "webui") && settings.servers.webui.is_some());
+        || (cfg!(feature = "webui") && settings.servers.webui.is_some())
+        || settings.catalog.as_ref().is_some_and(|catalog| {
+            catalog
+                .writer_authority
+                .as_ref()
+                .is_some_and(|authority| authority.listen_unix_socket.is_some())
+        });
     if !any_server {
         anyhow::bail!(
             "No servers configured. At least one server (NFS, 9P, NBD, RPC, or enabled WebUI) must be enabled."
@@ -1239,11 +1275,14 @@ pub async fn run_server(
     let fs = init_result.fs;
     let authority = init_result.authority;
     let catalog_runtime = init_result.catalog_runtime;
-    let mut branch_writer = match (catalog_runtime.as_ref(), init_result.branch_mount) {
-        (Some(runtime), Some(mount)) => {
+    let catalog_authority_listener = init_result.catalog_authority_listener;
+    let customer_catalog = init_result.customer_catalog;
+    let branch_writer_authority = init_result.branch_writer_authority;
+    let mut branch_writer = match (branch_writer_authority.as_ref(), init_result.branch_mount) {
+        (Some(writer_authority), Some(mount)) => {
             let fallback_grant = mount.preparation.grant.clone();
             match BranchWriterLeaseSupervisor::start(
-                runtime.clone(),
+                writer_authority.clone(),
                 mount.config.clone(),
                 mount.preparation,
             )
@@ -1255,7 +1294,7 @@ pub async fn run_server(
                         chrono::Duration::seconds(mount.config.lease_duration_seconds as i64);
                     let current_grant = match recover_branch_writer_bounded(
                         BRANCH_RENEWAL_RECONCILE_TIMEOUT,
-                        runtime.recover_writer_mount(&fallback_grant, duration),
+                        writer_authority.recover_writer_mount(&fallback_grant, duration),
                     )
                     .await
                     {
@@ -1270,7 +1309,8 @@ pub async fn run_server(
                     close_unserved_filesystem(
                         &fs,
                         db_mode,
-                        Some(runtime),
+                        catalog_runtime.as_ref(),
+                        Some(writer_authority),
                         None,
                         Some(current_grant),
                     )
@@ -1282,7 +1322,7 @@ pub async fn run_server(
             }
         }
         (None, None) | (Some(_), None) => None,
-        (None, Some(_)) => anyhow::bail!("configured branch mount lost its catalog runtime"),
+        (None, Some(_)) => anyhow::bail!("configured branch mount lost its writer authority"),
     };
     let leadership_deposed = authority
         .as_ref()
@@ -1313,6 +1353,7 @@ pub async fn run_server(
             &fs,
             db_mode,
             catalog_runtime.as_ref(),
+            branch_writer_authority.as_ref(),
             branch_writer.take(),
             None,
         )
@@ -1414,15 +1455,12 @@ pub async fn run_server(
     }
     #[cfg(feature = "webui")]
     let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
-    let checkpoint_catalog = catalog_runtime.as_ref().and_then(|runtime| {
+    let checkpoint_catalog = branch_writer_authority.as_ref().and_then(|authority| {
         settings
             .catalog
             .as_ref()
             .and_then(|catalog| catalog.mount.as_ref())
-            .map(|mount| {
-                Arc::new(runtime.checkpoint_catalog(mount.expected_branch_id))
-                    as Arc<dyn crate::rpc::server::CheckpointCatalogAuthority>
-            })
+            .map(|mount| authority.checkpoint_catalog(mount.expected_branch_id))
     });
     let catalog_configured = settings.catalog.is_some();
     let branch_catalog = catalog_runtime.as_ref().map(|runtime| {
@@ -1432,6 +1470,8 @@ pub async fn run_server(
     let checkpoint_catalog_for_webui = checkpoint_catalog.clone();
     #[cfg(feature = "webui")]
     let branch_catalog_for_webui = branch_catalog.clone();
+    #[cfg(feature = "webui")]
+    let customer_catalog_for_webui = customer_catalog.clone();
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
@@ -1439,14 +1479,27 @@ pub async fn run_server(
             checkpoint_catalog,
             branch_catalog,
             catalog_configured,
-            customer_catalog: catalog_runtime
-                .as_ref()
-                .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
+            customer_catalog,
         },
         Arc::clone(&fs),
         shutdown.clone(),
     )
     .await;
+    let catalog_authority_handle = match catalog_authority_listener {
+        Some(listener) => {
+            let runtime = catalog_runtime
+                .as_ref()
+                .expect("validated local writer authority requires catalog runtime")
+                .clone();
+            let authority_shutdown = shutdown.clone();
+            Some(spawn_named("catalog-writer-authority", async move {
+                crate::rpc::catalog_authority::serve(listener, runtime, authority_shutdown)
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            }))
+        }
+        None => None,
+    };
 
     // Keep the metadata block cache warm so the first wave of reads (and the
     // reads right after every compaction, which replaces meta SSTs with cold
@@ -1512,9 +1565,7 @@ pub async fn run_server(
             checkpoint_catalog_for_webui,
             branch_catalog_for_webui,
             catalog_configured,
-            catalog_runtime
-                .as_ref()
-                .and_then(crate::cli::init::CatalogRuntime::customer_catalog),
+            customer_catalog_for_webui,
             Arc::clone(&fs),
             shutdown.clone(),
         );
@@ -1535,6 +1586,7 @@ pub async fn run_server(
     server_handles.extend(ninep_handles);
     server_handles.extend(nbd_handles);
     server_handles.extend(rpc_handles);
+    server_handles.extend(catalog_authority_handle);
     #[cfg(feature = "webui")]
     server_handles.extend(webui_handles);
 
@@ -1544,6 +1596,7 @@ pub async fn run_server(
             &fs,
             db_mode,
             catalog_runtime.as_ref(),
+            branch_writer_authority.as_ref(),
             branch_writer.take(),
             None,
         )
@@ -1683,8 +1736,8 @@ pub async fn run_server(
         return Err(leadership_lost_error());
     }
 
-    let publication_result = match (catalog_runtime.as_ref(), branch_grant.as_ref()) {
-        (Some(runtime), Some(grant)) => runtime.publish_writer_head(grant).await,
+    let publication_result = match (branch_writer_authority.as_ref(), branch_grant.as_ref()) {
+        (Some(authority), Some(grant)) => authority.publish_writer_head(grant).await,
         _ => Ok(()),
     };
     let catalog_close_result = close_catalog_runtime(catalog_runtime.as_ref()).await;
@@ -1812,23 +1865,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_writer_supervisor_retains_reconciled_grant_on_renewal_failure() {
+    async fn branch_writer_supervisor_retries_transient_renewal_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
         let initial = test_branch_writer_grant(chrono::Duration::seconds(1));
-        let renewer: BranchWriterRenewer = Arc::new(move |mut grant, _| {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let renewer: BranchWriterRenewer = Arc::new(move |mut grant, duration| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                grant.lease.revision = 9;
+                if attempt == 0 {
+                    return Err(BranchWriterRenewalFailure {
+                        latest: grant,
+                        error: anyhow::anyhow!("authority temporarily unavailable"),
+                    });
+                }
+                grant.lease.revision += 1;
+                grant.lease.updated_at = chrono::Utc::now();
+                grant.lease.expires_at = grant.lease.updated_at + duration;
+                Ok(grant)
+            })
+        });
+        let supervisor = BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 1, renewer);
+        let lost = supervisor.loss_token();
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let latest = supervisor.stop().await;
+        assert!(!lost.is_cancelled());
+        assert!(latest.lease.revision > 1);
+    }
+
+    #[tokio::test]
+    async fn branch_writer_supervisor_persistent_failure_stops_before_expiry() {
+        let initial = test_branch_writer_grant(chrono::Duration::milliseconds(350));
+        let expires_at = initial.lease.expires_at;
+        let renewer: BranchWriterRenewer = Arc::new(move |grant, _| {
+            Box::pin(async move {
                 Err(BranchWriterRenewalFailure {
                     latest: grant,
-                    error: anyhow::anyhow!("lost renewal response"),
+                    error: anyhow::anyhow!("authority remains unavailable"),
                 })
             })
         });
         let supervisor = BranchWriterLeaseSupervisor::spawn_after_confirmation(initial, 0, renewer);
-        let lost = supervisor.loss_token();
-        tokio::time::timeout(Duration::from_millis(500), lost.cancelled())
-            .await
-            .expect("renewal failure must revoke serving");
-        assert_eq!(supervisor.stop().await.lease.revision, 9);
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            supervisor.loss_token().cancelled(),
+        )
+        .await
+        .expect("persistent renewal failure must revoke at the safety deadline");
+        assert!(chrono::Utc::now() < expires_at);
+        supervisor.stop().await;
     }
 
     #[tokio::test]

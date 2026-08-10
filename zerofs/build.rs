@@ -1,5 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-changed=proto/admin.proto");
+    println!("cargo::rerun-if-changed=proto/catalog_authority.proto");
     println!("cargo::rerun-if-changed=proto/replication.proto");
 
     // Use system protoc if available, otherwise build from source via protobuf-src
@@ -24,7 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &["proto/admin.proto", "proto/replication.proto"],
+            &[
+                "proto/admin.proto",
+                "proto/catalog_authority.proto",
+                "proto/replication.proto",
+            ],
             &["proto/"],
         )?;
     Ok(())

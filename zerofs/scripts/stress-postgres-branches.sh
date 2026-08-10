@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 # Disposable local qualification for real PostgreSQL data directories on COW
-# ZeroFS branches. Branch roots coexist, while servers rotate the one supported
-# SlateDB catalog writer; simultaneous catalog-owning servers currently fence
-# one another and are tracked as a separate production gap.
+# ZeroFS branches. One process owns the SlateDB catalog and exposes its private
+# writer lifecycle over an owner-only Unix socket; every branch worker stays up
+# concurrently without independently opening (and fencing) the catalog.
 
 readonly CONFIRMATION="run-disposable-postgres-branches-on-zerofs"
 readonly POSTGRES_IMAGE="${ZEROFS_STRESS_POSTGRES_IMAGE:-postgres:17-alpine}"
@@ -72,6 +72,8 @@ readonly MINIO_PASSWORD="zerofs-local-stress-secret"
 readonly PG_PASSWORD="zerofs-local-postgres-secret"
 readonly BUCKET="zerofs-stress"
 readonly OBJECT_PREFIX="runs/$RUN_ID"
+readonly AUTHORITY_DIR="/tmp/zerofs-ca-$RUN_ID"
+readonly AUTHORITY_SOCKET="$AUTHORITY_DIR/catalog-writer-authority.sock"
 readonly VOLUME_ID="$(</proc/sys/kernel/random/uuid)"
 readonly MAIN_BRANCH_ID="$(</proc/sys/kernel/random/uuid)"
 readonly MAIN_OPERATION_ID="$(</proc/sys/kernel/random/uuid)"
@@ -90,9 +92,11 @@ declare -a BRANCH_PG_NAMES=()
 declare -a BRANCH_PG_PORTS=()
 declare -a BRANCH_ZEROFS_PIDS=()
 declare -a BRANCH_MOUNT_PIDS=()
+declare -a PGBENCH_PIDS=()
 LAUNCH_SIGNAL_STATUS=0
 
 mkdir -p "$WORK_ROOT"/{cache,configs,logs,mnt,minio}
+mkdir -m 0700 "$AUTHORITY_DIR"
 
 event() {
   printf '{"event":"%s","run_id":"%s","work_root":"%s"}\n' "$1" "$RUN_ID" "$WORK_ROOT"
@@ -248,6 +252,9 @@ cleanup() {
       timeout 10 docker logs "$container" >"$WORK_ROOT/logs/container-$container.log" 2>&1 || true
     fi
   done
+  for pid in "${PGBENCH_PIDS[@]}"; do
+    [[ -n "$pid" ]] && stop_pid "$pid" || cleanup_failed=1
+  done
   for container in "${DATA_CONTAINERS[@]}"; do
     remove_container "$container" || cleanup_failed=1
   done
@@ -257,6 +264,8 @@ cleanup() {
   for pid in "${MOUNT_PIDS[@]}" "${ZEROFS_PIDS[@]}"; do
     [[ -n "$pid" ]] && stop_pid "$pid" || cleanup_failed=1
   done
+  rm -f -- "$AUTHORITY_SOCKET" || cleanup_failed=1
+  rmdir -- "$AUTHORITY_DIR" || cleanup_failed=1
   for container in "$CATALOG_PG_NAME" "$MINIO_NAME"; do
     remove_container "$container" || cleanup_failed=1
   done
@@ -286,6 +295,7 @@ trap 'exit 143' TERM
 write_config() {
   local path="$1" database_path="$2" cache_name="$3" ninep_port="$4" rpc_port="$5"
   local branch_name="${6:-}" branch_id="${7:-}" server_id="${8:-}" renewal_secret="${9:-}"
+  local authority_mode="${10:-}"
   {
     echo '[cache]'
     echo "dir = \"$WORK_ROOT/cache/$cache_name\""
@@ -335,6 +345,15 @@ write_config() {
       echo 'backend = "postgres"'
       echo "connection_string = \"postgresql://postgres:$PG_PASSWORD@127.0.0.1:$CATALOG_PG_PORT/catalog\""
       echo 'tls = false'
+      if [[ "$authority_mode" == "listen" ]]; then
+        echo
+        echo '[catalog.writer_authority]'
+        echo "listen_unix_socket = \"$AUTHORITY_SOCKET\""
+      elif [[ "$authority_mode" == "connect" ]]; then
+        echo
+        echo '[catalog.writer_authority]'
+        echo "connect_unix_socket = \"$AUTHORITY_SOCKET\""
+      fi
       if [[ "$branch_name" != "__bootstrap_only__" ]]; then
         echo
         echo '[catalog.mount]'
@@ -444,7 +463,7 @@ readonly MAIN_RPC_PORT="$((PORT_BASE + 8))"
 readonly MAIN_PG_NAME="zerofs-pg-main-${RUN_ID}"
 readonly MAIN_PG_PORT="$((PORT_BASE + 9))"
 write_config "$MAIN_CONFIG" source main "$MAIN_NINEP_PORT" "$MAIN_RPC_PORT" main "$MAIN_BRANCH_ID" \
-  "$(</proc/sys/kernel/random/uuid)" "$(</proc/sys/kernel/random/uuid)"
+  "$(</proc/sys/kernel/random/uuid)" "$(</proc/sys/kernel/random/uuid)" listen
 start_zerofs "$MAIN_CONFIG" "$WORK_ROOT/logs/zerofs-main.log"
 MAIN_ZEROFS_PID=$STARTED_ZEROFS_PID
 wait_tcp 127.0.0.1 "$MAIN_NINEP_PORT" 'main ZeroFS 9P'
@@ -467,12 +486,15 @@ for ((index = 0; index < BRANCH_COUNT; index++)); do
     --id "$branch_id" --operation-id "$operation_id" >"$WORK_ROOT/logs/create-$index.log"
 done
 event branches_created
-
-docker stop -t 30 "$MAIN_PG_NAME" >/dev/null
-unmount_path "$MAIN_MOUNT"
-stop_pid "$MAIN_MOUNT_PID"
-stop_pid "$MAIN_ZEROFS_PID"
-event catalog_authority_rotated_from_main
+[[ -S "$AUTHORITY_SOCKET" ]] || {
+  echo "catalog writer authority socket was not created: $AUTHORITY_SOCKET" >&2
+  exit 1
+}
+[[ "$(stat -c '%a' "$AUTHORITY_SOCKET")" == "600" ]] || {
+  echo "catalog writer authority socket is not owner-only" >&2
+  exit 1
+}
+event catalog_authority_ready
 
 for ((index = 0; index < BRANCH_COUNT; index++)); do
   ninep_port="$((PORT_BASE + 20 + index * 3))"
@@ -483,7 +505,7 @@ for ((index = 0; index < BRANCH_COUNT; index++)); do
   pg_name="zerofs-pg-branch-${index}-${RUN_ID}"
   write_config "$config" source "branch-$index" "$ninep_port" "$rpc_port" \
     "${BRANCH_NAMES[$index]}" "${BRANCH_IDS[$index]}" \
-    "$(</proc/sys/kernel/random/uuid)" "$(</proc/sys/kernel/random/uuid)"
+    "$(</proc/sys/kernel/random/uuid)" "$(</proc/sys/kernel/random/uuid)" connect
   BRANCH_CONFIGS+=("$config")
   BRANCH_MOUNTS+=("$mount")
   BRANCH_PG_NAMES+=("$pg_name")
@@ -498,11 +520,90 @@ for ((index = 0; index < BRANCH_COUNT; index++)); do
   docker exec "$pg_name" psql -v ON_ERROR_STOP=1 -U postgres postgres -c \
     "CREATE TABLE zerofs_branch_identity (token text PRIMARY KEY); INSERT INTO zerofs_branch_identity VALUES ('${BRANCH_IDS[$index]}'); UPDATE pgbench_accounts SET abalance = abalance + $((index + 1)) WHERE aid % $BRANCH_COUNT = $index;" >/dev/null
   event branch_postgres_ready
-  timeout "$((PGBENCH_SECONDS + 120))" docker exec "$pg_name" pgbench -T "$PGBENCH_SECONDS" \
-    -c "$PGBENCH_CLIENTS" -j "$PGBENCH_THREADS" -U postgres postgres \
-    >"$WORK_ROOT/logs/pgbench-$index.log" 2>&1
-  event divergent_load_complete
+done
 
+event all_branch_postgres_concurrent
+REMOTE_CHECKPOINT_OUTPUT="$("$ZEROFS_BIN" checkpoint create \
+  --config "${BRANCH_CONFIGS[0]}" remote-authority-roundtrip)"
+REMOTE_CHECKPOINT_ID="$(sed -n 's/^  ID: //p' <<<"$REMOTE_CHECKPOINT_OUTPUT")"
+[[ "$REMOTE_CHECKPOINT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+  echo 'remote authority checkpoint create did not return a UUID' >&2
+  exit 1
+}
+"$ZEROFS_BIN" checkpoint info --config "${BRANCH_CONFIGS[0]}" \
+  remote-authority-roundtrip --id "$REMOTE_CHECKPOINT_ID" \
+  | grep -F "ID: $REMOTE_CHECKPOINT_ID" >/dev/null
+"$ZEROFS_BIN" checkpoint delete --config "${BRANCH_CONFIGS[0]}" \
+  remote-authority-roundtrip --id "$REMOTE_CHECKPOINT_ID" >/dev/null
+event remote_checkpoint_lifecycle_verified
+
+for ((index = 0; index < BRANCH_COUNT; index++)); do
+  pg_name="${BRANCH_PG_NAMES[$index]}"
+  begin_atomic_launch
+  (trap - INT TERM; exec timeout "$((PGBENCH_SECONDS + 120))" \
+    docker exec "$pg_name" pgbench -T "$PGBENCH_SECONDS" \
+      -c "$PGBENCH_CLIENTS" -j "$PGBENCH_THREADS" -U postgres postgres) \
+      >"$WORK_ROOT/logs/pgbench-$index.log" 2>&1 &
+  pgbench_pid="$!"
+  OWNED_PIDS[$pgbench_pid]="$pg_name"
+  PGBENCH_PIDS+=("$pgbench_pid")
+  end_atomic_launch
+done
+pgbench_status=0
+for pid in "${PGBENCH_PIDS[@]}"; do
+  if ! wait "$pid"; then
+    pgbench_status=1
+  fi
+  unset 'OWNED_PIDS[$pid]'
+done
+PGBENCH_PIDS=()
+if (( pgbench_status != 0 )); then
+  echo 'one or more concurrent pgbench jobs failed' >&2
+  exit 1
+fi
+event concurrent_divergent_load_complete
+
+# Crash the sole catalog owner while every child PostgreSQL/ZeroFS pair stays
+# live. Restart it with the same deterministic main capability, then wait longer
+# than a worker renewal interval so every existing gRPC channel must prove it
+# can renew through the replacement authority.
+docker stop -t 30 "$MAIN_PG_NAME" >/dev/null
+unmount_path "$MAIN_MOUNT"
+stop_pid "$MAIN_MOUNT_PID"
+kill_owned_pid_hard "$MAIN_ZEROFS_PID"
+start_zerofs "$MAIN_CONFIG" "$WORK_ROOT/logs/zerofs-main-authority-restart.log"
+MAIN_ZEROFS_PID=$STARTED_ZEROFS_PID
+wait_tcp 127.0.0.1 "$MAIN_NINEP_PORT" 'restarted catalog authority ZeroFS 9P'
+wait_tcp 127.0.0.1 "$MAIN_RPC_PORT" 'restarted catalog authority ZeroFS RPC'
+for _ in $(seq 1 120); do
+  [[ -S "$AUTHORITY_SOCKET" ]] && break
+  sleep 0.25
+done
+[[ -S "$AUTHORITY_SOCKET" ]] || {
+  echo 'catalog writer authority socket did not recover after hard restart' >&2
+  exit 1
+}
+mount_zerofs "$MAIN_NINEP_PORT" "$MAIN_MOUNT" "$WORK_ROOT/logs/mount-main-authority-restart.log"
+MAIN_MOUNT_PID=$STARTED_MOUNT_PID
+docker start "$MAIN_PG_NAME" >/dev/null
+wait_postgres "$MAIN_PG_NAME"
+sleep 45
+for ((index = 0; index < BRANCH_COUNT; index++)); do
+  kill -0 "${BRANCH_ZEROFS_PIDS[$index]}" 2>/dev/null || {
+    echo "branch $index stopped after catalog authority restart" >&2
+    exit 1
+  }
+  wait_tcp 127.0.0.1 "$((PORT_BASE + 20 + index * 3))" \
+    "branch $index after catalog authority renewal"
+done
+event catalog_authority_crash_recovered
+
+for ((index = 0; index < BRANCH_COUNT; index++)); do
+  pg_name="${BRANCH_PG_NAMES[$index]}"
+  mount="${BRANCH_MOUNTS[$index]}"
+  config="${BRANCH_CONFIGS[$index]}"
+  ninep_port="$((PORT_BASE + 20 + index * 3))"
+  rpc_port="$((ninep_port + 1))"
   if (( index == 0 )); then
     docker kill "$pg_name" >/dev/null
     docker start "$pg_name" >/dev/null
@@ -530,20 +631,8 @@ for ((index = 0; index < BRANCH_COUNT; index++)); do
   docker exec "$pg_name" psql -At -v ON_ERROR_STOP=1 -U postgres postgres -c \
     "SELECT token FROM zerofs_branch_identity;" | grep -Fx "${BRANCH_IDS[$index]}" >/dev/null
   docker exec "$pg_name" pg_amcheck --all --install-missing -U postgres >/dev/null
-  docker stop -t 30 "$pg_name" >/dev/null
-  unmount_path "$mount"
-  stop_pid "${BRANCH_MOUNT_PIDS[$index]}"
-  stop_pid "${BRANCH_ZEROFS_PIDS[$index]}"
 done
 
-start_zerofs "$MAIN_CONFIG" "$WORK_ROOT/logs/zerofs-main-restart.log"
-MAIN_ZEROFS_PID=$STARTED_ZEROFS_PID
-wait_tcp 127.0.0.1 "$MAIN_NINEP_PORT" 'restarted main ZeroFS 9P'
-wait_tcp 127.0.0.1 "$MAIN_RPC_PORT" 'restarted main ZeroFS RPC'
-mount_zerofs "$MAIN_NINEP_PORT" "$MAIN_MOUNT" "$WORK_ROOT/logs/mount-main-restart.log"
-MAIN_MOUNT_PID=$STARTED_MOUNT_PID
-docker start "$MAIN_PG_NAME" >/dev/null
-wait_postgres "$MAIN_PG_NAME"
 if docker exec "$MAIN_PG_NAME" psql -At -v ON_ERROR_STOP=1 -U postgres postgres -c \
   "SELECT to_regclass('public.zerofs_branch_identity') IS NULL;" | grep -Fx t >/dev/null; then
   :
