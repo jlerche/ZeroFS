@@ -411,7 +411,7 @@ impl ExtentStore {
         let Some((segid, bytes)) = prepared else {
             return;
         };
-        let segments = self.segment_store();
+        let segments = self.segment_store_owned();
         let sealing = self.sealing.clone();
         crate::task::spawn_named("segment-seal", async move {
             match segments.put_segment(segid, bytes).await {

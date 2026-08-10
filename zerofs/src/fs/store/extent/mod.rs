@@ -88,23 +88,56 @@ pub(crate) struct PrivatePublisherIdentity {
 }
 
 struct RotatingSegmentStore {
+    initial: Arc<SegmentStore>,
     current: ArcSwap<SegmentStore>,
+    rotated: AtomicBool,
+}
+
+enum SegmentStoreHandle<'a> {
+    Initial(&'a SegmentStore),
+    Rotated(arc_swap::Guard<Arc<SegmentStore>>),
+}
+
+impl std::ops::Deref for SegmentStoreHandle<'_> {
+    type Target = SegmentStore;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Initial(store) => store,
+            Self::Rotated(store) => store,
+        }
+    }
 }
 
 impl RotatingSegmentStore {
     fn new(current: Arc<SegmentStore>) -> Self {
         Self {
+            initial: Arc::clone(&current),
             current: ArcSwap::from(current),
+            rotated: AtomicBool::new(false),
         }
     }
 
-    fn load(&self) -> Arc<SegmentStore> {
-        self.current.load_full()
+    fn load(&self) -> SegmentStoreHandle<'_> {
+        if self.rotated.load(Ordering::Acquire) {
+            SegmentStoreHandle::Rotated(self.current.load())
+        } else {
+            SegmentStoreHandle::Initial(&self.initial)
+        }
+    }
+
+    fn load_owned(&self) -> Arc<SegmentStore> {
+        if self.rotated.load(Ordering::Acquire) {
+            self.current.load_full()
+        } else {
+            Arc::clone(&self.initial)
+        }
     }
 
     #[allow(dead_code)] // The standalone binary does not yet open the branch catalog lifecycle.
     fn store(&self, next: Arc<SegmentStore>) {
         self.current.store(next);
+        self.rotated.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -266,8 +299,12 @@ impl ExtentStore {
         Arc::clone(&self.segment_gc_stats)
     }
 
-    fn segment_store(&self) -> Arc<SegmentStore> {
+    fn segment_store(&self) -> SegmentStoreHandle<'_> {
         self.segments.load()
+    }
+
+    fn segment_store_owned(&self) -> Arc<SegmentStore> {
+        self.segments.load_owned()
     }
 
     pub(crate) fn publisher_id(&self) -> Uuid {
