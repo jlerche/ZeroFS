@@ -665,11 +665,20 @@ impl BranchLifecycle {
         request: BranchCreateFromCheckpointNameRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
         self.require_create_enabled()?;
-        if let Some(existing) = self
+        let existing = self
             .catalog
             .branch_create_operation(request.operation_id)
-            .await?
-        {
+            .await?;
+        self.create_from_checkpoint_name_with_operation(request, existing)
+            .await
+    }
+
+    async fn create_from_checkpoint_name_with_operation(
+        &self,
+        request: BranchCreateFromCheckpointNameRequest,
+        existing: Option<BranchCreateOperation>,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
+        if let Some(existing) = existing {
             if existing.destination_id != request.destination_id
                 || existing.destination_name != request.destination_name
                 || existing.parent_id != Some(request.source_branch_id)
@@ -686,13 +695,16 @@ impl BranchLifecycle {
                 ));
             }
             return self
-                .create_from_checkpoint(BranchCreateRequest {
-                    operation_id: request.operation_id,
-                    destination_id: request.destination_id,
-                    destination_name: request.destination_name,
-                    source,
-                    created_at: request.created_at,
-                })
+                .create_from_checkpoint_with_operation(
+                    BranchCreateRequest {
+                        operation_id: request.operation_id,
+                        destination_id: request.destination_id,
+                        destination_name: request.destination_name,
+                        source,
+                        created_at: request.created_at,
+                    },
+                    Some(existing),
+                )
                 .await;
         }
         let source_record = self
@@ -709,13 +721,16 @@ impl BranchLifecycle {
         if source.checkpoint_id != source_record.id {
             return Err(BranchLifecycleError::SourceRootConflict(source_record.id));
         }
-        self.create_from_checkpoint(BranchCreateRequest {
-            operation_id: request.operation_id,
-            destination_id: request.destination_id,
-            destination_name: request.destination_name,
-            source,
-            created_at: request.created_at,
-        })
+        self.create_from_checkpoint_with_operation(
+            BranchCreateRequest {
+                operation_id: request.operation_id,
+                destination_id: request.destination_id,
+                destination_name: request.destination_name,
+                source,
+                created_at: request.created_at,
+            },
+            None,
+        )
         .await
     }
 
@@ -730,14 +745,12 @@ impl BranchLifecycle {
         source_branch_id: Uuid,
         source_checkpoint_name: String,
     ) -> Result<BranchRecord, BranchLifecycleError> {
-        let created_at = self
-            .catalog
-            .branch_create_operation(operation_id)
-            .await?
-            .map_or_else(
-                || catalog_timestamp(Utc::now()),
-                |operation| operation.created_at,
-            );
+        self.require_create_enabled()?;
+        let existing = self.catalog.branch_create_operation(operation_id).await?;
+        let created_at = existing.as_ref().map_or_else(
+            || catalog_timestamp(Utc::now()),
+            |operation| operation.created_at,
+        );
         let request = BranchCreateFromCheckpointNameRequest {
             operation_id,
             destination_id,
@@ -746,17 +759,23 @@ impl BranchLifecycle {
             source_checkpoint_name,
             created_at,
         };
-        match self.create_from_checkpoint_name(request.clone()).await {
+        match self
+            .create_from_checkpoint_name_with_operation(request.clone(), existing)
+            .await
+        {
             Ok(branch) => Ok(branch),
             Err(first_error) => {
                 let Some(operation) = self.catalog.branch_create_operation(operation_id).await?
                 else {
                     return Err(first_error);
                 };
-                self.create_from_checkpoint_name(BranchCreateFromCheckpointNameRequest {
-                    created_at: operation.created_at,
-                    ..request
-                })
+                self.create_from_checkpoint_name_with_operation(
+                    BranchCreateFromCheckpointNameRequest {
+                        created_at: operation.created_at,
+                        ..request
+                    },
+                    Some(operation),
+                )
                 .await
             }
         }
@@ -821,6 +840,15 @@ impl BranchLifecycle {
             .catalog
             .branch_create_operation(request.operation_id)
             .await?;
+        self.create_from_checkpoint_with_operation(request, existing)
+            .await
+    }
+
+    async fn create_from_checkpoint_with_operation(
+        &self,
+        request: BranchCreateRequest,
+        existing: Option<BranchCreateOperation>,
+    ) -> Result<BranchRecord, BranchLifecycleError> {
         let operation = if let Some(existing) = existing {
             if existing.destination_id != request.destination_id
                 || existing.destination_name != request.destination_name
@@ -872,10 +900,10 @@ impl BranchLifecycle {
             self.catalog
                 .apply(CatalogMutation::ReserveBranchCreate {
                     branch,
-                    operation: Box::new(reservation),
+                    operation: Box::new(reservation.clone()),
                 })
                 .await?;
-            self.operation(request.operation_id).await?
+            reservation
         };
         self.finish_create(operation, &request.source, request.created_at)
             .await
@@ -938,10 +966,10 @@ impl BranchLifecycle {
             self.catalog
                 .apply(CatalogMutation::ReserveBranchCreate {
                     branch,
-                    operation: Box::new(reservation),
+                    operation: Box::new(reservation.clone()),
                 })
                 .await?;
-            self.operation(request.operation_id).await?
+            reservation
         };
         self.finish_create(operation, &request.source, request.created_at)
             .await
@@ -998,46 +1026,30 @@ impl BranchLifecycle {
             BranchCreatePhase::Published => unreachable!("handled above"),
         };
         self.roots.verify(&destination_root).await?;
-        self.catalog
-            .apply(CatalogMutation::RecordBranchCreateRoot {
-                operation_id: operation.id,
-                expected_revision: operation.revision,
-                destination_root: destination_root.clone(),
-                updated_at: transition_time(created_at),
-            })
-            .await?;
-
-        let operation = self.operation(operation.id).await?;
-        if operation.phase == BranchCreatePhase::Published {
-            return self.ready_branch(operation.destination_id).await;
+        let updated_at = transition_time(created_at);
+        match operation.phase {
+            BranchCreatePhase::Reserved => {
+                self.catalog
+                    .apply(CatalogMutation::CompleteBranchCreate {
+                        operation_id: operation.id,
+                        expected_revision: operation.revision,
+                        destination_root: destination_root.clone(),
+                        updated_at,
+                    })
+                    .await?;
+            }
+            BranchCreatePhase::RootCreated => {
+                self.catalog
+                    .apply(CatalogMutation::PublishBranchCreate {
+                        operation_id: operation.id,
+                        expected_revision: operation.revision,
+                        updated_at,
+                    })
+                    .await?;
+            }
+            BranchCreatePhase::Published => unreachable!("handled above"),
         }
-        if operation.phase != BranchCreatePhase::RootCreated
-            || operation.destination_root.as_ref() != Some(&destination_root)
-        {
-            return Err(BranchLifecycleError::Invariant(format!(
-                "operation {} did not retain its authenticated destination root",
-                operation.id
-            )));
-        }
-        self.roots.verify(&destination_root).await?;
-        self.catalog
-            .apply(CatalogMutation::PublishBranchCreate {
-                operation_id: operation.id,
-                expected_revision: operation.revision,
-                updated_at: transition_time(created_at),
-            })
-            .await?;
         self.ready_branch(operation.destination_id).await
-    }
-
-    async fn operation(
-        &self,
-        operation_id: Uuid,
-    ) -> Result<BranchCreateOperation, BranchLifecycleError> {
-        self.catalog
-            .branch_create_operation(operation_id)
-            .await?
-            .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()).into())
     }
 
     fn require_create_enabled(&self) -> Result<(), BranchLifecycleError> {
@@ -2141,7 +2153,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = catalog.snapshot().await.unwrap();
-        assert_eq!(snapshot.generation, 6);
+        assert_eq!(snapshot.generation, 5);
         assert_eq!(
             snapshot.branch_create_operations[&operation_id].phase,
             BranchCreatePhase::Published

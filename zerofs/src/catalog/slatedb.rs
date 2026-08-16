@@ -17,13 +17,19 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
 use serde::{Serialize, de::DeserializeOwned};
-use slatedb::config::WriteOptions;
+use slatedb::config::{DurabilityLevel, ReadOptions, WriteOptions};
 use slatedb::object_store::path::Path;
 use slatedb::{Db, WriteBatch};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::ops::Bound;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{
+    Mutex, MutexGuard, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard,
+};
 use uuid::Uuid;
 
 const STATE_KEY: &[u8] = b"catalog/state";
@@ -48,6 +54,9 @@ const PRIVATE_GC_BRANCH_BLOCKER_PREFIX: &[u8] = b"catalog/private-gc-branch-bloc
 const PRIVATE_GC_GLOBAL_BLOCKER_KEY: &[u8] = b"catalog/private-gc-global-blocker";
 const RETIRED_CATALOG_ID_PREFIX: &[u8] = b"catalog/retired-id/";
 const BRANCH_LINEAGE_DEPTH_PREFIX: &[u8] = b"catalog/private-branch-lineage-depth/";
+/// Sequence fence only. Concurrent waiters may enqueue this shared key out of
+/// catalog-generation order, so its value is deliberately non-authoritative.
+const DURABILITY_BARRIER_KEY: &[u8] = b"catalog/private-durability-barrier";
 #[allow(dead_code)] // Used by the bounded cleanup entry point as server wiring lands.
 const TOMBSTONE_CLEANUP_CURSOR_KEY: &[u8] = b"catalog/tombstone-cleanup-cursor";
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -69,11 +78,37 @@ const TOMBSTONE_CLEANUP_SCHEMA_VERSION: u32 = 16;
 const SERVER_CATALOG_SCHEMA_VERSION: u32 = 17;
 const PRODUCTION_LIMITS_SCHEMA_VERSION: u32 = 18;
 const WRITER_AUTHORITY_SCHEMA_VERSION: u32 = 19;
+const BRANCH_LINEAGE_SCHEMA_VERSION: u32 = 20;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CatalogState {
     schema_version: u32,
     generation: u64,
+    live_branches: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CatalogStateHeader {
+    schema_version: u32,
+    generation: u64,
+}
+
+enum PreparedMutation {
+    Noop(u64),
+    Write { generation: u64, batch: WriteBatch },
+}
+
+struct DurabilityPoisonGuard {
+    poisoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for DurabilityPoisonGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -154,7 +189,12 @@ pub struct SlateDbCatalog {
     /// SlateDB admits one writer for a database path. This lock also gives
     /// multi-key point lookups and full snapshots a process-local consistent
     /// view relative to catalog mutations.
-    lock: Mutex<()>,
+    lock: Arc<Mutex<()>>,
+    /// Mutations hold a shared guard until their SlateDB sequence is durable.
+    /// Readers take the exclusive guard, so they cannot observe a mutation
+    /// which has become process-visible but has not reached object storage.
+    durability_visibility: Arc<RwLock<()>>,
+    durability_poisoned: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SlateDbCatalog {
@@ -173,13 +213,16 @@ impl SlateDbCatalog {
         let db = Arc::new(slatedb::DbBuilder::new(path, object_store).build().await?);
         let catalog = Self {
             db,
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
+            durability_visibility: Arc::new(RwLock::new(())),
+            durability_poisoned: Arc::new(AtomicBool::new(false)),
         };
         let _guard = catalog.lock.lock().await;
         if catalog.db.get(STATE_KEY).await?.is_none() {
             let state = CatalogState {
                 schema_version: CATALOG_SCHEMA_VERSION,
                 generation: 0,
+                live_branches: 0,
             };
             let mut batch = WriteBatch::new();
             put_json(&mut batch, Bytes::from_static(STATE_KEY), &state)?;
@@ -201,8 +244,89 @@ impl SlateDbCatalog {
 
     #[allow(dead_code)] // Explicit shutdown is used by owners once server wiring lands.
     pub async fn close(&self) -> Result<(), CatalogError> {
+        let _visibility = self.durability_visibility.write().await;
+        let _mutation = self.lock.lock().await;
         self.db.close().await?;
         Ok(())
+    }
+
+    async fn lock_visible(
+        &self,
+    ) -> Result<(RwLockWriteGuard<'_, ()>, MutexGuard<'_, ()>), CatalogError> {
+        let visibility = self.durability_visibility.write().await;
+        self.ensure_durability_certain()?;
+        let mutation = self.lock.lock().await;
+        self.ensure_durability_certain()?;
+        Ok((visibility, mutation))
+    }
+
+    fn ensure_durability_certain(&self) -> Result<(), CatalogError> {
+        if self.durability_poisoned.load(Ordering::Acquire) {
+            Err(CatalogError::Io(io::Error::other(
+                "catalog durability is uncertain; reopen the catalog before serving requests",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn confirm_durable(
+        db: Arc<Db>,
+        poisoned: Arc<AtomicBool>,
+        visibility: OwnedRwLockReadGuard<()>,
+    ) -> Result<(), CatalogError> {
+        let result = db
+            .put_with_options(
+                DURABILITY_BARRIER_KEY,
+                b"fence",
+                &Default::default(),
+                &durable_write_options(),
+            )
+            .await;
+        if result.is_err() {
+            poisoned.store(true, Ordering::Release);
+        }
+        drop(visibility);
+        result.map(|_| ()).map_err(CatalogError::from)
+    }
+
+    async fn admit_and_confirm(
+        db: Arc<Db>,
+        poisoned: Arc<AtomicBool>,
+        visibility: OwnedRwLockReadGuard<()>,
+        mutation: OwnedMutexGuard<()>,
+        prepared: Result<PreparedMutation, CatalogError>,
+    ) -> Result<u64, CatalogError> {
+        let mut poison_guard = DurabilityPoisonGuard {
+            poisoned: Arc::clone(&poisoned),
+            armed: true,
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(mutation);
+                Self::confirm_durable(db, poisoned, visibility).await?;
+                poison_guard.armed = false;
+                return Err(error);
+            }
+        };
+        let generation = match prepared {
+            PreparedMutation::Noop(generation) => generation,
+            PreparedMutation::Write { generation, batch } => {
+                let admitted = db
+                    .write_with_options(batch, &buffered_write_options())
+                    .await;
+                if admitted.is_err() {
+                    poisoned.store(true, Ordering::Release);
+                }
+                admitted?;
+                generation
+            }
+        };
+        drop(mutation);
+        Self::confirm_durable(db, poisoned, visibility).await?;
+        poison_guard.armed = false;
+        Ok(generation)
     }
 
     async fn state_unlocked(&self) -> Result<CatalogState, CatalogError> {
@@ -217,6 +341,12 @@ impl SlateDbCatalog {
                 state.schema_version
             )));
         }
+        if state.live_branches > MAX_LIVE_BRANCHES as u64 {
+            return Err(CatalogError::Corrupt(format!(
+                "catalog live branch count {} exceeds limit {MAX_LIVE_BRANCHES}",
+                state.live_branches
+            )));
+        }
         Ok(state)
     }
 
@@ -225,8 +355,9 @@ impl SlateDbCatalog {
             self.db.get(STATE_KEY).await?.ok_or_else(|| {
                 CatalogError::Corrupt("missing SlateDB catalog state".to_string())
             })?;
-        let state = serde_json::from_slice::<CatalogState>(&bytes)?;
+        let state = serde_json::from_slice::<CatalogStateHeader>(&bytes)?;
         if state.schema_version == CATALOG_SCHEMA_VERSION {
+            self.state_unlocked().await?;
             return Ok(());
         }
         if ![
@@ -249,6 +380,7 @@ impl SlateDbCatalog {
             SERVER_CATALOG_SCHEMA_VERSION,
             PRODUCTION_LIMITS_SCHEMA_VERSION,
             WRITER_AUTHORITY_SCHEMA_VERSION,
+            BRANCH_LINEAGE_SCHEMA_VERSION,
         ]
         .contains(&state.schema_version)
         {
@@ -343,9 +475,11 @@ impl SlateDbCatalog {
                     state.schema_version
                 ))
             })?;
+        let live_branches = self.count_live_branches_unlocked().await?;
         self.snapshot_unlocked(CatalogState {
             schema_version: CATALOG_SCHEMA_VERSION,
             generation: state.generation,
+            live_branches,
         })
         .await
         .map_err(|error| {
@@ -360,6 +494,7 @@ impl SlateDbCatalog {
                 serde_json::to_vec(&CatalogState {
                     schema_version: CATALOG_SCHEMA_VERSION,
                     generation: state.generation,
+                    live_branches,
                 })?,
                 &slatedb::config::PutOptions::default(),
                 &durable_write_options(),
@@ -373,6 +508,13 @@ impl SlateDbCatalog {
         state: CatalogState,
     ) -> Result<CatalogSnapshot, CatalogError> {
         let branches = self.scan_records::<BranchRecord>(BRANCH_PREFIX).await?;
+        if branches.len() as u64 != state.live_branches {
+            return Err(CatalogError::Corrupt(format!(
+                "catalog live branch count {} disagrees with {} branch records",
+                state.live_branches,
+                branches.len()
+            )));
+        }
         let checkpoints = self
             .scan_records::<CheckpointRecord>(CHECKPOINT_PREFIX)
             .await?;
@@ -484,6 +626,46 @@ impl SlateDbCatalog {
             .get(key)
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn get_durable_record<T: DeserializeOwned>(
+        &self,
+        key: Bytes,
+    ) -> Result<Option<T>, CatalogError> {
+        self.db
+            .get_with_options(key, &durable_read_options())
+            .await?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn durable_generation(&self) -> Result<u64, CatalogError> {
+        let state = self
+            .get_durable_record::<CatalogState>(Bytes::from_static(STATE_KEY))
+            .await?
+            .ok_or_else(|| CatalogError::Corrupt("missing SlateDB catalog state".to_string()))?;
+        if state.schema_version != CATALOG_SCHEMA_VERSION {
+            return Err(CatalogError::Corrupt(format!(
+                "unsupported SlateDB catalog schema version {}",
+                state.schema_version
+            )));
+        }
+        Ok(state.generation)
+    }
+
+    async fn durable_id_by_name(&self, key: Bytes) -> Result<Option<Uuid>, CatalogError> {
+        self.db
+            .get_with_options(key, &durable_read_options())
+            .await?
+            .map(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .map_err(|error| CatalogError::Corrupt(error.to_string()))
+                    .and_then(|text| {
+                        Uuid::parse_str(text)
+                            .map_err(|error| CatalogError::Corrupt(error.to_string()))
+                    })
+            })
             .transpose()
     }
 
@@ -627,17 +809,33 @@ impl SlateDbCatalog {
         })
     }
 
-    async fn ensure_live_branch_capacity_unlocked(&self) -> Result<(), CatalogError> {
+    async fn count_live_branches_unlocked(&self) -> Result<u64, CatalogError> {
         let mut iterator = self.db.scan_prefix(BRANCH_PREFIX, ..).await?;
-        for _ in 0..MAX_LIVE_BRANCHES {
-            if iterator.next().await?.is_none() {
-                return Ok(());
+        let mut count = 0u64;
+        while iterator.next().await?.is_some() {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::Corrupt("live branch count overflow".to_string()))?;
+            if count > MAX_LIVE_BRANCHES as u64 {
+                return Err(CatalogError::Capacity {
+                    resource: "live branch",
+                    limit: MAX_LIVE_BRANCHES,
+                });
             }
         }
-        Err(CatalogError::Capacity {
-            resource: "live branch",
-            limit: MAX_LIVE_BRANCHES,
-        })
+        Ok(count)
+    }
+
+    async fn ensure_live_branch_capacity_unlocked(&self) -> Result<(), CatalogError> {
+        let state = self.state_unlocked().await?;
+        if state.live_branches < MAX_LIVE_BRANCHES as u64 {
+            Ok(())
+        } else {
+            Err(CatalogError::Capacity {
+                resource: "live branch",
+                limit: MAX_LIVE_BRANCHES,
+            })
+        }
     }
 
     async fn validate_production_capacity_unlocked(&self) -> Result<(), CatalogError> {
@@ -1294,12 +1492,16 @@ impl SlateDbCatalog {
         Ok(())
     }
 
-    async fn apply_unlocked(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
+    async fn prepare_unlocked(
+        &self,
+        mutation: CatalogMutation,
+    ) -> Result<PreparedMutation, CatalogError> {
         let state = self.state_unlocked().await?;
         let next_generation = state
             .generation
             .checked_add(1)
             .ok_or_else(|| CatalogError::Corrupt("catalog generation overflow".to_string()))?;
+        let mut live_branches = state.live_branches;
         let mut batch = WriteBatch::new();
 
         match mutation {
@@ -1311,7 +1513,7 @@ impl SlateDbCatalog {
                     .await?
                 {
                     if existing == guard {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(guard.id.to_string()));
                 }
@@ -1361,7 +1563,7 @@ impl SlateDbCatalog {
                     .get_record::<LocalGcProgressRecord>(local_gc_progress_key(record.id))
                     .await?;
                 if existing.as_ref() == Some(&record) {
-                    return Ok(state.generation);
+                    return Ok(PreparedMutation::Noop(state.generation));
                 }
                 let guard = self
                     .get_record::<LocalGcGuardRecord>(local_gc_guard_key(record.id))
@@ -1432,7 +1634,7 @@ impl SlateDbCatalog {
                     .await?
                 {
                     if existing == record {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(format!(
                         "private epoch {}",
@@ -1484,7 +1686,7 @@ impl SlateDbCatalog {
                     && record.branch_id == branch_id
                     && record.sealed_at == Some(sealed_at)
                 {
-                    return Ok(state.generation);
+                    return Ok(PreparedMutation::Noop(state.generation));
                 }
                 ensure_expected_revision(expected_revision, record.revision)?;
                 let next = self
@@ -1541,7 +1743,7 @@ impl SlateDbCatalog {
                     && record.branch_id == branch_id
                     && record.exposed_at == Some(exposed_at)
                 {
-                    return Ok(state.generation);
+                    return Ok(PreparedMutation::Noop(state.generation));
                 }
                 ensure_expected_revision(expected_revision, record.revision)?;
                 if record.branch_id != branch_id
@@ -1589,7 +1791,7 @@ impl SlateDbCatalog {
                     .await?
                 {
                     if branch_delete_inputs_equal(&existing, &operation) {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(operation.id.to_string()));
                 }
@@ -1677,7 +1879,7 @@ impl SlateDbCatalog {
                     .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
                 if operation.phase == BranchDeletePhase::Published {
                     if expected_revision.checked_add(1) == Some(operation.revision) {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::RevisionConflict {
                         expected: expected_revision,
@@ -1724,6 +1926,9 @@ impl SlateDbCatalog {
                 )
                 .await?;
                 batch.delete(branch_key(operation.branch_id));
+                live_branches = live_branches.checked_sub(1).ok_or_else(|| {
+                    CatalogError::Corrupt("live branch count underflow".to_string())
+                })?;
                 put_json(
                     &mut batch,
                     tombstone_key(operation.branch_id),
@@ -1767,7 +1972,7 @@ impl SlateDbCatalog {
                         && existing.expires_at - existing.updated_at
                             == lease.expires_at - lease.updated_at
                     {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(lease.id.to_string()));
                 }
@@ -1876,7 +2081,7 @@ impl SlateDbCatalog {
                     && lease.expires_at - lease.updated_at == expires_at - renewed_at
                     && renewed_at < lease.expires_at
                 {
-                    return Ok(state.generation);
+                    return Ok(PreparedMutation::Noop(state.generation));
                 }
                 ensure_expected_revision(expected_revision, lease.revision)?;
                 if lease.token_hash != token_hash
@@ -1908,7 +2113,7 @@ impl SlateDbCatalog {
                     .await?
                 {
                     if tombstone.token_hash == token_hash {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(id.to_string()));
                 }
@@ -1988,7 +2193,7 @@ impl SlateDbCatalog {
                         && publication.previous_root == previous_root
                         && publication.root == root
                     {
-                        return Ok(publication.published_generation);
+                        return Ok(PreparedMutation::Noop(publication.published_generation));
                     }
                     return Err(CatalogError::OperationConflict(lease_id.to_string()));
                 }
@@ -2094,7 +2299,7 @@ impl SlateDbCatalog {
             } => {
                 validate_timestamp(observed_at, "lease expiry observation")?;
                 if self.db.get(lease_tombstone_key(id)).await?.is_some() {
-                    return Ok(state.generation);
+                    return Ok(PreparedMutation::Noop(state.generation));
                 }
                 let lease = self
                     .get_record::<LeaseRecord>(lease_key(id))
@@ -2162,7 +2367,7 @@ impl SlateDbCatalog {
                     .await?
                 {
                     if existing.immutable_inputs_equal(&operation) {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(operation.id.to_string()));
                 }
@@ -2224,6 +2429,9 @@ impl SlateDbCatalog {
                     .next_lineage_depth_unlocked(operation.parent_id)
                     .await?;
                 self.ensure_live_branch_capacity_unlocked().await?;
+                live_branches = live_branches.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("live branch count overflow".to_string())
+                })?;
                 put_json(&mut batch, branch_key(branch.id), &branch)?;
                 put_json(
                     &mut batch,
@@ -2265,7 +2473,7 @@ impl SlateDbCatalog {
                     .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
                 if operation.phase != BranchCreatePhase::Reserved {
                     if operation.destination_root.as_ref() == Some(&destination_root) {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(operation_id.to_string()));
                 }
@@ -2290,6 +2498,97 @@ impl SlateDbCatalog {
                     operation.source_checkpoint_id,
                     operation.id,
                 ));
+            }
+            CatalogMutation::CompleteBranchCreate {
+                operation_id,
+                expected_revision,
+                destination_root,
+                updated_at,
+            } => {
+                validate_root(&destination_root)?;
+                validate_timestamp(updated_at, "branch completion updated_at")?;
+                let mut operation = self
+                    .get_record::<BranchCreateOperation>(branch_create_operation_key(operation_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation_id.to_string()))?;
+                let mut branch = self
+                    .get_record::<BranchRecord>(branch_key(operation.destination_id))
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(operation.destination_id.to_string()))?;
+                if operation.phase == BranchCreatePhase::Published {
+                    let retry_revision = expected_revision.checked_add(2).ok_or_else(|| {
+                        CatalogError::Invalid(
+                            "branch completion expected revision overflow".to_string(),
+                        )
+                    })?;
+                    ensure_expected_revision(retry_revision, operation.revision)?;
+                    let expected_origin =
+                        operation.parent_id.map(|_| operation.source_checkpoint_id);
+                    if operation.destination_id == branch.id
+                        && operation.destination_name == branch.name
+                        && branch.parent_id == operation.parent_id
+                        && branch.origin_checkpoint_id == expected_origin
+                        && operation.destination_root.as_ref() == Some(&destination_root)
+                        && branch.state == BranchState::Ready
+                        && branch.root.as_ref() == Some(&destination_root)
+                    {
+                        return Ok(PreparedMutation::Noop(state.generation));
+                    }
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                let expected_origin = operation.parent_id.map(|_| operation.source_checkpoint_id);
+                if operation.phase != BranchCreatePhase::Reserved
+                    || operation.destination_root.is_some()
+                    || branch.state != BranchState::Creating
+                    || branch.root.is_some()
+                    || branch.name != operation.destination_name
+                    || branch.parent_id != operation.parent_id
+                    || branch.origin_checkpoint_id != expected_origin
+                {
+                    return Err(CatalogError::OperationConflict(operation_id.to_string()));
+                }
+                ensure_expected_revision(expected_revision, operation.revision)?;
+                if updated_at < operation.updated_at || updated_at < branch.updated_at {
+                    return Err(CatalogError::Invalid(
+                        "branch completion time cannot move backwards".to_string(),
+                    ));
+                }
+                operation.revision = operation.revision.checked_add(2).ok_or_else(|| {
+                    CatalogError::Corrupt("branch operation revision overflow".to_string())
+                })?;
+                operation.phase = BranchCreatePhase::Published;
+                operation.destination_root = Some(destination_root.clone());
+                operation.updated_at = updated_at;
+                branch.revision = branch
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CatalogError::Corrupt("branch revision overflow".to_string()))?;
+                branch.state = BranchState::Ready;
+                branch.root = Some(destination_root);
+                branch.updated_at = updated_at;
+                put_json(
+                    &mut batch,
+                    branch_create_operation_key(operation.id),
+                    &operation,
+                )?;
+                put_json(&mut batch, branch_key(branch.id), &branch)?;
+                batch.delete(branch_create_source_key(
+                    operation.source_checkpoint_id,
+                    operation.id,
+                ));
+                if let Some(parent_id) = operation.parent_id {
+                    let mut parent_blockers =
+                        self.private_gc_branch_blockers_unlocked(parent_id).await?;
+                    decrement_blocker(
+                        &mut parent_blockers.incomplete_children,
+                        "child-create blocker",
+                    )?;
+                    put_json(
+                        &mut batch,
+                        private_gc_branch_blocker_key(parent_id),
+                        &parent_blockers,
+                    )?;
+                }
             }
             CatalogMutation::PublishBranchCreate {
                 operation_id,
@@ -2317,7 +2616,7 @@ impl SlateDbCatalog {
                         && branch.parent_id == operation.parent_id
                         && branch.origin_checkpoint_id == expected_origin
                     {
-                        return Ok(state.generation);
+                        return Ok(PreparedMutation::Noop(state.generation));
                     }
                     return Err(CatalogError::OperationConflict(operation_id.to_string()));
                 }
@@ -2399,6 +2698,9 @@ impl SlateDbCatalog {
                 .await?;
                 let lineage_depth = self.next_lineage_depth_unlocked(record.parent_id).await?;
                 self.ensure_live_branch_capacity_unlocked().await?;
+                live_branches = live_branches.checked_add(1).ok_or_else(|| {
+                    CatalogError::Corrupt("live branch count overflow".to_string())
+                })?;
                 put_json(&mut batch, branch_key(record.id), &record)?;
                 put_json(
                     &mut batch,
@@ -2617,12 +2919,13 @@ impl SlateDbCatalog {
             &CatalogState {
                 schema_version: CATALOG_SCHEMA_VERSION,
                 generation: next_generation,
+                live_branches,
             },
         )?;
-        self.db
-            .write_with_options(batch, &durable_write_options())
-            .await?;
-        Ok(next_generation)
+        Ok(PreparedMutation::Write {
+            generation: next_generation,
+            batch,
+        })
     }
 }
 
@@ -2633,19 +2936,33 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn snapshot(&self) -> Result<CatalogSnapshot, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let state = self.state_unlocked().await?;
         self.snapshot_unlocked(state).await
     }
 
     async fn branch(&self, id: Uuid) -> Result<Option<BranchRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
-        self.get_record(branch_key(id)).await
+        self.ensure_durability_certain()?;
+        let result = self.get_durable_record(branch_key(id)).await;
+        self.ensure_durability_certain()?;
+        result
     }
 
     async fn branch_by_name(&self, name: &str) -> Result<Option<BranchRecord>, CatalogError> {
         validate_name(name)?;
-        let _guard = self.lock.lock().await;
+        self.ensure_durability_certain()?;
+        for _ in 0..8 {
+            let before = self.durable_generation().await?;
+            let result = match self.durable_id_by_name(branch_name_key(name)).await? {
+                Some(id) => self.get_durable_record(branch_key(id)).await?,
+                None => None,
+            };
+            if self.durable_generation().await? == before {
+                self.ensure_durability_certain()?;
+                return Ok(result);
+            }
+        }
+        let (_visibility, _guard) = self.lock_visible().await?;
         match self.id_by_name(branch_name_key(name)).await? {
             Some(id) => self.get_record(branch_key(id)).await,
             None => Ok(None),
@@ -2653,8 +2970,10 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn checkpoint(&self, id: Uuid) -> Result<Option<CheckpointRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
-        self.get_record(checkpoint_key(id)).await
+        self.ensure_durability_certain()?;
+        let result = self.get_durable_record(checkpoint_key(id)).await;
+        self.ensure_durability_certain()?;
+        result
     }
 
     async fn checkpoint_by_name(
@@ -2663,7 +2982,22 @@ impl Catalog for SlateDbCatalog {
         name: &str,
     ) -> Result<Option<CheckpointRecord>, CatalogError> {
         validate_name(name)?;
-        let _guard = self.lock.lock().await;
+        self.ensure_durability_certain()?;
+        for _ in 0..8 {
+            let before = self.durable_generation().await?;
+            let result = match self
+                .durable_id_by_name(checkpoint_name_key(branch_id, name))
+                .await?
+            {
+                Some(id) => self.get_durable_record(checkpoint_key(id)).await?,
+                None => None,
+            };
+            if self.durable_generation().await? == before {
+                self.ensure_durability_certain()?;
+                return Ok(result);
+            }
+        }
+        let (_visibility, _guard) = self.lock_visible().await?;
         match self
             .id_by_name(checkpoint_name_key(branch_id, name))
             .await?
@@ -2677,20 +3011,24 @@ impl Catalog for SlateDbCatalog {
         &self,
         id: Uuid,
     ) -> Result<Option<BranchCreateOperation>, CatalogError> {
-        let _guard = self.lock.lock().await;
-        self.get_record(branch_create_operation_key(id)).await
+        self.ensure_durability_certain()?;
+        let result = self
+            .get_durable_record(branch_create_operation_key(id))
+            .await;
+        self.ensure_durability_certain()?;
+        result
     }
 
     async fn branch_delete_operation(
         &self,
         id: Uuid,
     ) -> Result<Option<BranchDeleteOperation>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         self.get_record(branch_delete_operation_key(id)).await
     }
 
     async fn gc_run(&self, id: Uuid) -> Result<Option<GcRunRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let run = self.get_record::<GcRunRecord>(gc_run_key(id)).await?;
         if let Some(run) = &run {
             run.validate()?;
@@ -2699,7 +3037,7 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn private_epoch(&self, epoch: u64) -> Result<Option<PrivateEpochRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let record = self
             .get_record::<PrivateEpochRecord>(private_epoch_key(epoch))
             .await?;
@@ -2715,7 +3053,7 @@ impl Catalog for SlateDbCatalog {
         database_identity: &str,
         epoch_limit: usize,
     ) -> Result<PrivateGcOwnerView, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let branch = self
             .validate_private_gc_owner_unlocked(branch_id, database_identity)
             .await?;
@@ -2788,7 +3126,7 @@ impl Catalog for SlateDbCatalog {
         guard_id: Uuid,
         writer_epoch_id: u64,
     ) -> Result<PrivateGcGuardView, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let guard = self
             .get_record::<LocalGcGuardRecord>(local_gc_guard_key(guard_id))
             .await?;
@@ -2881,7 +3219,7 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn gc_blockers(&self, run_id: Uuid) -> Result<Vec<GcBlockerRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let prefix = gc_blocker_run_prefix(run_id);
         let mut iterator = self.db.scan_prefix(&prefix, ..).await?;
         let mut blockers = Vec::new();
@@ -2904,7 +3242,7 @@ impl Catalog for SlateDbCatalog {
         expected_generation: u64,
         run: GcRunRecord,
     ) -> Result<(), CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         run.validate()?;
         ensure_initial_revision(run.revision)?;
         if run.catalog_generation != expected_generation {
@@ -2948,7 +3286,7 @@ impl Catalog for SlateDbCatalog {
         mark_stats: GcMarkStats,
         updated_at: DateTime<Utc>,
     ) -> Result<GcRunRecord, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(updated_at, "GC marking updated_at")?;
         let mut run = self
             .get_record::<GcRunRecord>(gc_run_key(id))
@@ -3004,7 +3342,7 @@ impl Catalog for SlateDbCatalog {
             inventory_stats,
             reported_at,
         } = publication;
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(reported_at, "GC report timestamp")?;
         let state = self.state_unlocked().await?;
         let mut run = self
@@ -3077,7 +3415,7 @@ impl Catalog for SlateDbCatalog {
             inventory_stats,
             quarantine_at,
         } = publication;
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(quarantine_at, "GC quarantine timestamp")?;
         let state = self.state_unlocked().await?;
         let mut run = self
@@ -3138,7 +3476,7 @@ impl Catalog for SlateDbCatalog {
             observation,
             updated_at,
         } = capture;
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(updated_at, "GC revalidation capture")?;
         let state = self.state_unlocked().await?;
         let mut run = self
@@ -3213,7 +3551,7 @@ impl Catalog for SlateDbCatalog {
             stats,
             completed_at,
         } = publication;
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(completed_at, "GC revalidation completion")?;
         let state = self.state_unlocked().await?;
         let mut run = self
@@ -3287,7 +3625,7 @@ impl Catalog for SlateDbCatalog {
             progress,
             updated_at,
         } = publication;
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(updated_at, "GC deletion progress")?;
         let state = self.state_unlocked().await?;
         let mut run = self
@@ -3368,7 +3706,7 @@ impl Catalog for SlateDbCatalog {
         detail: String,
         observed_at: DateTime<Utc>,
     ) -> Result<GcBlockerRecord, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         validate_timestamp(observed_at, "GC blocker observation")?;
         if self
             .get_record::<GcRunRecord>(gc_run_key(run_id))
@@ -3413,17 +3751,17 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn lease(&self, id: Uuid) -> Result<Option<LeaseRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         self.get_record(lease_key(id)).await
     }
 
     async fn lease_tombstone(&self, id: Uuid) -> Result<Option<LeaseTombstone>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         self.get_record(lease_tombstone_key(id)).await
     }
 
     async fn tombstone(&self, id: Uuid) -> Result<Option<TombstoneRecord>, CatalogError> {
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         self.get_record(tombstone_key(id)).await
     }
 
@@ -3442,7 +3780,7 @@ impl Catalog for SlateDbCatalog {
             )));
         }
 
-        let _guard = self.lock.lock().await;
+        let (_visibility, _guard) = self.lock_visible().await?;
         let state = self.state_unlocked().await?;
         let mut cursor = self
             .get_record::<TombstoneCleanupCursor>(Bytes::from_static(TOMBSTONE_CLEANUP_CURSOR_KEY))
@@ -3616,6 +3954,7 @@ impl Catalog for SlateDbCatalog {
                     generation: state.generation.checked_add(1).ok_or_else(|| {
                         CatalogError::Corrupt("catalog generation overflow".to_string())
                     })?,
+                    live_branches: state.live_branches,
                 },
             )?;
         }
@@ -3634,14 +3973,44 @@ impl Catalog for SlateDbCatalog {
     }
 
     async fn apply(&self, mutation: CatalogMutation) -> Result<u64, CatalogError> {
-        let _guard = self.lock.lock().await;
-        self.apply_unlocked(mutation).await
+        let visibility = Arc::clone(&self.durability_visibility).read_owned().await;
+        self.ensure_durability_certain()?;
+        let mutation_guard = Arc::clone(&self.lock).lock_owned().await;
+        self.ensure_durability_certain()?;
+        let prepared = self.prepare_unlocked(mutation).await;
+        let durability = tokio::spawn(Self::admit_and_confirm(
+            Arc::clone(&self.db),
+            Arc::clone(&self.durability_poisoned),
+            visibility,
+            mutation_guard,
+            prepared,
+        ));
+        match durability.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.durability_poisoned.store(true, Ordering::Release);
+                Err(CatalogError::Io(io::Error::other(format!(
+                    "catalog durability task failed: {error}"
+                ))))
+            }
+        }
     }
 }
 
 fn durable_write_options() -> WriteOptions {
     WriteOptions {
         await_durable: true,
+        ..Default::default()
+    }
+}
+
+fn durable_read_options() -> ReadOptions {
+    ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)
+}
+
+fn buffered_write_options() -> WriteOptions {
+    WriteOptions {
+        await_durable: false,
         ..Default::default()
     }
 }
@@ -3911,6 +4280,7 @@ mod tests {
         GcRevalidationStats, GcRootKind, GcRootPin, RootCaptureLifecycle,
         RootCaptureLifecycleError, SlateDbRootStore, catalog_timestamp, lease::LEASE_CLOCK_SKEW,
     };
+    use crate::fault_store::FaultStore;
     use chrono::Utc;
     use slatedb::object_store::memory::InMemory;
 
@@ -4062,6 +4432,7 @@ mod tests {
             &CatalogState {
                 schema_version: SERVER_CATALOG_SCHEMA_VERSION,
                 generation: 1,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -4119,6 +4490,52 @@ mod tests {
         assert_eq!(snapshot.generation, 3);
         assert!(snapshot.branches.is_empty());
         assert_eq!(snapshot.tombstones.get(&record.id).unwrap().name, "main");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_apply_never_exposes_an_undurable_record() {
+        let (store, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = store;
+        let catalog = Arc::new(
+            SlateDbCatalog::open(Path::from("cancelled-apply-visibility"), store)
+                .await
+                .unwrap(),
+        );
+        controls.reset_counts();
+        controls.delay_puts(16, std::time::Duration::from_millis(300));
+        let record = branch("cancelled-visible");
+        let apply = tokio::spawn({
+            let catalog = Arc::clone(&catalog);
+            let record = record.clone();
+            async move { catalog.apply(CatalogMutation::CreateBranch(record)).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while catalog
+                .db
+                .get(branch_key(record.id))
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        apply.abort();
+        assert_eq!(catalog.branch(record.id).await.unwrap(), None);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if catalog.branch(record.id).await.unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(catalog.branch(record.id).await.unwrap(), Some(record));
         catalog.close().await.unwrap();
     }
 
@@ -4332,6 +4749,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_create_completion_atomically_swaps_gc_pins_and_retries_exactly() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("branch-create-complete"), store)
+            .await
+            .unwrap();
+        let parent = branch("complete-parent");
+        catalog
+            .apply(CatalogMutation::CreateBranch(parent.clone()))
+            .await
+            .unwrap();
+        let source = checkpoint(Uuid::new_v4(), parent.id, "complete-source");
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(source.clone()))
+            .await
+            .unwrap();
+        let (creating, operation) = reserved_create(&source, "complete-child");
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: creating.clone(),
+                operation: Box::new(operation.clone()),
+            })
+            .await
+            .unwrap();
+        let destination_root = DurableRoot {
+            identity: "branches/complete-child".to_string(),
+            manifest_id: "checkpoint@complete".to_string(),
+        };
+        let completion = CatalogMutation::CompleteBranchCreate {
+            operation_id: operation.id,
+            expected_revision: operation.revision,
+            destination_root: destination_root.clone(),
+            updated_at: catalog_timestamp(Utc::now()),
+        };
+        assert_eq!(catalog.apply(completion.clone()).await.unwrap(), 4);
+        assert_eq!(catalog.apply(completion).await.unwrap(), 4);
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::CompleteBranchCreate {
+                    operation_id: operation.id,
+                    expected_revision: operation.revision + 1,
+                    destination_root: destination_root.clone(),
+                    updated_at: catalog_timestamp(Utc::now()),
+                })
+                .await,
+            Err(CatalogError::RevisionConflict {
+                expected: 4,
+                actual: 3,
+            })
+        ));
+
+        let snapshot = catalog.snapshot().await.unwrap();
+        snapshot.validate().unwrap();
+        let pins = snapshot.gc_root_pins();
+        assert_eq!(pins.len(), 3);
+        assert!(pins.contains(&GcRootPin {
+            kind: GcRootKind::Branch,
+            root: parent.root.clone().unwrap(),
+        }));
+        assert!(pins.contains(&GcRootPin {
+            kind: GcRootKind::Branch,
+            root: destination_root.clone(),
+        }));
+        assert!(pins.contains(&GcRootPin {
+            kind: GcRootKind::Checkpoint,
+            root: source.root.clone(),
+        }));
+        let completed = &snapshot.branch_create_operations[&operation.id];
+        assert_eq!(completed.phase, BranchCreatePhase::Published);
+        assert_eq!(completed.revision, 3);
+        assert_eq!(completed.destination_root.as_ref(), Some(&destination_root));
+        assert_eq!(
+            snapshot.branches[&creating.id].root,
+            Some(destination_root.clone())
+        );
+        assert_eq!(
+            catalog
+                .private_gc_branch_blockers_unlocked(parent.id)
+                .await
+                .unwrap()
+                .incomplete_children,
+            0
+        );
+        assert!(
+            catalog
+                .db
+                .get(branch_create_source_key(source.id, operation.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            catalog
+                .apply(CatalogMutation::CompleteBranchCreate {
+                    operation_id: operation.id,
+                    expected_revision: operation.revision,
+                    destination_root: DurableRoot {
+                        identity: "branches/conflict".to_string(),
+                        manifest_id: "checkpoint@conflict".to_string(),
+                    },
+                    updated_at: catalog_timestamp(Utc::now()),
+                })
+                .await,
+            Err(CatalogError::OperationConflict(_))
+        ));
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn production_branch_and_lineage_capacity_is_enforced_before_publication() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = SlateDbCatalog::open(Path::from("branch-capacity"), store)
@@ -4408,6 +4933,16 @@ mod tests {
                 Bytes::from_static(b"capacity-placeholder"),
             );
         }
+        let state = catalog.state_unlocked().await.unwrap();
+        put_json(
+            &mut batch,
+            Bytes::from_static(STATE_KEY),
+            &CatalogState {
+                live_branches: (MAX_LIVE_BRANCHES - 1) as u64,
+                ..state
+            },
+        )
+        .unwrap();
         catalog
             .db
             .write_with_options(batch, &durable_write_options())
@@ -6250,6 +6785,7 @@ mod tests {
             &CatalogState {
                 schema_version: LEGACY_SCHEMA_VERSION,
                 generation: 2,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -6293,7 +6829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v2_through_v19_catalogs_to_writer_head_schema() {
+    async fn migrates_v2_through_v20_catalogs_to_counted_branch_schema() {
         for prior_version in [
             PREVIOUS_SCHEMA_VERSION,
             OPERATION_SCHEMA_VERSION,
@@ -6313,9 +6849,10 @@ mod tests {
             SERVER_CATALOG_SCHEMA_VERSION,
             PRODUCTION_LIMITS_SCHEMA_VERSION,
             WRITER_AUTHORITY_SCHEMA_VERSION,
+            BRANCH_LINEAGE_SCHEMA_VERSION,
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let path = Path::from(format!("migration-v{prior_version}-v20"));
+            let path = Path::from(format!("migration-v{prior_version}-v21"));
             let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
                 .build()
                 .await
@@ -6327,10 +6864,10 @@ mod tests {
             put_json(
                 &mut batch,
                 Bytes::from_static(STATE_KEY),
-                &CatalogState {
-                    schema_version: prior_version,
-                    generation: 1,
-                },
+                &serde_json::json!({
+                    "schema_version": prior_version,
+                    "generation": 1,
+                }),
             )
             .unwrap();
             put_json(&mut batch, branch_key(existing.id), &existing).unwrap();
@@ -6387,6 +6924,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_schema_rejects_a_missing_live_branch_counter() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SlateDbCatalog::open(Path::from("missing-live-branch-count"), store)
+            .await
+            .unwrap();
+        catalog
+            .db
+            .put_with_options(
+                STATE_KEY,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": CATALOG_SCHEMA_VERSION,
+                    "generation": 0,
+                }))
+                .unwrap(),
+                &Default::default(),
+                &durable_write_options(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.state_unlocked().await,
+            Err(CatalogError::Json(_))
+        ));
+        catalog.db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn v19_lease_tombstones_migrate_without_inventing_head_publication() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("migration-v19-lease-tombstone");
@@ -6403,6 +6967,7 @@ mod tests {
             &CatalogState {
                 schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
                 generation: 3,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -6452,6 +7017,7 @@ mod tests {
                 &CatalogState {
                     schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
                     generation: 7,
+                    live_branches: 0,
                 },
             )
             .unwrap();
@@ -6570,6 +7136,7 @@ mod tests {
             &CatalogState {
                 schema_version: PRODUCTION_LIMITS_SCHEMA_VERSION,
                 generation: 1,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -6603,6 +7170,7 @@ mod tests {
             &CatalogState {
                 schema_version: PRODUCTION_LIMITS_SCHEMA_VERSION,
                 generation: 1,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -6658,6 +7226,7 @@ mod tests {
             &CatalogState {
                 schema_version: WRITER_AUTHORITY_SCHEMA_VERSION,
                 generation: 3,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -6977,6 +7546,7 @@ mod tests {
             &CatalogState {
                 schema_version: LEGACY_SCHEMA_VERSION,
                 generation: 1,
+                live_branches: 0,
             },
         )
         .unwrap();
@@ -7002,7 +7572,9 @@ mod tests {
             .unwrap();
         let catalog = SlateDbCatalog {
             db,
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
+            durability_visibility: Arc::new(RwLock::new(())),
+            durability_poisoned: Arc::new(AtomicBool::new(false)),
         };
 
         for _ in 0..2 {

@@ -29,6 +29,9 @@ pub struct FaultControls {
     delay_get_millis: AtomicU64,
     /// Fail the next N `put` calls before applying them, then resume.
     fail_next_puts: AtomicUsize,
+    /// Delay the next N `put` calls before forwarding them, then resume.
+    delay_next_puts: AtomicUsize,
+    delay_put_millis: AtomicU64,
     /// Apply the next N `put` calls, then return a transient response error.
     fail_after_puts: AtomicUsize,
     /// Fail the next N `delete` calls before applying them, then resume.
@@ -69,6 +72,12 @@ impl FaultControls {
     }
     pub fn fail_puts(&self, n: usize) {
         self.fail_next_puts.store(n, Ordering::SeqCst);
+    }
+    /// Delay the next `n` puts before forwarding them to the inner store.
+    pub fn delay_puts(&self, n: usize, delay: std::time::Duration) {
+        let millis = u64::try_from(delay.as_millis()).expect("PUT delay exceeds u64 milliseconds");
+        self.delay_put_millis.store(millis, Ordering::SeqCst);
+        self.delay_next_puts.store(n, Ordering::SeqCst);
     }
     pub fn fail_puts_after_apply(&self, n: usize) {
         self.fail_after_puts.store(n, Ordering::SeqCst);
@@ -241,6 +250,12 @@ impl ObjectStore for FaultStore {
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
         let payload_bytes = payload.content_length() as u64;
         self.check_writable("put")?;
+        if take_one(&self.ctl.delay_next_puts) {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.ctl.delay_put_millis.load(Ordering::SeqCst),
+            ))
+            .await;
+        }
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }
@@ -418,6 +433,19 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(35));
         assert_eq!(ctl.delay_next_gets.load(Ordering::SeqCst), 0);
         store.get(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delays_a_bounded_number_of_puts() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("k");
+
+        ctl.delay_puts(1, std::time::Duration::from_millis(40));
+        let started = std::time::Instant::now();
+        store.put(&path, b"hello".to_vec().into()).await.unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(35));
+        assert_eq!(ctl.delay_next_puts.load(Ordering::SeqCst), 0);
+        store.put(&path, b"again".to_vec().into()).await.unwrap();
     }
 
     #[tokio::test]
