@@ -5,7 +5,7 @@ use super::{
     RootCaptureLifecycleError, ServerWriterMountRequest, SlateDbCatalog, SlateDbRootStore,
     catalog_timestamp,
 };
-use crate::fault_store::FaultStore;
+use crate::fault_store::{FaultControls, FaultStore};
 use crate::fs::key_codec::KeyCodec;
 use crate::segment::{FrameLoc, Segid};
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 const STRESS_CONFIRMATION: &str = "run-cow-minio-postgres-stress-with-retained-prefix";
+const BRANCH_BENCH_CONFIRMATION: &str = "run-cow-branch-create-benchmark-with-retained-prefix";
 
 #[derive(Clone)]
 struct BranchSpec {
@@ -45,6 +46,69 @@ fn bounded_env(name: &str, default: usize, minimum: usize, maximum: usize) -> us
     value
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BranchBenchProjection {
+    Authority,
+    Postgres,
+    Json,
+}
+
+impl BranchBenchProjection {
+    fn from_env() -> Self {
+        match std::env::var("ZEROFS_BRANCH_BENCH_PROJECTION")
+            .unwrap_or_else(|_| "authority".to_string())
+            .as_str()
+        {
+            "authority" => Self::Authority,
+            "postgres" => Self::Postgres,
+            "json" => Self::Json,
+            value => panic!(
+                "ZEROFS_BRANCH_BENCH_PROJECTION must be authority, postgres, or json; got {value}"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Authority => "authority",
+            Self::Postgres => "postgres",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ObjectCounts {
+    gets: usize,
+    puts: usize,
+    lists: usize,
+}
+
+impl ObjectCounts {
+    fn read(counters: &FaultControls) -> Self {
+        Self {
+            gets: counters.get_count(),
+            puts: counters.put_count(),
+            lists: counters.list_count(),
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            gets: self.gets - before.gets,
+            puts: self.puts - before.puts,
+            lists: self.lists - before.lists,
+        }
+    }
+}
+
+fn percentile(sorted_micros: &[u64], percentile: usize) -> u64 {
+    assert!(!sorted_micros.is_empty());
+    assert!((1..=100).contains(&percentile));
+    let rank = (percentile * sorted_micros.len()).div_ceil(100);
+    sorted_micros[rank.saturating_sub(1)]
+}
+
 fn wal_off_settings() -> slatedb::config::Settings {
     slatedb::config::Settings {
         wal_enabled: false,
@@ -55,11 +119,31 @@ fn wal_off_settings() -> slatedb::config::Settings {
 }
 
 fn stress_url(raw: &str, confirmation: Option<&str>) -> Result<url::Url, String> {
+    qualified_s3_url(raw, confirmation, STRESS_CONFIRMATION, "CoW stress")
+}
+
+fn branch_bench_url(raw: &str, confirmation: Option<&str>) -> Result<url::Url, String> {
+    qualified_s3_url(
+        raw,
+        confirmation,
+        BRANCH_BENCH_CONFIRMATION,
+        "branch benchmark",
+    )
+}
+
+fn qualified_s3_url(
+    raw: &str,
+    confirmation: Option<&str>,
+    expected_confirmation: &str,
+    label: &str,
+) -> Result<url::Url, String> {
     let url: url::Url = raw
         .parse()
-        .map_err(|error| format!("ZEROFS_COW_STRESS_URL is invalid: {error}"))?;
+        .map_err(|error| format!("{label} URL is invalid: {error}"))?;
     if !matches!(url.scheme(), "s3" | "s3a") {
-        return Err("CoW stress requires an S3-compatible object store such as MinIO".to_string());
+        return Err(format!(
+            "{label} requires an S3-compatible object store such as MinIO"
+        ));
     }
     if !url.username().is_empty()
         || url.password().is_some()
@@ -68,9 +152,9 @@ fn stress_url(raw: &str, confirmation: Option<&str>) -> Result<url::Url, String>
     {
         return Err("stress credentials and options must come from the environment".to_string());
     }
-    if confirmation != Some(STRESS_CONFIRMATION) {
+    if confirmation != Some(expected_confirmation) {
         return Err(format!(
-            "ZEROFS_COW_STRESS_CONFIRM must equal {STRESS_CONFIRMATION}"
+            "{label} confirmation must equal {expected_confirmation}"
         ));
     }
     Ok(url)
@@ -110,6 +194,368 @@ async fn run_report(lifecycle: &BranchLifecycle, run_id: Uuid) -> super::GcRunRe
     assert_eq!(gc.mark(run_id).await.unwrap(), reported);
     assert_eq!(gc.report(run_id).await.unwrap(), reported);
     reported
+}
+
+async fn create_benchmark_batch(
+    lifecycle: Arc<BranchLifecycle>,
+    specs: Vec<BranchSpec>,
+    source_branch_id: Uuid,
+    concurrency: usize,
+    volume_id: Uuid,
+    projection: Option<Arc<dyn CatalogProjection>>,
+) -> Vec<u64> {
+    stream::iter(specs)
+        .map(|spec| {
+            let lifecycle = Arc::clone(&lifecycle);
+            let projection = projection.clone();
+            async move {
+                let started = Instant::now();
+                let branch = lifecycle
+                    .create_from_checkpoint_name_by_identity(
+                        spec.operation_id,
+                        spec.branch_id,
+                        spec.name,
+                        source_branch_id,
+                        "branch-bench-source".to_string(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(branch.state, BranchState::Ready);
+                if let Some(projection) = projection {
+                    lifecycle
+                        .reconcile_projection(volume_id, projection.as_ref())
+                        .await
+                        .unwrap();
+                }
+                u64::try_from(started.elapsed().as_micros()).unwrap()
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await
+}
+
+/// Focused release-mode throughput benchmark for the production checkpoint
+/// branch-creation protocol. Setup, warm-up, validation, and cleanup are
+/// excluded from the timed interval. Every successful timed operation executes
+/// reserve -> physical COW clone -> root authentication -> catalog publication.
+/// `postgres` and `json` modes additionally include the same synchronous,
+/// best-effort projection reconciliation attempted by the server RPC boundary.
+///
+/// Required environment:
+/// - `ZEROFS_BRANCH_BENCH_URL`: retained S3-compatible prefix
+/// - `ZEROFS_BRANCH_BENCH_CONFIRM=run-cow-branch-create-benchmark-with-retained-prefix`
+/// - PostgreSQL mode also requires `ZEROFS_BRANCH_BENCH_POSTGRES_URL`
+///
+/// Knobs: `_BRANCHES` (default 256), `_REFERENCES` (default 1), `_SEGMENTS`
+/// (default 1), `_CONCURRENCY` (default 32), `_WARMUP` (default 8), and
+/// `_PROJECTION=authority|postgres|json` (default authority).
+#[tokio::test]
+#[ignore = "requires explicitly acknowledged MinIO/S3 and optional disposable PostgreSQL"]
+async fn cow_branch_create_throughput() {
+    let timeout_minutes = bounded_env("ZEROFS_BRANCH_BENCH_TIMEOUT_MINUTES", 30, 1, 120);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_minutes as u64 * 60),
+        run_cow_branch_create_throughput(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("branch creation benchmark exceeded {timeout_minutes} minutes"));
+}
+
+async fn run_cow_branch_create_throughput() {
+    let raw_url = std::env::var("ZEROFS_BRANCH_BENCH_URL")
+        .expect("ZEROFS_BRANCH_BENCH_URL must name an S3-compatible prefix");
+    let url = branch_bench_url(
+        &raw_url,
+        std::env::var("ZEROFS_BRANCH_BENCH_CONFIRM").ok().as_deref(),
+    )
+    .unwrap();
+    let branches = bounded_env("ZEROFS_BRANCH_BENCH_BRANCHES", 256, 1, 4_095);
+    let references = bounded_env("ZEROFS_BRANCH_BENCH_REFERENCES", 1, 1, 1_000_000);
+    let segments = bounded_env("ZEROFS_BRANCH_BENCH_SEGMENTS", 1, 1, references);
+    let concurrency = bounded_env("ZEROFS_BRANCH_BENCH_CONCURRENCY", 32, 1, 64);
+    let warmup = bounded_env("ZEROFS_BRANCH_BENCH_WARMUP", 8, 0, 64);
+    assert!(
+        branches + warmup <= 4_095,
+        "timed plus warm-up branches must leave capacity for the source branch"
+    );
+    let projection_mode = BranchBenchProjection::from_env();
+    let postgres_tls = std::env::var("ZEROFS_BRANCH_BENCH_POSTGRES_TLS")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+
+    let (parsed, configured_prefix) = object_store::parse_url_opts(&url, std::env::vars()).unwrap();
+    let qualification_id = Uuid::new_v4();
+    let retained_prefix = configured_prefix
+        .join("zerofs-branch-create-bench")
+        .join(qualification_id.to_string());
+    let retained_prefix_text = retained_prefix.to_string();
+    let scoped = object_store::prefix::PrefixStore::new(parsed, retained_prefix);
+    let (counted_store, counters) = FaultStore::new(Arc::new(scoped));
+    let store: Arc<dyn ObjectStore> = counted_store;
+    let source_path = Path::from("source");
+    let catalog_path = Path::from("catalog");
+    let branch_root = Path::from("branches");
+    let segment_pool = Path::from("segment-pool");
+    let volume_id = Uuid::new_v4();
+    let setup_started = Instant::now();
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "branch_create_benchmark_started",
+            "qualification_id": qualification_id,
+            "retained_object_prefix": retained_prefix_text,
+            "automatic_cleanup": false,
+            "branches": branches,
+            "references": references,
+            "segments": segments,
+            "concurrency": concurrency,
+            "warmup": warmup,
+            "projection": projection_mode.as_str(),
+            "postgres_tls": postgres_tls,
+        })
+    );
+
+    let source_db = Db::builder(source_path.clone(), Arc::clone(&store))
+        .with_settings(wal_off_settings())
+        .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+        .build()
+        .await
+        .unwrap();
+    let key_codec = KeyCodec::new();
+    let mut source_batch = WriteBatch::new();
+    for index in 0..references {
+        source_batch.put(
+            key_codec.extent_key(index as u64 + 1, 0),
+            FrameLoc {
+                segid: Segid::new(1, (index % segments) as u64),
+                frame_index: 0,
+                byte_offset: 0,
+                byte_len: 1,
+            }
+            .encode(),
+        );
+    }
+    source_db
+        .write_with_options(
+            source_batch,
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    source_db.flush().await.unwrap();
+    let source_checkpoint = source_db
+        .create_checkpoint(
+            CheckpointScope::All,
+            &CheckpointOptions {
+                lifetime: None,
+                source: None,
+                name: Some("branch-bench-source".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    source_db.close().await.unwrap();
+    let physical = AdminBuilder::new(source_path.clone(), Arc::clone(&store))
+        .build()
+        .list_checkpoints(Some("branch-bench-source"))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|checkpoint| checkpoint.id == source_checkpoint.id)
+        .unwrap();
+    let source = ImmutableCheckpoint {
+        database_path: source_path,
+        checkpoint_id: source_checkpoint.id,
+        manifest_id: source_checkpoint.manifest_id,
+    };
+    let now = catalog_timestamp(physical.create_time);
+    let source_branch_id = Uuid::new_v4();
+    let catalog = Arc::new(
+        SlateDbCatalog::open(catalog_path, Arc::clone(&store))
+            .await
+            .unwrap(),
+    );
+    catalog
+        .apply(CatalogMutation::CreateBranch(BranchRecord {
+            id: source_branch_id,
+            revision: 1,
+            name: "branch-bench-main".to_string(),
+            state: BranchState::Ready,
+            root: Some(source.durable_root()),
+            parent_id: None,
+            origin_checkpoint_id: None,
+            created_at: now,
+            updated_at: now,
+        }))
+        .await
+        .unwrap();
+    catalog
+        .apply(CatalogMutation::CreateCheckpoint(CheckpointRecord {
+            id: source.checkpoint_id,
+            revision: 1,
+            branch_id: source_branch_id,
+            name: "branch-bench-source".to_string(),
+            root: source.durable_root(),
+            created_at: now,
+            updated_at: now,
+        }))
+        .await
+        .unwrap();
+    let lifecycle = Arc::new(BranchLifecycle::new(
+        catalog.clone(),
+        SlateDbRootStore::new(Arc::clone(&store), branch_root).with_segment_pool_root(segment_pool),
+    ));
+
+    let json_directory = matches!(projection_mode, BranchBenchProjection::Json)
+        .then(|| tempfile::tempdir().unwrap());
+    let projection: Option<Arc<dyn CatalogProjection>> = match projection_mode {
+        BranchBenchProjection::Authority => None,
+        BranchBenchProjection::Postgres => {
+            let postgres_url = std::env::var("ZEROFS_BRANCH_BENCH_POSTGRES_URL")
+                .expect("PostgreSQL projection mode requires ZEROFS_BRANCH_BENCH_POSTGRES_URL");
+            let postgres = PostgresCatalogProjection::connect_with_tls(&postgres_url, postgres_tls)
+                .await
+                .unwrap();
+            postgres.migrate().await.unwrap();
+            Some(Arc::new(postgres))
+        }
+        BranchBenchProjection::Json => Some(Arc::new(JsonCatalogProjection::new(
+            json_directory
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("projection.json"),
+        ))),
+    };
+    if let Some(projection) = &projection {
+        lifecycle
+            .reconcile_projection(volume_id, projection.as_ref())
+            .await
+            .unwrap();
+    }
+
+    let warmup_specs = (0..warmup)
+        .map(|index| BranchSpec {
+            operation_id: Uuid::new_v4(),
+            deletion_operation_id: Uuid::new_v4(),
+            branch_id: Uuid::new_v4(),
+            name: format!("branch-bench-warmup-{index:04}"),
+        })
+        .collect();
+    create_benchmark_batch(
+        Arc::clone(&lifecycle),
+        warmup_specs,
+        source_branch_id,
+        concurrency,
+        volume_id,
+        projection.clone(),
+    )
+    .await;
+
+    let setup_ms = setup_started.elapsed().as_millis();
+    let specs = (0..branches)
+        .map(|index| BranchSpec {
+            operation_id: Uuid::new_v4(),
+            deletion_operation_id: Uuid::new_v4(),
+            branch_id: Uuid::new_v4(),
+            name: format!("branch-bench-child-{index:04}"),
+        })
+        .collect();
+    let counts_before = ObjectCounts::read(counters.as_ref());
+    let timed_started = Instant::now();
+    let mut latency_micros = create_benchmark_batch(
+        Arc::clone(&lifecycle),
+        specs,
+        source_branch_id,
+        concurrency,
+        volume_id,
+        projection.clone(),
+    )
+    .await;
+    let timed_elapsed = timed_started.elapsed();
+    let counts = ObjectCounts::read(counters.as_ref()).delta(counts_before);
+    latency_micros.sort_unstable();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    snapshot.validate().unwrap();
+    assert_eq!(snapshot.branches.len(), 1 + warmup + branches);
+    assert_eq!(
+        snapshot
+            .branches
+            .values()
+            .filter(|branch| branch.state == BranchState::Ready)
+            .count(),
+        1 + warmup + branches
+    );
+    if let Some(projection) = &projection {
+        lifecycle
+            .reconcile_projection(volume_id, projection.as_ref())
+            .await
+            .unwrap();
+        let mut projected = 0;
+        let mut after = None;
+        loop {
+            let page = projection
+                .list(
+                    volume_id,
+                    CustomerCatalogListRequest {
+                        kind: None,
+                        parent_id: None,
+                        state: None,
+                        after,
+                        limit: 256,
+                    },
+                )
+                .await
+                .unwrap();
+            projected += page.records.len();
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+        assert_eq!(projected, 2 + warmup + branches);
+    }
+
+    let elapsed_seconds = timed_elapsed.as_secs_f64();
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "branch_create_benchmark_completed",
+            "qualification_id": qualification_id,
+            "retained_object_prefix": retained_prefix_text,
+            "automatic_cleanup": false,
+            "projection": projection_mode.as_str(),
+            "branches": branches,
+            "references": references,
+            "segments": segments,
+            "concurrency": concurrency,
+            "warmup": warmup,
+            "setup_ms": setup_ms,
+            "timed_ms": timed_elapsed.as_millis(),
+            "branches_per_second": branches as f64 / elapsed_seconds,
+            "latency_micros": {
+                "p50": percentile(&latency_micros, 50),
+                "p95": percentile(&latency_micros, 95),
+                "p99": percentile(&latency_micros, 99),
+                "min": latency_micros[0],
+                "max": latency_micros[latency_micros.len() - 1],
+            },
+            "object_store": {
+                "gets": counts.gets,
+                "puts": counts.puts,
+                "lists": counts.lists,
+                "requests_per_branch": (counts.gets + counts.puts + counts.lists) as f64
+                    / branches as f64,
+            },
+        })
+    );
+    lifecycle.close().await.unwrap();
 }
 
 /// Expensive manual stress qualification for the production object-store,
@@ -629,6 +1075,12 @@ fn stress_guard_requires_s3_and_exact_acknowledgement() {
         "s3://stress-bucket/prefix#fragment",
     ] {
         assert!(stress_url(url, Some(STRESS_CONFIRMATION)).is_err());
+        assert!(branch_bench_url(url, Some(BRANCH_BENCH_CONFIRMATION)).is_err());
     }
     assert!(stress_url("s3://stress-bucket/prefix", None).is_err());
+    assert!(branch_bench_url("s3://stress-bucket/prefix", Some(BRANCH_BENCH_CONFIRMATION)).is_ok());
+    assert!(branch_bench_url("s3://stress-bucket/prefix", None).is_err());
+    assert!(branch_bench_url("s3://stress-bucket/prefix", Some(STRESS_CONFIRMATION)).is_err());
+    assert_eq!(percentile(&[1, 2, 3, 4, 5], 50), 3);
+    assert_eq!(percentile(&[1, 2, 3, 4, 5], 95), 5);
 }
