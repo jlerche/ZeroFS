@@ -10,7 +10,7 @@ use slatedb::object_store::path::Path;
 use slatedb::{DbReader, DbReaderMode, PathResolver, VersionedManifest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 const ROOT_CHECKPOINT_PREFIX: &str = "__zerofs_branch_root_";
@@ -69,6 +69,42 @@ struct AuthenticatedSharedSource {
 
 type SharedSourceIdentity = (String, Uuid, u64);
 type SharedSourceCache = BTreeMap<SharedSourceIdentity, AuthenticatedSharedSource>;
+type SharedPinIdentity = (String, Uuid);
+type SharedPinProofResult =
+    Result<Arc<BTreeSet<slatedb::manifest::SsTableId>>, SharedPinProofFailure>;
+
+#[derive(Debug)]
+struct SharedPinProofFlight {
+    result: watch::Receiver<Option<SharedPinProofResult>>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedPinProofFailure {
+    MissingPin {
+        source_path: String,
+        checkpoint_id: Uuid,
+    },
+    MissingManifest(String),
+    Backend(String),
+}
+
+impl SharedPinProofFailure {
+    fn into_root_store_error(self) -> RootStoreError {
+        match self {
+            Self::MissingPin {
+                source_path,
+                checkpoint_id,
+            } => RootStoreError::MissingExternalPin {
+                source_path,
+                checkpoint_id: Some(checkpoint_id),
+            },
+            Self::MissingManifest(manifest_id) => RootStoreError::MissingManifest(manifest_id),
+            Self::Backend(error) => {
+                RootStoreError::Clone(format!("shared source pin verification failed: {error}"))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PreparedCloneSource {
@@ -121,6 +157,7 @@ pub struct SlateDbRootStore {
     branch_database_root: Path,
     segment_pool_root: Path,
     shared_sources: Arc<Mutex<SharedSourceCache>>,
+    shared_pin_proofs: Arc<Mutex<BTreeMap<SharedPinIdentity, Arc<SharedPinProofFlight>>>>,
 }
 
 impl std::fmt::Debug for SlateDbRootStore {
@@ -139,6 +176,7 @@ impl SlateDbRootStore {
             branch_database_root,
             segment_pool_root: Path::default(),
             shared_sources: Arc::new(Mutex::new(BTreeMap::new())),
+            shared_pin_proofs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -333,16 +371,12 @@ impl SlateDbRootStore {
                     .await;
                 return Ok(result.root);
             }
-            let destination = destination_admin
-                .read_manifest(None)
-                .await?
-                .filter(|manifest| manifest.initialized());
             // Keep the operation's requested immutable source authoritative
             // even while reconciling an already-initialized destination. An
             // external DB entry with the same path but a different checkpoint
             // must never become the source merely because it won a prior write.
             let prepared = Some(self.authenticated_shared_source(source).await?);
-            (OwnerClaim::Created, prepared, destination)
+            (OwnerClaim::Created, prepared, None)
         } else {
             let inspected_owner = self.inspect_owner(&owner, &destination_admin).await?;
             let prepared = if inspected_owner.is_none() {
@@ -975,55 +1009,16 @@ impl SlateDbRootStore {
                         source_path: external.path.clone(),
                         checkpoint_id: None,
                     })?;
-            let pin = self
-                .admin(Path::from(external.path.clone()))
-                .list_checkpoints(None)
-                .await?
-                .into_iter()
-                .find(|checkpoint| checkpoint.id == final_checkpoint_id);
             let source_path = Path::from(external.path.clone());
-            let Some(pin) = pin.filter(|checkpoint| {
-                checkpoint.expire_time.is_none()
-                    && match checkpoint.name.as_deref() {
-                        None => final_checkpoint_id != external.source_checkpoint_id,
-                        Some(_) => {
-                            final_checkpoint_id == external.source_checkpoint_id
-                                && valid_shared_source_checkpoint(&source_path, checkpoint)
-                        }
-                    }
-            }) else {
-                return Err(RootStoreError::MissingExternalPin {
-                    source_path: external.path.clone(),
-                    checkpoint_id: Some(final_checkpoint_id),
-                });
+            let pinned_ids = if final_checkpoint_id == external.source_checkpoint_id {
+                self.verify_shared_pin(source_path, final_checkpoint_id)
+                    .await?
+            } else {
+                Arc::new(
+                    self.verify_private_pin(source_path, final_checkpoint_id)
+                        .await?,
+                )
             };
-            let source_admin = self.admin(Path::from(external.path.clone()));
-            let pin_manifest = source_admin
-                .read_manifest(Some(pin.manifest_id))
-                .await?
-                .ok_or_else(|| RootStoreError::MissingManifest(pin.manifest_id.to_string()))?;
-            let mut pinned_ids = BTreeSet::new();
-            pinned_ids.extend(pin_manifest.l0().iter().map(|view| view.sst.id));
-            pinned_ids.extend(
-                pin_manifest
-                    .compacted()
-                    .iter()
-                    .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
-            );
-            for segment in pin_manifest.segments() {
-                pinned_ids.extend(segment.l0().iter().map(|view| view.sst.id));
-                pinned_ids.extend(
-                    segment
-                        .compacted()
-                        .iter()
-                        .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
-                );
-            }
-            for inherited in pin_manifest.external_dbs() {
-                for external_id in &inherited.sst_ids {
-                    pinned_ids.remove(external_id);
-                }
-            }
             if !external.sst_ids.iter().all(|id| pinned_ids.contains(id)) {
                 return Err(RootStoreError::ExternalPinCoverage {
                     source_path: external.path.clone(),
@@ -1077,6 +1072,116 @@ impl SlateDbRootStore {
             }
         }
         Ok(())
+    }
+
+    /// Authenticate one borrowed permanent source pin for the set of branch
+    /// publications that overlap this proof. The completed result is removed
+    /// immediately: a later wave must touch storage again, while siblings
+    /// already in flight avoid repeating the same manifest LIST and GET.
+    async fn verify_shared_pin(
+        &self,
+        source_path: Path,
+        checkpoint_id: Uuid,
+    ) -> Result<Arc<BTreeSet<slatedb::manifest::SsTableId>>, RootStoreError> {
+        let identity = (source_path.to_string(), checkpoint_id);
+        let (flight, leader_sender) = {
+            let mut flights = self.shared_pin_proofs.lock().await;
+            if let Some(flight) = flights.get(&identity) {
+                (Arc::clone(flight), None)
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                let flight = Arc::new(SharedPinProofFlight { result: receiver });
+                flights.insert(identity.clone(), Arc::clone(&flight));
+                (flight, Some(sender))
+            }
+        };
+
+        if let Some(sender) = leader_sender {
+            let roots = self.clone();
+            let flight_for_task = Arc::clone(&flight);
+            let source_path_for_task = source_path.clone();
+            tokio::spawn(async move {
+                let result = roots
+                    .load_shared_pin_proof(source_path_for_task, checkpoint_id)
+                    .await;
+                {
+                    let mut flights = roots.shared_pin_proofs.lock().await;
+                    if flights
+                        .get(&identity)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight_for_task))
+                    {
+                        flights.remove(&identity);
+                    }
+                }
+                // Existing waiters retain this flight. Removing it before the
+                // broadcast ensures callers arriving after physical proof
+                // completion always elect a new storage check.
+                sender.send_replace(Some(result));
+            });
+        }
+
+        let mut receiver = flight.result.clone();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result.map_err(SharedPinProofFailure::into_root_store_error);
+            }
+            receiver.changed().await.map_err(|_| {
+                RootStoreError::Clone("shared source pin verifier stopped unexpectedly".to_string())
+            })?;
+        }
+    }
+
+    async fn load_shared_pin_proof(
+        &self,
+        source_path: Path,
+        checkpoint_id: Uuid,
+    ) -> SharedPinProofResult {
+        let pin = self
+            .admin(source_path.clone())
+            .list_checkpoints(None)
+            .await
+            .map_err(|error| SharedPinProofFailure::Backend(error.to_string()))?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .filter(|checkpoint| {
+                checkpoint.expire_time.is_none()
+                    && valid_shared_source_checkpoint(&source_path, checkpoint)
+            })
+            .ok_or_else(|| SharedPinProofFailure::MissingPin {
+                source_path: source_path.to_string(),
+                checkpoint_id,
+            })?;
+        let manifest = self
+            .admin(source_path)
+            .read_manifest(Some(pin.manifest_id))
+            .await
+            .map_err(|error| SharedPinProofFailure::Backend(error.to_string()))?
+            .ok_or_else(|| SharedPinProofFailure::MissingManifest(pin.manifest_id.to_string()))?;
+        Ok(Arc::new(manifest_owned_sst_ids(&manifest)))
+    }
+
+    async fn verify_private_pin(
+        &self,
+        source_path: Path,
+        checkpoint_id: Uuid,
+    ) -> Result<BTreeSet<slatedb::manifest::SsTableId>, RootStoreError> {
+        let pin = self
+            .admin(source_path.clone())
+            .list_checkpoints(None)
+            .await?
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .filter(|checkpoint| checkpoint.expire_time.is_none() && checkpoint.name.is_none())
+            .ok_or_else(|| RootStoreError::MissingExternalPin {
+                source_path: source_path.to_string(),
+                checkpoint_id: Some(checkpoint_id),
+            })?;
+        let manifest = self
+            .admin(source_path)
+            .read_manifest(Some(pin.manifest_id))
+            .await?
+            .ok_or_else(|| RootStoreError::MissingManifest(pin.manifest_id.to_string()))?;
+        Ok(manifest_owned_sst_ids(&manifest))
     }
 
     async fn ensure_shared_source_pin(
@@ -1466,6 +1571,34 @@ impl SlateDbRootStore {
         }
         builder.build()
     }
+}
+
+fn manifest_owned_sst_ids(
+    manifest: &slatedb::VersionedManifest,
+) -> BTreeSet<slatedb::manifest::SsTableId> {
+    let mut ids = BTreeSet::new();
+    ids.extend(manifest.l0().iter().map(|view| view.sst.id));
+    ids.extend(
+        manifest
+            .compacted()
+            .iter()
+            .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
+    );
+    for segment in manifest.segments() {
+        ids.extend(segment.l0().iter().map(|view| view.sst.id));
+        ids.extend(
+            segment
+                .compacted()
+                .iter()
+                .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
+        );
+    }
+    for inherited in manifest.external_dbs() {
+        for external_id in &inherited.sst_ids {
+            ids.remove(external_id);
+        }
+    }
+    ids
 }
 
 fn validate_database_path(label: &str, path: &Path) -> Result<(), RootStoreError> {
@@ -1908,6 +2041,121 @@ mod tests {
         source_admin.delete_checkpoint(checkpoint.id).await.unwrap();
         roots.verify(&left).await.unwrap();
         roots.verify(&right).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_shared_pin_proofs_coalesce_but_later_waves_revalidate() {
+        let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = fault_store;
+        let source_path = Path::from("shared-pin-proof-source");
+        let source = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source.put(b"key", b"value").await.unwrap();
+        source.flush().await.unwrap();
+        let checkpoint = source
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    name: Some("permanent-source".to_string()),
+                    ..CheckpointOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        let exact = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let roots = SlateDbRootStore::new(Arc::clone(&store), Path::from("shared-pin-proof-roots"));
+        let prepared = roots.authenticated_shared_source(&exact).await.unwrap();
+
+        faults.reset_counts();
+        faults.delay_gets(1, std::time::Duration::from_millis(50));
+        let (left, right) = tokio::join!(
+            roots.verify_shared_pin(source_path.clone(), prepared.checkpoint.checkpoint_id),
+            roots.verify_shared_pin(source_path.clone(), prepared.checkpoint.checkpoint_id),
+        );
+        assert_eq!(left.unwrap(), right.unwrap());
+        assert_eq!(
+            faults.list_count(),
+            1,
+            "overlapping callers must share one physical pin proof"
+        );
+
+        faults.reset_counts();
+        faults.delay_gets(1, std::time::Duration::from_millis(50));
+        let cancelled = {
+            let roots = roots.clone();
+            let source_path = source_path.clone();
+            let checkpoint_id = prepared.checkpoint.checkpoint_id;
+            tokio::spawn(async move { roots.verify_shared_pin(source_path, checkpoint_id).await })
+        };
+        while faults.list_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let survivor = {
+            let roots = roots.clone();
+            let source_path = source_path.clone();
+            let checkpoint_id = prepared.checkpoint.checkpoint_id;
+            tokio::spawn(async move { roots.verify_shared_pin(source_path, checkpoint_id).await })
+        };
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), survivor)
+            .await
+            .expect("cancelling the first waiter must not cancel the detached proof")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            faults.list_count(),
+            1,
+            "a cancelled first waiter must not start a duplicate proof"
+        );
+
+        faults.reset_counts();
+        roots
+            .verify_shared_pin(source_path.clone(), prepared.checkpoint.checkpoint_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            faults.list_count(),
+            1,
+            "later waves must revalidate storage"
+        );
+
+        roots
+            .admin(source_path.clone())
+            .delete_checkpoint(prepared.checkpoint.checkpoint_id)
+            .await
+            .unwrap();
+        faults.reset_counts();
+        faults.delay_gets(1, std::time::Duration::from_millis(50));
+        let (left, right) = tokio::join!(
+            roots.verify_shared_pin(source_path.clone(), prepared.checkpoint.checkpoint_id),
+            roots.verify_shared_pin(source_path.clone(), prepared.checkpoint.checkpoint_id),
+        );
+        assert!(matches!(
+            left,
+            Err(RootStoreError::MissingExternalPin { .. })
+        ));
+        assert!(matches!(
+            right,
+            Err(RootStoreError::MissingExternalPin { .. })
+        ));
+        assert_eq!(
+            faults.list_count(),
+            1,
+            "overlapping callers must share a failed physical proof"
+        );
+
+        roots.ensure_shared_source_pin(&exact).await.unwrap();
+        roots
+            .verify_shared_pin(source_path, prepared.checkpoint.checkpoint_id)
+            .await
+            .expect("a failed proof must be evicted so a later wave can retry");
     }
 
     #[tokio::test]
