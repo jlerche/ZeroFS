@@ -523,6 +523,10 @@ mod tests {
             manifest_id: "creating-child@1".to_string(),
         };
         catalog
+            .mark_reserved_operation_private_for_test(create_operation.id)
+            .await
+            .unwrap();
+        catalog
             .apply(CatalogMutation::RecordBranchCreateRoot {
                 operation_id: create_operation.id,
                 expected_revision: create_operation.revision,

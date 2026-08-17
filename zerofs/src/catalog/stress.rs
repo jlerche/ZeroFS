@@ -1,9 +1,9 @@
 use super::{
     BranchLifecycle, BranchRecord, BranchState, Catalog, CatalogError, CatalogMutation,
-    CatalogProjection, CheckpointRecord, CustomerCatalogListRequest, CustomerMetadata, GcRunPhase,
-    ImmutableCheckpoint, JsonCatalogProjection, PostgresCatalogProjection,
-    RootCaptureLifecycleError, ServerWriterMountRequest, SlateDbCatalog, SlateDbRootStore,
-    catalog_timestamp,
+    CatalogProjection, CatalogProjectionReconciler, CheckpointRecord, CustomerCatalogListRequest,
+    CustomerMetadata, GcRunPhase, ImmutableCheckpoint, JsonCatalogProjection,
+    PostgresCatalogProjection, RootCaptureLifecycleError, ServerWriterMountRequest, SlateDbCatalog,
+    SlateDbRootStore, catalog_timestamp,
 };
 use crate::fault_store::{FaultControls, FaultStore};
 use crate::fs::key_codec::KeyCodec;
@@ -201,8 +201,7 @@ async fn create_benchmark_batch(
     specs: Vec<BranchSpec>,
     source_branch_id: Uuid,
     concurrency: usize,
-    volume_id: Uuid,
-    projection: Option<Arc<dyn CatalogProjection>>,
+    projection: Option<CatalogProjectionReconciler>,
 ) -> Vec<u64> {
     stream::iter(specs)
         .map(|spec| {
@@ -222,10 +221,7 @@ async fn create_benchmark_batch(
                     .unwrap();
                 assert_eq!(branch.state, BranchState::Ready);
                 if let Some(projection) = projection {
-                    lifecycle
-                        .reconcile_projection(volume_id, projection.as_ref())
-                        .await
-                        .unwrap();
+                    projection.reconcile().await.unwrap();
                 }
                 u64::try_from(started.elapsed().as_micros()).unwrap()
             }
@@ -273,7 +269,7 @@ async fn run_cow_branch_create_throughput() {
     let branches = bounded_env("ZEROFS_BRANCH_BENCH_BRANCHES", 256, 1, 4_095);
     let references = bounded_env("ZEROFS_BRANCH_BENCH_REFERENCES", 1, 1, 1_000_000);
     let segments = bounded_env("ZEROFS_BRANCH_BENCH_SEGMENTS", 1, 1, references);
-    let concurrency = bounded_env("ZEROFS_BRANCH_BENCH_CONCURRENCY", 32, 1, 64);
+    let concurrency = bounded_env("ZEROFS_BRANCH_BENCH_CONCURRENCY", 32, 1, 256);
     let warmup = bounded_env("ZEROFS_BRANCH_BENCH_WARMUP", 8, 0, 64);
     assert!(
         branches + warmup <= 4_095,
@@ -438,6 +434,9 @@ async fn run_cow_branch_create_throughput() {
             .await
             .unwrap();
     }
+    let projection_reconciler = projection
+        .as_ref()
+        .map(|projection| lifecycle.projection_reconciler(volume_id, Arc::clone(projection)));
 
     let warmup_specs = (0..warmup)
         .map(|index| BranchSpec {
@@ -452,8 +451,7 @@ async fn run_cow_branch_create_throughput() {
         warmup_specs,
         source_branch_id,
         concurrency,
-        volume_id,
-        projection.clone(),
+        projection_reconciler.clone(),
     )
     .await;
 
@@ -473,8 +471,7 @@ async fn run_cow_branch_create_throughput() {
         specs,
         source_branch_id,
         concurrency,
-        volume_id,
-        projection.clone(),
+        projection_reconciler,
     )
     .await;
     let timed_elapsed = timed_started.elapsed();

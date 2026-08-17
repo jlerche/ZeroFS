@@ -34,13 +34,17 @@ pub(crate) struct CatalogRuntime {
     lifecycle: zerofs::catalog::BranchLifecycle,
     volume_id: uuid::Uuid,
     projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
+    projection_reconciler: Option<zerofs::catalog::CatalogProjectionReconciler>,
 }
 
 #[derive(Clone)]
 pub(crate) struct CheckpointCatalogRuntime {
     lifecycle: zerofs::catalog::BranchLifecycle,
+    #[allow(dead_code)] // Read by feature-gated customer catalog serving paths.
     volume_id: uuid::Uuid,
+    #[allow(dead_code)] // Retained for feature-gated customer catalog reads.
     projection: Option<Arc<dyn zerofs::catalog::CatalogProjection>>,
+    projection_reconciler: Option<zerofs::catalog::CatalogProjectionReconciler>,
     branch_id: uuid::Uuid,
 }
 
@@ -84,11 +88,8 @@ impl CheckpointCatalogRuntime {
     }
 
     async fn reconcile_projection(&self, operation: &str) {
-        if let Some(projection) = &self.projection
-            && let Err(error) = self
-                .lifecycle
-                .reconcile_projection(self.volume_id, projection.as_ref())
-                .await
+        if let Some(reconciler) = &self.projection_reconciler
+            && let Err(error) = reconciler.reconcile().await
         {
             tracing::warn!(
                 "Customer catalog projection reconciliation after {operation} failed; authoritative SlateDB remains current: {error}"
@@ -125,6 +126,7 @@ impl CatalogRuntime {
             lifecycle: self.lifecycle.clone(),
             volume_id: self.volume_id,
             projection: self.projection.clone(),
+            projection_reconciler: self.projection_reconciler.clone(),
             branch_id,
         }
     }
@@ -199,11 +201,8 @@ impl CatalogRuntime {
     }
 
     async fn reconcile_projection(&self, operation: &str) {
-        if let Some(projection) = &self.projection
-            && let Err(error) = self
-                .lifecycle
-                .reconcile_projection(self.volume_id, projection.as_ref())
-                .await
+        if let Some(reconciler) = &self.projection_reconciler
+            && let Err(error) = reconciler.reconcile().await
         {
             tracing::warn!(
                 "Customer catalog projection reconciliation after {operation} failed; authoritative SlateDB remains current: {error}"
@@ -435,10 +434,14 @@ pub(crate) async fn open_catalog_runtime(
             None
         }
     };
+    let projection_reconciler = projection.as_ref().map(|projection| {
+        lifecycle.projection_reconciler(config.volume_id, Arc::clone(projection))
+    });
     Ok(Some(CatalogRuntime {
         lifecycle,
         volume_id: config.volume_id,
         projection,
+        projection_reconciler,
     }))
 }
 
@@ -2210,9 +2213,13 @@ mod catalog_runtime_tests {
         let projection = Arc::new(JsonCatalogProjection::new(
             directory.path().join("customer-catalog.json"),
         ));
+        let volume_id = uuid::Uuid::new_v4();
         let runtime = CatalogRuntime {
+            projection_reconciler: Some(
+                lifecycle.projection_reconciler(volume_id, projection.clone()),
+            ),
             lifecycle,
-            volume_id: uuid::Uuid::new_v4(),
+            volume_id,
             projection: Some(projection),
         };
         let branch = runtime

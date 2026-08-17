@@ -47,9 +47,10 @@ pub use lifecycle::{
     AdministrativeInspectionRequest, AdministrativeLeaseRecord,
     BranchCreateFromCheckpointNameRequest, BranchCreateRequest, BranchFeatureConfig,
     BranchInspection, BranchLifecycle, BranchLifecycleError, BranchLineageInspection,
-    BranchMountGrant, BranchMountRequest, CheckpointCreateRequest, HistoricalResource,
-    HistoricalResourceStatus, InitialBranchCreateRequest, MAX_ADMINISTRATIVE_INSPECTION_RECORDS,
-    ServerWriterMountDisposition, ServerWriterMountPreparation, ServerWriterMountRequest,
+    BranchMountGrant, BranchMountRequest, CatalogProjectionReconciler, CheckpointCreateRequest,
+    HistoricalResource, HistoricalResourceStatus, InitialBranchCreateRequest,
+    MAX_ADMINISTRATIVE_INSPECTION_RECORDS, ServerWriterMountDisposition,
+    ServerWriterMountPreparation, ServerWriterMountRequest,
 };
 pub use postgres::PostgresCatalogProjection;
 pub use private_epoch::{
@@ -59,7 +60,7 @@ pub use private_epoch::{
 pub use root_store::{ImmutableCheckpoint, RootStoreError, SlateDbRootStore};
 pub(crate) use slate::SlateDbCatalog;
 
-pub const CATALOG_SCHEMA_VERSION: u32 = 21;
+pub const CATALOG_SCHEMA_VERSION: u32 = 22;
 pub const CATALOG_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CATALOG_NAME_BYTES: usize = 255;
 pub const MAX_ROOT_IDENTIFIER_BYTES: usize = 4 * 1024;
@@ -2378,6 +2379,12 @@ pub(crate) trait Catalog: Send + Sync {
         Ok(())
     }
     async fn snapshot(&self) -> Result<CatalogSnapshot, CatalogError>;
+    async fn projection_snapshot(&self) -> Result<CatalogSnapshot, CatalogError> {
+        self.snapshot().await
+    }
+    async fn projection_generation(&self) -> Result<u64, CatalogError> {
+        Ok(self.projection_snapshot().await?.generation)
+    }
     async fn branch(&self, id: Uuid) -> Result<Option<BranchRecord>, CatalogError>;
     async fn branch_by_name(&self, name: &str) -> Result<Option<BranchRecord>, CatalogError>;
     async fn checkpoint(&self, id: Uuid) -> Result<Option<CheckpointRecord>, CatalogError>;
@@ -2390,6 +2397,9 @@ pub(crate) trait Catalog: Send + Sync {
         &self,
         id: Uuid,
     ) -> Result<Option<BranchCreateOperation>, CatalogError>;
+    async fn branch_create_uses_shared_source(&self, _id: Uuid) -> Result<bool, CatalogError> {
+        Ok(false)
+    }
     async fn branch_delete_operation(
         &self,
         id: Uuid,

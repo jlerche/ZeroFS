@@ -3,15 +3,18 @@ use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use slatedb::admin::{Admin, AdminBuilder, CloneSourceSpec};
 use slatedb::config::CheckpointOptions;
 use slatedb::object_store::path::Path;
-use slatedb::{DbReader, DbReaderMode, PathResolver};
-use std::collections::BTreeSet;
+use slatedb::{DbReader, DbReaderMode, PathResolver, VersionedManifest};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const ROOT_CHECKPOINT_PREFIX: &str = "__zerofs_branch_root_";
+const SHARED_SOURCE_CHECKPOINT_PREFIX: &str = "__zerofs_shared_source_";
 const HEAD_CHECKPOINT_PREFIX: &str = "__zerofs_branch_head_";
 const ROOT_OWNER_OBJECT: &str = "__zerofs_branch_root_owner.json";
 const ROOT_RESULT_OBJECT: &str = "__zerofs_branch_root_result.json";
@@ -33,6 +36,12 @@ struct RootOwner {
     source_manifest_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerClaim {
+    Created,
+    Existing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RootResult {
     owner: RootOwner,
@@ -49,6 +58,23 @@ struct WriterHeadResult {
     previous_writer_epoch: u64,
     root: DurableRoot,
     writer_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedSharedSource {
+    checkpoint: ImmutableCheckpoint,
+    physical_checkpoint: slatedb::Checkpoint,
+    manifest: VersionedManifest,
+}
+
+type SharedSourceIdentity = (String, Uuid, u64);
+type SharedSourceCache = BTreeMap<SharedSourceIdentity, AuthenticatedSharedSource>;
+
+#[derive(Debug, Clone)]
+struct PreparedCloneSource {
+    checkpoint: ImmutableCheckpoint,
+    physical_checkpoint: Option<slatedb::Checkpoint>,
+    preloaded_manifest: Option<VersionedManifest>,
 }
 
 /// Exact immutable source resolved once before branch creation begins.
@@ -94,6 +120,7 @@ pub struct SlateDbRootStore {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     branch_database_root: Path,
     segment_pool_root: Path,
+    shared_sources: Arc<Mutex<SharedSourceCache>>,
 }
 
 impl std::fmt::Debug for SlateDbRootStore {
@@ -111,6 +138,7 @@ impl SlateDbRootStore {
             wal_object_store: None,
             branch_database_root,
             segment_pool_root: Path::default(),
+            shared_sources: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -166,7 +194,7 @@ impl SlateDbRootStore {
         expected_created_at: DateTime<Utc>,
     ) -> Result<(), RootStoreError> {
         validate_database_path("checkpoint", &checkpoint.database_path)?;
-        let physical = self.authenticate_source(checkpoint).await?;
+        let (physical, _) = self.authenticate_source(checkpoint).await?;
         if physical.name.as_deref() != Some(expected_name) {
             return Err(RootStoreError::SourceCheckpointNameMismatch {
                 checkpoint_id: checkpoint.checkpoint_id,
@@ -232,6 +260,29 @@ impl SlateDbRootStore {
         destination_id: Uuid,
         source: &ImmutableCheckpoint,
     ) -> Result<DurableRoot, RootStoreError> {
+        self.create_from_checkpoint_inner(operation_id, destination_id, source, false)
+            .await
+    }
+
+    /// Create a catalog-owned clone whose direct source checkpoint remains
+    /// held for the published branch lifetime.
+    pub(crate) async fn create_from_checkpoint_shared(
+        &self,
+        operation_id: Uuid,
+        destination_id: Uuid,
+        source: &ImmutableCheckpoint,
+    ) -> Result<DurableRoot, RootStoreError> {
+        self.create_from_checkpoint_inner(operation_id, destination_id, source, true)
+            .await
+    }
+
+    async fn create_from_checkpoint_inner(
+        &self,
+        operation_id: Uuid,
+        destination_id: Uuid,
+        source: &ImmutableCheckpoint,
+        shared_source_pin: bool,
+    ) -> Result<DurableRoot, RootStoreError> {
         if operation_id.is_nil() {
             return Err(RootStoreError::Invalid(
                 "branch operation UUID cannot be nil".to_string(),
@@ -270,27 +321,57 @@ impl SlateDbRootStore {
             source_checkpoint_id: source.checkpoint_id,
             source_manifest_id: source.manifest_id,
         };
-        let existing_owner = self
-            .read_optional::<RootOwner>(&owner_object_path(&destination_path))
-            .await?;
-        if let Some(existing) = &existing_owner
-            && existing != &owner
+        let (owner_claim, prepared_source, recovered_destination) = if shared_source_pin {
+            if let Some(result) = self.read_result(&destination_path).await? {
+                if result.owner != owner {
+                    return Err(RootStoreError::OwnershipConflict(
+                        destination_path.to_string(),
+                    ));
+                }
+                self.verify(&result.root).await?;
+                self.cleanup_operation_checkpoints(&destination_path, operation_id, &result.root)
+                    .await;
+                return Ok(result.root);
+            }
+            let destination = destination_admin
+                .read_manifest(None)
+                .await?
+                .filter(|manifest| manifest.initialized());
+            // Keep the operation's requested immutable source authoritative
+            // even while reconciling an already-initialized destination. An
+            // external DB entry with the same path but a different checkpoint
+            // must never become the source merely because it won a prior write.
+            let prepared = Some(self.authenticated_shared_source(source).await?);
+            (OwnerClaim::Created, prepared, destination)
+        } else {
+            let inspected_owner = self.inspect_owner(&owner, &destination_admin).await?;
+            let prepared = if inspected_owner.is_none() {
+                let (checkpoint, manifest) = self.authenticate_source(source).await?;
+                Some(AuthenticatedSharedSource {
+                    checkpoint: source.clone(),
+                    physical_checkpoint: checkpoint,
+                    manifest,
+                })
+            } else {
+                None
+            };
+            let claim = match inspected_owner {
+                Some(claim) => claim,
+                None => self.create_owner(&owner).await?,
+            };
+            let destination = if claim == OwnerClaim::Existing {
+                destination_admin
+                    .read_manifest(None)
+                    .await?
+                    .filter(|manifest| manifest.initialized())
+            } else {
+                None
+            };
+            (claim, prepared, destination)
+        };
+        if owner_claim == OwnerClaim::Existing
+            && let Some(result) = self.read_result(&destination_path).await?
         {
-            return Err(RootStoreError::OwnershipConflict(
-                destination_path.to_string(),
-            ));
-        }
-        let destination_exists = destination_admin.read_manifest(None).await?.is_some();
-        if existing_owner.is_none() && destination_exists {
-            return Err(RootStoreError::UnownedDestination(
-                destination_path.to_string(),
-            ));
-        }
-        if !destination_exists {
-            self.verify_source(source).await?;
-        }
-        self.ensure_owner(&owner, &destination_admin).await?;
-        if let Some(result) = self.read_result(&destination_path).await? {
             if result.owner != owner {
                 return Err(RootStoreError::OwnershipConflict(
                     destination_path.to_string(),
@@ -301,50 +382,150 @@ impl SlateDbRootStore {
                 .await;
             return Ok(result.root);
         }
+        let clone_source = if let Some(prepared) = prepared_source {
+            PreparedCloneSource {
+                checkpoint: prepared.checkpoint,
+                physical_checkpoint: shared_source_pin.then_some(prepared.physical_checkpoint),
+                preloaded_manifest: shared_source_pin.then_some(prepared.manifest),
+            }
+        } else if shared_source_pin {
+            let prepared = self.authenticated_shared_source(source).await?;
+            PreparedCloneSource {
+                checkpoint: prepared.checkpoint,
+                physical_checkpoint: Some(prepared.physical_checkpoint),
+                preloaded_manifest: Some(prepared.manifest),
+            }
+        } else if recovered_destination.is_some() {
+            // An initialized private clone is self-authenticating against the
+            // exact requested source identity below. Do not require the
+            // customer checkpoint to remain present during crash recovery,
+            // and never substitute a checkpoint discovered in the destination.
+            PreparedCloneSource {
+                checkpoint: source.clone(),
+                physical_checkpoint: None,
+                preloaded_manifest: None,
+            }
+        } else {
+            self.verify_source(source).await?;
+            PreparedCloneSource {
+                checkpoint: source.clone(),
+                physical_checkpoint: None,
+                preloaded_manifest: None,
+            }
+        };
 
-        let mut builder = destination_admin.create_clone_builder_from_source(
-            CloneSourceSpec::with_checkpoint(source.database_path.clone(), source.checkpoint_id),
+        let mut source_spec = CloneSourceSpec::with_checkpoint(
+            clone_source.checkpoint.database_path.clone(),
+            clone_source.checkpoint.checkpoint_id,
         );
+        if let (Some(checkpoint), Some(manifest)) = (
+            clone_source.physical_checkpoint,
+            clone_source.preloaded_manifest,
+        ) {
+            source_spec = source_spec.with_preloaded_manifest(checkpoint, manifest);
+        }
+        let mut builder = destination_admin.create_clone_builder_from_source(source_spec);
+        if shared_source_pin {
+            builder = builder.with_shared_source_pins();
+        }
         if let Some(wal_object_store) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal_object_store));
         }
-        let clone_error = builder.build().await.err().map(|error| error.to_string());
+        let checkpoint_name = format!("{ROOT_CHECKPOINT_PREFIX}{operation_id}");
+        let root_checkpoint_id = branch_root_checkpoint_identity(operation_id, destination_id);
+        let clone_attempt = builder
+            .build_with_stable_checkpoint(root_checkpoint_id, &checkpoint_name)
+            .await;
+        let clone_error = clone_attempt.as_ref().err().map(ToString::to_string);
 
         let reconcile_deadline = tokio::time::Instant::now() + CONCURRENT_CLONE_RECONCILE_TIMEOUT;
-        let manifest = loop {
-            if let Some(result) = self.read_result(&destination_path).await? {
-                if result.owner != owner {
-                    return Err(RootStoreError::OwnershipConflict(
-                        destination_path.to_string(),
+        let (manifest, created_checkpoint) = match clone_attempt {
+            Ok(result) => (result.manifest, Some(result.checkpoint)),
+            Err(_) => {
+                let manifest = loop {
+                    if let Some(result) = self.read_result(&destination_path).await? {
+                        if result.owner != owner {
+                            return Err(RootStoreError::OwnershipConflict(
+                                destination_path.to_string(),
+                            ));
+                        }
+                        self.verify(&result.root).await?;
+                        self.cleanup_operation_checkpoints(
+                            &destination_path,
+                            operation_id,
+                            &result.root,
+                        )
+                        .await;
+                        return Ok(result.root);
+                    }
+                    match destination_admin.read_manifest(None).await? {
+                        Some(manifest) if manifest.initialized() => break manifest,
+                        state if tokio::time::Instant::now() < reconcile_deadline => {
+                            tokio::time::sleep(CONCURRENT_CLONE_RECONCILE_INTERVAL).await;
+                            drop(state);
+                        }
+                        Some(_) => {
+                            return Err(RootStoreError::Uninitialized(
+                                destination_path.to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(RootStoreError::Clone(
+                                clone_error.clone().expect("failed clone has an error"),
+                            ));
+                        }
+                    }
+                };
+                let expected_source_attached = manifest.external_dbs().iter().any(|external| {
+                    external.path == clone_source.checkpoint.database_path.to_string()
+                        && external.source_checkpoint_id == clone_source.checkpoint.checkpoint_id
+                        && if shared_source_pin {
+                            external.final_checkpoint_id
+                                == Some(clone_source.checkpoint.checkpoint_id)
+                        } else {
+                            external.final_checkpoint_id.is_some()
+                        }
+                });
+                if !expected_source_attached {
+                    return Err(RootStoreError::Clone(
+                        clone_error.clone().expect("failed clone has an error"),
                     ));
                 }
-                self.verify(&result.root).await?;
-                return Ok(result.root);
-            }
-            match destination_admin.read_manifest(None).await? {
-                Some(manifest) if manifest.initialized() => break manifest,
-                state
-                    if clone_error.is_some()
-                        && tokio::time::Instant::now() < reconcile_deadline =>
-                {
-                    tokio::time::sleep(CONCURRENT_CLONE_RECONCILE_INTERVAL).await;
-                    drop(state);
+                let recovered = destination_admin
+                    .create_current_checkpoint_with_id(root_checkpoint_id, &checkpoint_name)
+                    .await?;
+                let pinned_manifest = destination_admin
+                    .read_manifest(Some(recovered.manifest_id))
+                    .await?
+                    .ok_or_else(|| {
+                        RootStoreError::MissingManifest(format!(
+                            "{}@{}",
+                            destination_path, recovered.manifest_id
+                        ))
+                    })?;
+                let mut exact = destination_admin
+                    .list_checkpoints(Some(&checkpoint_name))
+                    .await?
+                    .into_iter()
+                    .filter(|checkpoint| checkpoint.id == root_checkpoint_id)
+                    .collect::<Vec<_>>();
+                if exact.len() != 1 {
+                    return Err(RootStoreError::NonCanonicalRoot(encode_root_checkpoint(
+                        recovered.id,
+                        recovered.manifest_id,
+                    )));
                 }
-                Some(_) => {
-                    return Err(RootStoreError::Uninitialized(destination_path.to_string()));
-                }
-                None => {
-                    return Err(clone_error.clone().map_or_else(
-                        || RootStoreError::MissingManifest(destination_path.to_string()),
-                        RootStoreError::Clone,
-                    ));
-                }
+                (pinned_manifest, Some(exact.remove(0)))
             }
         };
         let attached = manifest.external_dbs().iter().any(|external| {
-            external.path == source.database_path.to_string()
-                && external.source_checkpoint_id == source.checkpoint_id
-                && external.final_checkpoint_id.is_some()
+            external.path == clone_source.checkpoint.database_path.to_string()
+                && external.source_checkpoint_id == clone_source.checkpoint.checkpoint_id
+                && if shared_source_pin {
+                    external.final_checkpoint_id == Some(clone_source.checkpoint.checkpoint_id)
+                } else {
+                    external.final_checkpoint_id.is_some()
+                }
         });
         if !attached {
             if let Some(error) = clone_error {
@@ -358,53 +539,29 @@ impl SlateDbRootStore {
         }
         ensure_no_wal_dependency(&manifest)?;
 
-        let checkpoint_name = format!("{ROOT_CHECKPOINT_PREFIX}{operation_id}");
-        let mut root_checkpoints = destination_admin
-            .list_checkpoints(Some(&checkpoint_name))
-            .await?;
-        root_checkpoints.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
-        let (root_checkpoint_id, root_manifest_id) =
-            if let Some(checkpoint) = root_checkpoints.into_iter().next() {
-                (checkpoint.id, checkpoint.manifest_id)
-            } else {
-                match destination_admin
-                    .create_detached_checkpoint(&CheckpointOptions {
-                        name: Some(checkpoint_name.clone()),
-                        ..CheckpointOptions::default()
-                    })
-                    .await
-                {
-                    Ok(created) => (created.id, created.manifest_id),
-                    Err(create_error) => {
-                        if let Some(result) = self.read_result(&destination_path).await? {
-                            if result.owner != owner {
-                                return Err(RootStoreError::OwnershipConflict(
-                                    destination_path.to_string(),
-                                ));
-                            }
-                            self.verify(&result.root).await?;
-                            return Ok(result.root);
-                        }
-                        let mut recovered = destination_admin
-                            .list_checkpoints(Some(&checkpoint_name))
-                            .await?;
-                        recovered.sort_by_key(|checkpoint| (checkpoint.manifest_id, checkpoint.id));
-                        if recovered.is_empty() {
-                            return Err(create_error.into());
-                        }
-                        let checkpoint = recovered.remove(0);
-                        (checkpoint.id, checkpoint.manifest_id)
-                    }
-                }
-            };
+        let created_checkpoint = created_checkpoint
+            .expect("successful or reconciled clone always returns its exact root checkpoint");
+        let root_manifest_id = created_checkpoint.manifest_id;
         let root = DurableRoot {
             identity: destination_path.to_string(),
             manifest_id: encode_root_checkpoint(root_checkpoint_id, root_manifest_id),
         };
-        self.verify_storage_root(&root, &checkpoint_name).await?;
+        if created_checkpoint.id != root_checkpoint_id
+            || created_checkpoint.manifest_id != root_manifest_id
+            || created_checkpoint.name.as_deref() != Some(checkpoint_name.as_str())
+            || created_checkpoint.expire_time.is_some()
+            || manifest.id() != root_manifest_id
+            || !manifest.initialized()
+        {
+            return Err(RootStoreError::NonCanonicalRoot(root.manifest_id));
+        }
+        self.verify_manifest_storage(destination_path.clone(), &manifest)
+            .await?;
         let canonical = self.publish_result(RootResult { owner, root }).await?;
-        self.cleanup_operation_checkpoints(&destination_path, operation_id, &canonical)
-            .await;
+        if owner_claim == OwnerClaim::Existing || clone_error.is_some() {
+            self.cleanup_operation_checkpoints(&destination_path, operation_id, &canonical)
+                .await;
+        }
         Ok(canonical)
     }
 
@@ -426,10 +583,14 @@ impl SlateDbRootStore {
         }
         self.verify(previous_root).await?;
         let destination = Path::from(previous_root.identity.clone());
+        let initial = self
+            .read_result(&destination)
+            .await?
+            .ok_or_else(|| RootStoreError::MissingResult(destination.to_string()))?;
         let owner = self
             .read_optional::<RootOwner>(&owner_object_path(&destination))
             .await?
-            .ok_or_else(|| RootStoreError::MissingOwner(destination.to_string()))?;
+            .unwrap_or(initial.owner);
         if owner.destination_id != branch_id || owner.destination_path != destination.to_string() {
             return Err(RootStoreError::OwnershipConflict(destination.to_string()));
         }
@@ -556,14 +717,14 @@ impl SlateDbRootStore {
     pub async fn verify(&self, root: &DurableRoot) -> Result<(), RootStoreError> {
         validate_root(root).map_err(|error| RootStoreError::Invalid(error.to_string()))?;
         let destination = Path::from(root.identity.clone());
-        let owner = self
-            .read_optional::<RootOwner>(&owner_object_path(&destination))
-            .await?
-            .ok_or_else(|| RootStoreError::MissingOwner(destination.to_string()))?;
         let initial = self
             .read_result(&destination)
             .await?
             .ok_or_else(|| RootStoreError::MissingResult(destination.to_string()))?;
+        let owner = self
+            .read_optional::<RootOwner>(&owner_object_path(&destination))
+            .await?
+            .unwrap_or_else(|| initial.owner.clone());
         if owner != initial.owner
             || owner.schema_version != ROOT_DESCRIPTOR_SCHEMA_VERSION
             || owner.destination_path != destination.to_string()
@@ -798,6 +959,14 @@ impl SlateDbRootStore {
         }
         ensure_no_wal_dependency(&manifest)?;
 
+        self.verify_manifest_storage(path, &manifest).await
+    }
+
+    async fn verify_manifest_storage(
+        &self,
+        path: Path,
+        manifest: &slatedb::VersionedManifest,
+    ) -> Result<(), RootStoreError> {
         for external in manifest.external_dbs() {
             let final_checkpoint_id =
                 external
@@ -812,9 +981,17 @@ impl SlateDbRootStore {
                 .await?
                 .into_iter()
                 .find(|checkpoint| checkpoint.id == final_checkpoint_id);
-            let Some(pin) = pin
-                .filter(|checkpoint| checkpoint.name.is_none() && checkpoint.expire_time.is_none())
-            else {
+            let source_path = Path::from(external.path.clone());
+            let Some(pin) = pin.filter(|checkpoint| {
+                checkpoint.expire_time.is_none()
+                    && match checkpoint.name.as_deref() {
+                        None => final_checkpoint_id != external.source_checkpoint_id,
+                        Some(_) => {
+                            final_checkpoint_id == external.source_checkpoint_id
+                                && valid_shared_source_checkpoint(&source_path, checkpoint)
+                        }
+                    }
+            }) else {
                 return Err(RootStoreError::MissingExternalPin {
                     source_path: external.path.clone(),
                     checkpoint_id: Some(final_checkpoint_id),
@@ -854,7 +1031,7 @@ impl SlateDbRootStore {
                 });
             }
         }
-        let resolver = PathResolver::new(path, &manifest);
+        let resolver = PathResolver::new(path, manifest);
         let mut root_sst_ids = BTreeSet::new();
         root_sst_ids.extend(manifest.l0().iter().map(|view| view.sst.id));
         root_sst_ids.extend(
@@ -902,16 +1079,104 @@ impl SlateDbRootStore {
         Ok(())
     }
 
-    async fn ensure_owner(
+    async fn ensure_shared_source_pin(
+        &self,
+        source: &ImmutableCheckpoint,
+    ) -> Result<(ImmutableCheckpoint, slatedb::Checkpoint), RootStoreError> {
+        let (checkpoint_id, checkpoint_name) = shared_source_checkpoint_identity(
+            &source.database_path,
+            source.checkpoint_id,
+            source.manifest_id,
+        );
+        let source_admin = self.admin(source.database_path.clone());
+        let checkpoint = self
+            .admin(source.database_path.clone())
+            .create_detached_checkpoint_with_id(
+                checkpoint_id,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: Some(source.checkpoint_id),
+                    name: Some(checkpoint_name.clone()),
+                },
+            )
+            .await?;
+        if checkpoint.id != checkpoint_id || checkpoint.manifest_id != source.manifest_id {
+            return Err(RootStoreError::SourceManifestMismatch {
+                checkpoint_id,
+                expected: source.manifest_id,
+                actual: checkpoint.manifest_id,
+            });
+        }
+        let physical = source_admin
+            .list_checkpoints(None)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == checkpoint_id)
+            .ok_or(RootStoreError::MissingSourceCheckpoint(checkpoint_id))?;
+        if physical.manifest_id != source.manifest_id
+            || physical.expire_time.is_some()
+            || physical.name.as_deref() != Some(checkpoint_name.as_str())
+        {
+            return Err(RootStoreError::Invalid(format!(
+                "shared source checkpoint {checkpoint_id} does not match its permanent descriptor"
+            )));
+        }
+        Ok((
+            ImmutableCheckpoint {
+                database_path: source.database_path.clone(),
+                checkpoint_id,
+                manifest_id: source.manifest_id,
+            },
+            physical,
+        ))
+    }
+
+    async fn authenticated_shared_source(
+        &self,
+        source: &ImmutableCheckpoint,
+    ) -> Result<AuthenticatedSharedSource, RootStoreError> {
+        let identity = (
+            source.database_path.to_string(),
+            source.checkpoint_id,
+            source.manifest_id,
+        );
+        let mut shared = self.shared_sources.lock().await;
+        if let Some(prepared) = shared.get(&identity) {
+            return Ok(prepared.clone());
+        }
+        let (checkpoint, manifest) = self.authenticate_source(source).await?;
+        if checkpoint.expire_time.is_some() {
+            return Err(RootStoreError::ExpiringSourceCheckpoint(
+                source.checkpoint_id,
+            ));
+        }
+        if !manifest.initialized() {
+            return Err(RootStoreError::Uninitialized(
+                source.database_path.to_string(),
+            ));
+        }
+        self.verify_manifest_storage(source.database_path.clone(), &manifest)
+            .await?;
+        let (checkpoint, physical_checkpoint) = self.ensure_shared_source_pin(source).await?;
+        let prepared = AuthenticatedSharedSource {
+            checkpoint,
+            physical_checkpoint,
+            manifest,
+        };
+        shared.insert(identity, prepared.clone());
+        Ok(prepared)
+    }
+
+    async fn inspect_owner(
         &self,
         owner: &RootOwner,
         destination_admin: &Admin,
-    ) -> Result<(), RootStoreError> {
+    ) -> Result<Option<OwnerClaim>, RootStoreError> {
         let destination = Path::from(owner.destination_path.clone());
         let path = owner_object_path(&destination);
         if let Some(existing) = self.read_optional::<RootOwner>(&path).await? {
             return if existing == *owner {
-                Ok(())
+                Ok(Some(OwnerClaim::Existing))
             } else {
                 Err(RootStoreError::OwnershipConflict(
                     owner.destination_path.clone(),
@@ -919,10 +1184,25 @@ impl SlateDbRootStore {
             };
         }
         if destination_admin.read_manifest(None).await?.is_some() {
+            if let Some(existing) = self.read_optional::<RootOwner>(&path).await? {
+                return if existing == *owner {
+                    Ok(Some(OwnerClaim::Existing))
+                } else {
+                    Err(RootStoreError::OwnershipConflict(
+                        owner.destination_path.clone(),
+                    ))
+                };
+            }
             return Err(RootStoreError::UnownedDestination(
                 owner.destination_path.clone(),
             ));
         }
+        Ok(None)
+    }
+
+    async fn create_owner(&self, owner: &RootOwner) -> Result<OwnerClaim, RootStoreError> {
+        let destination = Path::from(owner.destination_path.clone());
+        let path = owner_object_path(&destination);
         match self
             .object_store
             .put_opts(
@@ -932,14 +1212,14 @@ impl SlateDbRootStore {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(OwnerClaim::Created),
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let existing = self
                     .read_optional::<RootOwner>(&path)
                     .await?
                     .ok_or_else(|| RootStoreError::MissingOwner(owner.destination_path.clone()))?;
                 if existing == *owner {
-                    Ok(())
+                    Ok(OwnerClaim::Existing)
                 } else {
                     Err(RootStoreError::OwnershipConflict(
                         owner.destination_path.clone(),
@@ -948,12 +1228,33 @@ impl SlateDbRootStore {
             }
             Err(error) => {
                 if self.read_optional::<RootOwner>(&path).await? == Some(owner.clone()) {
-                    Ok(())
+                    Ok(OwnerClaim::Existing)
                 } else {
                     Err(error.into())
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn claim_owner(
+        &self,
+        owner: &RootOwner,
+        destination_admin: &Admin,
+    ) -> Result<OwnerClaim, RootStoreError> {
+        match self.inspect_owner(owner, destination_admin).await? {
+            Some(claim) => Ok(claim),
+            None => self.create_owner(owner).await,
+        }
+    }
+
+    #[cfg(test)]
+    async fn ensure_owner(
+        &self,
+        owner: &RootOwner,
+        destination_admin: &Admin,
+    ) -> Result<(), RootStoreError> {
+        self.claim_owner(owner, destination_admin).await.map(|_| ())
     }
 
     async fn verify_source(&self, source: &ImmutableCheckpoint) -> Result<(), RootStoreError> {
@@ -963,7 +1264,7 @@ impl SlateDbRootStore {
     async fn authenticate_source(
         &self,
         source: &ImmutableCheckpoint,
-    ) -> Result<slatedb::Checkpoint, RootStoreError> {
+    ) -> Result<(slatedb::Checkpoint, slatedb::VersionedManifest), RootStoreError> {
         let source_admin = self.admin(source.database_path.clone());
         let source_checkpoint = source_admin
             .list_checkpoints(None)
@@ -985,7 +1286,7 @@ impl SlateDbRootStore {
             .await?
             .ok_or_else(|| RootStoreError::MissingManifest(source.manifest_id.to_string()))?;
         ensure_no_wal_dependency(&source_manifest)?;
-        Ok(source_checkpoint)
+        Ok((source_checkpoint, source_manifest))
     }
 
     async fn read_result(&self, destination: &Path) -> Result<Option<RootResult>, RootStoreError> {
@@ -1219,6 +1520,65 @@ fn ensure_no_wal_dependency(manifest: &slatedb::VersionedManifest) -> Result<(),
         });
     }
     Ok(())
+}
+
+fn shared_source_checkpoint_identity(
+    path: &Path,
+    source_checkpoint_id: Uuid,
+    manifest_id: u64,
+) -> (Uuid, String) {
+    let mut hash = Sha256::new();
+    hash.update(b"zerofs-shared-source-checkpoint-v1\0");
+    hash.update(path.to_string().as_bytes());
+    hash.update(source_checkpoint_id.as_bytes());
+    hash.update(manifest_id.to_be_bytes());
+    let digest = hash.finalize();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    (
+        Uuid::from_bytes(id),
+        format!("{SHARED_SOURCE_CHECKPOINT_PREFIX}{source_checkpoint_id}_{manifest_id}"),
+    )
+}
+
+fn branch_root_checkpoint_identity(operation_id: Uuid, destination_id: Uuid) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"zerofs-branch-root-checkpoint-v1\0");
+    hash.update(operation_id.as_bytes());
+    hash.update(destination_id.as_bytes());
+    let digest = hash.finalize();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    // Use RFC 4122 variant/version bits so the derived physical identifier is
+    // visibly distinct from either catalog identity supplied by the caller.
+    id[6] = (id[6] & 0x0f) | 0x50;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(id)
+}
+
+fn valid_shared_source_checkpoint(path: &Path, checkpoint: &slatedb::Checkpoint) -> bool {
+    let Some(name) = checkpoint
+        .name
+        .as_deref()
+        .and_then(|name| name.strip_prefix(SHARED_SOURCE_CHECKPOINT_PREFIX))
+    else {
+        return false;
+    };
+    let Some((source_id, manifest_id)) = name.rsplit_once('_') else {
+        return false;
+    };
+    let Ok(source_id) = Uuid::parse_str(source_id) else {
+        return false;
+    };
+    let Ok(manifest_id) = manifest_id.parse::<u64>() else {
+        return false;
+    };
+    let (expected_id, expected_name) =
+        shared_source_checkpoint_identity(path, source_id, manifest_id);
+    checkpoint.id == expected_id
+        && checkpoint.manifest_id == manifest_id
+        && checkpoint.expire_time.is_none()
+        && checkpoint.name.as_deref() == Some(expected_name.as_str())
 }
 
 fn owner_object_path(destination: &Path) -> Path {
@@ -1477,6 +1837,375 @@ mod tests {
         );
         reader.close().await.unwrap();
         source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_clones_create_one_hidden_pin_and_survive_customer_pin_deletion() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("shared-pin-source");
+        let source = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source.put(b"key", b"value").await.unwrap();
+        source.flush().await.unwrap();
+        let checkpoint = source
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    name: Some("permanent-source".to_string()),
+                    ..CheckpointOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        let source_admin = AdminBuilder::new(source_path.clone(), Arc::clone(&store)).build();
+        let source_version = source_admin
+            .read_manifest(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        let exact = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let roots = SlateDbRootStore::new(Arc::clone(&store), Path::from("shared-pin-branches"));
+
+        let (left, right) = tokio::join!(
+            roots.create_from_checkpoint_shared(Uuid::new_v4(), Uuid::new_v4(), &exact),
+            roots.create_from_checkpoint_shared(Uuid::new_v4(), Uuid::new_v4(), &exact)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        let shared_version = source_admin
+            .read_manifest(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+
+        assert_eq!(
+            source_admin
+                .read_manifest(None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            shared_version,
+            "all clones of one immutable source must reuse one hidden physical pin"
+        );
+        assert_eq!(shared_version, source_version + 1);
+        for root in [&left, &right] {
+            assert!(matches!(
+                store
+                    .get(&owner_object_path(&Path::from(root.identity.clone())))
+                    .await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
+        source_admin.delete_checkpoint(checkpoint.id).await.unwrap();
+        roots.verify(&left).await.unwrap();
+        roots.verify(&right).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_pin_recovery_rejects_a_conflicting_stable_descriptor() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("shared-pin-conflict-source");
+        let source = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source.put(b"key", b"value").await.unwrap();
+        source.flush().await.unwrap();
+        let checkpoint = source
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        let exact = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let (stable_id, _) =
+            shared_source_checkpoint_identity(&source_path, checkpoint.id, checkpoint.manifest_id);
+        AdminBuilder::new(source_path, Arc::clone(&store))
+            .build()
+            .create_detached_checkpoint_with_id(
+                stable_id,
+                &CheckpointOptions {
+                    lifetime: None,
+                    source: Some(checkpoint.id),
+                    name: Some("wrong-hidden-name".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let roots = SlateDbRootStore::new(store, Path::from("shared-pin-conflict-branches"));
+        assert!(
+            roots
+                .create_from_checkpoint_shared(Uuid::new_v4(), Uuid::new_v4(), &exact)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_rejects_initialized_destination_from_another_checkpoint() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("shared-wrong-source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"first").await.unwrap();
+        let first = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.put(b"key", b"second").await.unwrap();
+        let second = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        assert_ne!(first.manifest_id, second.manifest_id);
+
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("shared-wrong-source-branches"),
+        );
+        let requested = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: first.id,
+            manifest_id: first.manifest_id,
+        };
+        let other = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: second.id,
+            manifest_id: second.manifest_id,
+        };
+        let prepared_other = roots.authenticated_shared_source(&other).await.unwrap();
+        let destination_id = Uuid::new_v4();
+        let destination = roots
+            .branch_database_root
+            .clone()
+            .join(destination_id.to_string());
+        roots
+            .admin(destination.clone())
+            .create_clone_builder_from_source(
+                CloneSourceSpec::with_checkpoint(
+                    prepared_other.checkpoint.database_path.clone(),
+                    prepared_other.checkpoint.checkpoint_id,
+                )
+                .with_preloaded_manifest(
+                    prepared_other.physical_checkpoint,
+                    prepared_other.manifest,
+                ),
+            )
+            .with_shared_source_pins()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            roots
+                .create_from_checkpoint_shared(Uuid::new_v4(), destination_id, &requested)
+                .await
+                .is_err(),
+            "an initialized clone from another checkpoint of the same DB must not be adopted"
+        );
+        assert!(matches!(
+            store.get(&result_object_path(&destination)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn private_recovery_rejects_initialized_destination_from_another_checkpoint() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("private-wrong-source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"first").await.unwrap();
+        let first = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.put(b"key", b"second").await.unwrap();
+        let second = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let requested = ImmutableCheckpoint {
+            database_path: source_path.clone(),
+            checkpoint_id: first.id,
+            manifest_id: first.manifest_id,
+        };
+        let operation_id = Uuid::new_v4();
+        let destination_id = Uuid::new_v4();
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("private-wrong-source-branches"),
+        );
+        let destination = roots
+            .branch_database_root
+            .clone()
+            .join(destination_id.to_string());
+        let destination_admin = roots.admin(destination.clone());
+        roots
+            .ensure_owner(
+                &RootOwner {
+                    schema_version: ROOT_DESCRIPTOR_SCHEMA_VERSION,
+                    operation_id,
+                    destination_id,
+                    destination_path: destination.to_string(),
+                    source_path: source_path.to_string(),
+                    source_checkpoint_id: first.id,
+                    source_manifest_id: first.manifest_id,
+                },
+                &destination_admin,
+            )
+            .await
+            .unwrap();
+        destination_admin
+            .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
+                source_path,
+                second.id,
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            roots
+                .create_from_checkpoint(operation_id, destination_id, &requested)
+                .await
+                .is_err(),
+            "private recovery must retain the owner's exact requested checkpoint"
+        );
+        assert!(matches!(
+            store.get(&result_object_path(&destination)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_installs_the_exact_root_after_initialized_clone() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("shared-stable-root-source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"value").await.unwrap();
+        let checkpoint = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let source = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: checkpoint.id,
+            manifest_id: checkpoint.manifest_id,
+        };
+        let roots = SlateDbRootStore::new(
+            Arc::clone(&store),
+            Path::from("shared-stable-root-branches"),
+        );
+        let prepared = roots.authenticated_shared_source(&source).await.unwrap();
+        let operation_id = Uuid::new_v4();
+        let destination_id = Uuid::new_v4();
+        let destination = roots
+            .branch_database_root
+            .clone()
+            .join(destination_id.to_string());
+        let destination_admin = roots.admin(destination.clone());
+        destination_admin
+            .create_clone_builder_from_source(
+                CloneSourceSpec::with_checkpoint(
+                    prepared.checkpoint.database_path.clone(),
+                    prepared.checkpoint.checkpoint_id,
+                )
+                .with_preloaded_manifest(prepared.physical_checkpoint, prepared.manifest),
+            )
+            .with_shared_source_pins()
+            .build()
+            .await
+            .unwrap();
+
+        let root = roots
+            .create_from_checkpoint_shared(operation_id, destination_id, &source)
+            .await
+            .unwrap();
+        let (root_checkpoint_id, _) = decode_root_checkpoint(&root.manifest_id).unwrap();
+        assert_eq!(
+            root_checkpoint_id,
+            branch_root_checkpoint_identity(operation_id, destination_id)
+        );
+        let checkpoint_name = format!("{ROOT_CHECKPOINT_PREFIX}{operation_id}");
+        let matching = destination_admin
+            .list_checkpoints(Some(&checkpoint_name))
+            .await
+            .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, root_checkpoint_id);
+        assert_eq!(
+            roots
+                .create_from_checkpoint_shared(operation_id, destination_id, &source)
+                .await
+                .unwrap(),
+            root
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_rejects_borrowed_customer_named_checkpoint() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source_path = Path::from("borrowed-customer-source");
+        let source = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source.put(b"key", b"value").await.unwrap();
+        source.flush().await.unwrap();
+        let checkpoint = source
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    name: Some("customer-visible".to_string()),
+                    ..CheckpointOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        let destination = Path::from("borrowed-customer-destination");
+        let destination_admin = AdminBuilder::new(destination.clone(), Arc::clone(&store)).build();
+        destination_admin
+            .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
+                source_path,
+                checkpoint.id,
+            ))
+            .with_shared_source_pins()
+            .build()
+            .await
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let root_checkpoint = destination_admin
+            .create_detached_checkpoint(&CheckpointOptions {
+                name: Some(format!("{ROOT_CHECKPOINT_PREFIX}{operation_id}")),
+                ..CheckpointOptions::default()
+            })
+            .await
+            .unwrap();
+        let roots = SlateDbRootStore::new(store, Path::from("unused"));
+        let root = DurableRoot {
+            identity: destination.to_string(),
+            manifest_id: encode_root_checkpoint(root_checkpoint.id, root_checkpoint.manifest_id),
+        };
+        assert!(roots.verify(&root).await.is_err());
     }
 
     #[tokio::test]

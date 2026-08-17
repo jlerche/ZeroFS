@@ -5,7 +5,7 @@ use super::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row, Transaction, config::SslMode};
@@ -13,12 +13,20 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../../migrations/0001_catalog_projection.sql");
+const PROJECTION_BATCH_ROWS: usize = 512;
+
+fn delta_base_matches(previous: Option<&CatalogSnapshot>, observed_generation: i64) -> bool {
+    previous.is_some_and(|snapshot| {
+        i64::try_from(snapshot.generation).ok() == Some(observed_generation)
+    })
+}
 
 /// PostgreSQL customer-facing projection of the authoritative SlateDB catalog.
 /// This schema deliberately has no durable-root or manifest columns.
 pub struct PostgresCatalogProjection {
     read_client: Option<Client>,
     write_client: Arc<Mutex<Client>>,
+    committed_snapshots: Arc<Mutex<BTreeMap<Uuid, Arc<CatalogSnapshot>>>>,
 }
 
 impl std::fmt::Debug for PostgresCatalogProjection {
@@ -86,6 +94,7 @@ impl PostgresCatalogProjection {
         Self {
             read_client: None,
             write_client: Arc::new(Mutex::new(client)),
+            committed_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -93,6 +102,7 @@ impl PostgresCatalogProjection {
         Self {
             read_client: Some(read_client),
             write_client: Arc::new(Mutex::new(write_client)),
+            committed_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -114,6 +124,12 @@ impl CatalogProjection for PostgresCatalogProjection {
         let generation = i64::try_from(snapshot.generation)
             .map_err(|_| CatalogError::Invalid("projection generation exceeds BIGINT".into()))?;
         let mut client = self.write_client.lock().await;
+        let previous = self
+            .committed_snapshots
+            .lock()
+            .await
+            .get(&volume_id)
+            .cloned();
         let transaction = client.transaction().await?;
         transaction
             .execute(
@@ -137,88 +153,61 @@ impl CatalogProjection for PostgresCatalogProjection {
                 "unsupported PostgreSQL projection schema {schema_version}"
             )));
         }
+        let full_reconcile = !delta_base_matches(previous.as_deref(), observed);
         if generation <= observed {
             transaction.commit().await?;
+            if generation == observed {
+                let mut committed = self.committed_snapshots.lock().await;
+                if committed
+                    .get(&volume_id)
+                    .is_none_or(|prior| prior.generation <= snapshot.generation)
+                {
+                    committed.insert(volume_id, Arc::new(snapshot.clone()));
+                }
+            }
             return Ok(());
         }
 
-        let mut present = BTreeSet::new();
-        for branch in snapshot.branches.values() {
-            present.insert(branch.id);
-            upsert_resource(
-                &transaction,
-                volume_id,
-                branch.id,
-                CustomerResourceKind::Branch,
-                &branch.name,
-                branch.state.as_str(),
-                branch.parent_id,
-                branch.origin_checkpoint_id,
-                generation,
-                branch.created_at,
-                branch.updated_at,
-                None,
-                false,
-            )
-            .await?;
+        let mut batch = Vec::with_capacity(PROJECTION_BATCH_ROWS);
+        for record in projection_records(snapshot, previous.as_deref(), full_reconcile) {
+            batch.push(record);
+            if batch.len() == PROJECTION_BATCH_ROWS {
+                upsert_resource_batch(&transaction, volume_id, generation, &batch).await?;
+                batch.clear();
+            }
         }
-        for checkpoint in snapshot.checkpoints.values() {
-            present.insert(checkpoint.id);
-            upsert_resource(
-                &transaction,
-                volume_id,
-                checkpoint.id,
-                CustomerResourceKind::Checkpoint,
-                &checkpoint.name,
-                "ready",
-                Some(checkpoint.branch_id),
-                None,
-                generation,
-                checkpoint.created_at,
-                checkpoint.updated_at,
-                None,
-                false,
-            )
-            .await?;
+        if !batch.is_empty() {
+            upsert_resource_batch(&transaction, volume_id, generation, &batch).await?;
         }
-        for tombstone in snapshot.tombstones.values() {
-            present.insert(tombstone.id);
-            let kind = match tombstone.kind {
-                TombstoneKind::Branch => CustomerResourceKind::Branch,
-                TombstoneKind::Checkpoint => CustomerResourceKind::Checkpoint,
-            };
-            upsert_resource(
-                &transaction,
-                volume_id,
-                tombstone.id,
-                kind,
-                &tombstone.name,
-                "deleted",
-                tombstone.parent_id,
-                tombstone.origin_checkpoint_id,
-                generation,
-                tombstone.created_at,
-                tombstone.deleted_at,
-                Some(tombstone.deleted_at),
-                false,
-            )
-            .await?;
-        }
-        let rows = transaction
-            .query(
-                "SELECT resource_id FROM zerofs_catalog_projection_resources WHERE volume_id = $1",
-                &[&volume_id],
-            )
-            .await?;
-        for row in rows {
-            let resource_id: Uuid = row.get(0);
-            if !present.contains(&resource_id) {
+        if full_reconcile {
+            transaction
+                .execute(
+                    "UPDATE zerofs_catalog_projection_resources \
+                     SET state = 'absent', observed_generation = $2 \
+                     WHERE volume_id = $1 AND observed_generation <> $2",
+                    &[&volume_id, &generation],
+                )
+                .await?;
+        } else if let Some(previous) = &previous {
+            let removed = previous
+                .branches
+                .keys()
+                .chain(previous.checkpoints.keys())
+                .chain(previous.tombstones.keys())
+                .filter(|id| {
+                    !snapshot.branches.contains_key(id)
+                        && !snapshot.checkpoints.contains_key(id)
+                        && !snapshot.tombstones.contains_key(id)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            for removed in removed.chunks(PROJECTION_BATCH_ROWS) {
                 transaction
                     .execute(
                         "UPDATE zerofs_catalog_projection_resources \
                          SET state = 'absent', observed_generation = $3 \
-                         WHERE volume_id = $1 AND resource_id = $2",
-                        &[&volume_id, &resource_id, &generation],
+                         WHERE volume_id = $1 AND resource_id = ANY($2::uuid[])",
+                        &[&volume_id, &removed, &generation],
                     )
                     .await?;
             }
@@ -231,6 +220,13 @@ impl CatalogProjection for PostgresCatalogProjection {
             )
             .await?;
         transaction.commit().await?;
+        let mut committed = self.committed_snapshots.lock().await;
+        if committed
+            .get(&volume_id)
+            .is_none_or(|prior| prior.generation <= snapshot.generation)
+        {
+            committed.insert(volume_id, Arc::new(snapshot.clone()));
+        }
         Ok(())
     }
 
@@ -347,49 +343,98 @@ impl CatalogProjection for PostgresCatalogProjection {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn upsert_resource(
+fn projection_records<'a>(
+    snapshot: &'a CatalogSnapshot,
+    previous: Option<&'a CatalogSnapshot>,
+    full_reconcile: bool,
+) -> impl Iterator<Item = Value> + 'a {
+    let branches = snapshot.branches.values().filter_map(move |branch| {
+        if !full_reconcile
+            && previous.is_some_and(|prior| prior.branches.get(&branch.id) == Some(branch))
+        {
+            return None;
+        }
+        Some(serde_json::json!({
+            "resource_id": branch.id,
+            "kind": CustomerResourceKind::Branch.as_str(),
+            "name": branch.name,
+            "state": branch.state.as_str(),
+            "parent_id": branch.parent_id,
+            "origin_checkpoint_id": branch.origin_checkpoint_id,
+            "created_at": branch.created_at,
+            "updated_at": branch.updated_at,
+            "deleted_at": null,
+        }))
+    });
+    let checkpoints = snapshot.checkpoints.values().filter_map(move |checkpoint| {
+        if !full_reconcile
+            && previous
+                .is_some_and(|prior| prior.checkpoints.get(&checkpoint.id) == Some(checkpoint))
+        {
+            return None;
+        }
+        Some(serde_json::json!({
+            "resource_id": checkpoint.id,
+            "kind": CustomerResourceKind::Checkpoint.as_str(),
+            "name": checkpoint.name,
+            "state": "ready",
+            "parent_id": checkpoint.branch_id,
+            "origin_checkpoint_id": null,
+            "created_at": checkpoint.created_at,
+            "updated_at": checkpoint.updated_at,
+            "deleted_at": null,
+        }))
+    });
+    let tombstones = snapshot.tombstones.values().filter_map(move |tombstone| {
+        if !full_reconcile
+            && previous.is_some_and(|prior| prior.tombstones.get(&tombstone.id) == Some(tombstone))
+        {
+            return None;
+        }
+        let kind = match tombstone.kind {
+            TombstoneKind::Branch => CustomerResourceKind::Branch,
+            TombstoneKind::Checkpoint => CustomerResourceKind::Checkpoint,
+        };
+        Some(serde_json::json!({
+            "resource_id": tombstone.id,
+            "kind": kind.as_str(),
+            "name": tombstone.name,
+            "state": "deleted",
+            "parent_id": tombstone.parent_id,
+            "origin_checkpoint_id": tombstone.origin_checkpoint_id,
+            "created_at": tombstone.created_at,
+            "updated_at": tombstone.deleted_at,
+            "deleted_at": tombstone.deleted_at,
+        }))
+    });
+    branches.chain(checkpoints).chain(tombstones)
+}
+
+async fn upsert_resource_batch(
     transaction: &Transaction<'_>,
     volume_id: Uuid,
-    resource_id: Uuid,
-    kind: CustomerResourceKind,
-    name: &str,
-    state: &str,
-    parent_id: Option<Uuid>,
-    origin_checkpoint_id: Option<Uuid>,
     generation: i64,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
-    preserve_lineage: bool,
+    records: &[Value],
 ) -> Result<(), CatalogError> {
+    debug_assert!(!records.is_empty() && records.len() <= PROJECTION_BATCH_ROWS);
     transaction
         .execute(
             "INSERT INTO zerofs_catalog_projection_resources \
              (volume_id, resource_id, kind, name, state, parent_id, origin_checkpoint_id, \
               observed_generation, created_at, updated_at, deleted_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             SELECT $1, row.resource_id, row.kind, row.name, row.state, row.parent_id, \
+                    row.origin_checkpoint_id, $3, row.created_at, row.updated_at, row.deleted_at \
+             FROM jsonb_to_recordset($2::jsonb) AS row( \
+                 resource_id uuid, kind text, name text, state text, parent_id uuid, \
+                 origin_checkpoint_id uuid, created_at timestamptz, updated_at timestamptz, \
+                 deleted_at timestamptz) \
              ON CONFLICT (volume_id, resource_id) DO UPDATE SET \
              kind=EXCLUDED.kind, name=EXCLUDED.name, state=EXCLUDED.state, \
-             parent_id=CASE WHEN $12 THEN COALESCE(EXCLUDED.parent_id, zerofs_catalog_projection_resources.parent_id) ELSE EXCLUDED.parent_id END, \
-             origin_checkpoint_id=CASE WHEN $12 THEN COALESCE(EXCLUDED.origin_checkpoint_id, zerofs_catalog_projection_resources.origin_checkpoint_id) ELSE EXCLUDED.origin_checkpoint_id END, \
+             parent_id=EXCLUDED.parent_id, origin_checkpoint_id=EXCLUDED.origin_checkpoint_id, \
              observed_generation=EXCLUDED.observed_generation, \
              created_at=LEAST(zerofs_catalog_projection_resources.created_at, EXCLUDED.created_at), \
              updated_at=EXCLUDED.updated_at, deleted_at=EXCLUDED.deleted_at",
-            &[
-                &volume_id,
-                &resource_id,
-                &kind.as_str(),
-                &name,
-                &state,
-                &parent_id,
-                &origin_checkpoint_id,
-                &generation,
-                &created_at,
-                &updated_at,
-                &deleted_at,
-                &preserve_lineage,
-            ],
+            &[&volume_id, &Value::Array(records.to_vec()), &generation],
         )
         .await?;
     Ok(())
@@ -440,4 +485,63 @@ fn validate_volume_id(volume_id: Uuid) -> Result<(), CatalogError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_process_cache_forces_full_reconciliation() {
+        let cached = CatalogSnapshot {
+            generation: 7,
+            ..CatalogSnapshot::default()
+        };
+
+        assert!(delta_base_matches(Some(&cached), 7));
+        assert!(!delta_base_matches(Some(&cached), 8));
+        assert!(!delta_base_matches(None, 8));
+        assert!(!delta_base_matches(Some(&cached), -1));
+    }
+
+    #[test]
+    fn large_projection_is_partitioned_into_bounded_batches() {
+        use crate::catalog::{BranchRecord, BranchState, DurableRoot};
+
+        let mut snapshot = CatalogSnapshot {
+            generation: 1,
+            ..CatalogSnapshot::default()
+        };
+        let now = chrono::Utc::now();
+        for index in 0..(PROJECTION_BATCH_ROWS * 2 + 1) {
+            let id = Uuid::from_u128(index as u128 + 1);
+            snapshot.branches.insert(
+                id,
+                BranchRecord {
+                    id,
+                    revision: 1,
+                    name: format!("branch-{index}"),
+                    state: BranchState::Ready,
+                    root: Some(DurableRoot {
+                        identity: format!("root-{index}"),
+                        manifest_id: "checkpoint@1".to_string(),
+                    }),
+                    parent_id: None,
+                    origin_checkpoint_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+
+        let records = projection_records(&snapshot, None, true).collect::<Vec<_>>();
+        let batches = records.chunks(PROJECTION_BATCH_ROWS).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 3);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| !batch.is_empty() && batch.len() <= PROJECTION_BATCH_ROWS)
+        );
+        assert_eq!(batches.last().unwrap().len(), 1);
+    }
 }

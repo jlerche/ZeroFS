@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +226,108 @@ pub struct BranchLifecycle {
     catalog: Arc<dyn Catalog>,
     roots: SlateDbRootStore,
     features: BranchFeatureConfig,
+    create_operations: Arc<Vec<Arc<Mutex<()>>>>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectionReconcileState {
+    running: bool,
+    attempt: u64,
+    failed_attempt: u64,
+    requested_generation: u64,
+    completed_generation: u64,
+    failure: Option<String>,
+}
+
+/// Coalesce concurrent best-effort projection updates onto the newest
+/// authoritative snapshot while preserving synchronous success semantics for
+/// every caller.
+#[derive(Clone)]
+pub struct CatalogProjectionReconciler {
+    catalog: Arc<dyn Catalog>,
+    volume_id: Uuid,
+    projection: Arc<dyn super::CatalogProjection>,
+    state: Arc<Mutex<ProjectionReconcileState>>,
+    changed: Arc<Notify>,
+}
+
+impl std::fmt::Debug for CatalogProjectionReconciler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CatalogProjectionReconciler")
+            .field("volume_id", &self.volume_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogProjectionReconciler {
+    async fn drive(self) {
+        loop {
+            let snapshot = match self.catalog.projection_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.fail(error.to_string()).await;
+                    return;
+                }
+            };
+            if let Err(error) = self.projection.reconcile(self.volume_id, &snapshot).await {
+                self.fail(error.to_string()).await;
+                return;
+            }
+            let mut state = self.state.lock().await;
+            state.completed_generation = state.completed_generation.max(snapshot.generation);
+            state.failure = None;
+            if state.completed_generation >= state.requested_generation {
+                state.running = false;
+                self.changed.notify_waiters();
+                return;
+            }
+            drop(state);
+        }
+    }
+
+    async fn fail(&self, error: String) {
+        let mut state = self.state.lock().await;
+        state.failed_attempt = state.attempt;
+        state.failure = Some(error);
+        state.running = false;
+        self.changed.notify_waiters();
+    }
+
+    pub async fn reconcile(&self) -> Result<(), BranchLifecycleError> {
+        let target_generation = self.catalog.projection_generation().await?;
+        let mut observed_attempt = None;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut state = self.state.lock().await;
+            state.requested_generation = state.requested_generation.max(target_generation);
+            if state.completed_generation >= target_generation {
+                return Ok(());
+            }
+            if !state.running {
+                if observed_attempt == Some(state.failed_attempt)
+                    && let Some(error) = &state.failure
+                {
+                    return Err(CatalogError::Invalid(format!(
+                        "projection reconciliation failed: {error}"
+                    ))
+                    .into());
+                }
+                state.attempt = state.attempt.wrapping_add(1).max(1);
+                observed_attempt = Some(state.attempt);
+                state.running = true;
+                let runner = self.clone();
+                drop(state);
+                tokio::spawn(async move { runner.drive().await });
+            } else {
+                observed_attempt = Some(state.attempt);
+                drop(state);
+            }
+            notified.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for BranchLifecycle {
@@ -259,7 +362,15 @@ impl BranchLifecycle {
             catalog,
             roots,
             features,
+            create_operations: Arc::new((0..4096).map(|_| Arc::new(Mutex::new(()))).collect()),
         }
+    }
+
+    async fn lock_create_operation(&self, operation_id: Uuid) -> OwnedMutexGuard<()> {
+        let value = operation_id.as_u128();
+        let stripe = ((value >> 64) as u64 ^ value as u64) as usize % self.create_operations.len();
+        let operation = Arc::clone(&self.create_operations[stripe]);
+        operation.lock_owned().await
     }
 
     pub fn leases(&self) -> super::LeaseLifecycle {
@@ -268,6 +379,20 @@ impl BranchLifecycle {
             self.roots.clone(),
             self.features.mount,
         )
+    }
+
+    pub fn projection_reconciler(
+        &self,
+        volume_id: Uuid,
+        projection: Arc<dyn super::CatalogProjection>,
+    ) -> CatalogProjectionReconciler {
+        CatalogProjectionReconciler {
+            catalog: Arc::clone(&self.catalog),
+            volume_id,
+            projection,
+            state: Arc::new(Mutex::new(ProjectionReconcileState::default())),
+            changed: Arc::new(Notify::new()),
+        }
     }
 
     /// Rebuild one customer projection from a lock-consistent authoritative
@@ -664,6 +789,7 @@ impl BranchLifecycle {
         &self,
         request: BranchCreateFromCheckpointNameRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        let _operation = self.lock_create_operation(request.operation_id).await;
         self.require_create_enabled()?;
         let existing = self
             .catalog
@@ -745,6 +871,7 @@ impl BranchLifecycle {
         source_branch_id: Uuid,
         source_checkpoint_name: String,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        let _operation = self.lock_create_operation(operation_id).await;
         self.require_create_enabled()?;
         let existing = self.catalog.branch_create_operation(operation_id).await?;
         let created_at = existing.as_ref().map_or_else(
@@ -835,6 +962,7 @@ impl BranchLifecycle {
         &self,
         request: BranchCreateRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        let _operation = self.lock_create_operation(request.operation_id).await;
         self.require_create_enabled()?;
         let existing = self
             .catalog
@@ -919,6 +1047,7 @@ impl BranchLifecycle {
         &self,
         request: InitialBranchCreateRequest,
     ) -> Result<BranchRecord, BranchLifecycleError> {
+        let _operation = self.lock_create_operation(request.operation_id).await;
         self.require_create_enabled()?;
         let existing = self
             .catalog
@@ -984,6 +1113,7 @@ impl BranchLifecycle {
         destination_id: Uuid,
         destination_name: &str,
     ) -> Result<Option<BranchRecord>, BranchLifecycleError> {
+        let _operation = self.lock_create_operation(operation_id).await;
         self.require_create_enabled()?;
         let Some(operation) = self.catalog.branch_create_operation(operation_id).await? else {
             return Ok(None);
@@ -1012,9 +1142,23 @@ impl BranchLifecycle {
         }
         let destination_root = match operation.phase {
             BranchCreatePhase::Reserved => {
-                self.roots
-                    .create_from_checkpoint(operation.id, operation.destination_id, source)
+                if self
+                    .catalog
+                    .branch_create_uses_shared_source(operation.id)
                     .await?
+                {
+                    self.roots
+                        .create_from_checkpoint_shared(
+                            operation.id,
+                            operation.destination_id,
+                            source,
+                        )
+                        .await?
+                } else {
+                    self.roots
+                        .create_from_checkpoint(operation.id, operation.destination_id, source)
+                        .await?
+                }
             }
             BranchCreatePhase::RootCreated => {
                 operation.destination_root.clone().ok_or_else(|| {
@@ -1025,7 +1169,13 @@ impl BranchLifecycle {
             }
             BranchCreatePhase::Published => unreachable!("handled above"),
         };
-        self.roots.verify(&destination_root).await?;
+        // A newly cloned root is authenticated by `create_from_checkpoint`
+        // before that method publishes and returns its operation-owned result.
+        // Persisted legacy RootCreated operations did not carry that return-path
+        // proof, so authenticate those immediately before publication.
+        if operation.phase == BranchCreatePhase::RootCreated {
+            self.roots.verify(&destination_root).await?;
+        }
         let updated_at = transition_time(created_at);
         match operation.phase {
             BranchCreatePhase::Reserved => {
@@ -1308,7 +1458,8 @@ mod tests {
     use super::*;
     use crate::catalog::{
         BranchDeleteRequest, BranchDeleteResult, CatalogMutation, CheckpointDeleteRequest,
-        CheckpointRecord, DeletionLifecycleError, DurableRoot, JsonCatalogProjection,
+        CheckpointRecord, CustomerCatalogListRequest, CustomerCatalogPage, CustomerCatalogRecord,
+        CustomerMetadata, DeletionLifecycleError, DurableRoot, JsonCatalogProjection,
         LeaseAccessMode, LeaseAcquireRequest, SlateDbCatalog, catalog_timestamp,
     };
     use crate::fs::key_codec::KeyCodec;
@@ -1318,6 +1469,153 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DelayedProjection {
+        inner: JsonCatalogProjection,
+        reconciles: AtomicUsize,
+        failures_remaining: AtomicUsize,
+        started: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::CatalogProjection for DelayedProjection {
+        async fn reconcile(
+            &self,
+            volume_id: Uuid,
+            snapshot: &CatalogSnapshot,
+        ) -> Result<(), CatalogError> {
+            self.reconciles.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(CatalogError::Invalid(
+                    "injected projection failure".to_string(),
+                ));
+            }
+            self.inner.reconcile(volume_id, snapshot).await
+        }
+
+        async fn record(
+            &self,
+            volume_id: Uuid,
+            resource_id: Uuid,
+        ) -> Result<Option<CustomerCatalogRecord>, CatalogError> {
+            self.inner.record(volume_id, resource_id).await
+        }
+
+        async fn list(
+            &self,
+            volume_id: Uuid,
+            request: CustomerCatalogListRequest,
+        ) -> Result<CustomerCatalogPage, CatalogError> {
+            self.inner.list(volume_id, request).await
+        }
+
+        async fn set_customer_metadata(
+            &self,
+            volume_id: Uuid,
+            resource_id: Uuid,
+            metadata: CustomerMetadata,
+        ) -> Result<(), CatalogError> {
+            self.inner
+                .set_customer_metadata(volume_id, resource_id, metadata)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_reconciliation_coalesces_and_survives_caller_cancellation() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = Arc::new(
+            SlateDbCatalog::open(
+                Path::from("coalesced-projection/catalog"),
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap(),
+        );
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: Uuid::new_v4(),
+                revision: 1,
+                name: "main".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "coalesced-projection/root".to_string(),
+                    manifest_id: "checkpoint@1".to_string(),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: catalog_timestamp(Utc::now()),
+                updated_at: catalog_timestamp(Utc::now()),
+            }))
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let projection = Arc::new(DelayedProjection {
+            inner: JsonCatalogProjection::new(directory.path().join("projection.json")),
+            reconciles: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
+            started: Notify::new(),
+        });
+        let lifecycle = BranchLifecycle::new(
+            catalog.clone(),
+            SlateDbRootStore::new(store, Path::from("coalesced-projection/roots")),
+        );
+        let projection_api: Arc<dyn super::super::CatalogProjection> = projection.clone();
+        let reconciler = lifecycle.projection_reconciler(Uuid::new_v4(), projection_api);
+        let snapshots_before = catalog.projection_snapshot_count();
+
+        let started = projection.started.notified();
+        let cancelled = tokio::spawn({
+            let reconciler = reconciler.clone();
+            async move { reconciler.reconcile().await }
+        });
+        started.await;
+        cancelled.abort();
+        let results = futures::future::join_all((0..32).map(|_| {
+            let reconciler = reconciler.clone();
+            async move { reconciler.reconcile().await }
+        }))
+        .await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(projection.reconciles.load(Ordering::SeqCst), 1);
+        assert_eq!(catalog.projection_snapshot_count() - snapshots_before, 1);
+
+        let now = catalog_timestamp(Utc::now());
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: Uuid::new_v4(),
+                revision: 1,
+                name: "second".to_string(),
+                state: BranchState::Ready,
+                root: Some(DurableRoot {
+                    identity: "coalesced-projection/second".to_string(),
+                    manifest_id: "checkpoint@2".to_string(),
+                }),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        projection.failures_remaining.store(1, Ordering::SeqCst);
+        assert!(reconciler.reconcile().await.is_err());
+        reconciler
+            .reconcile()
+            .await
+            .expect("an unchanged generation must retry a transient projection failure");
+        assert_eq!(projection.reconciles.load(Ordering::SeqCst), 3);
+        catalog.close().await.unwrap();
+    }
 
     async fn reserve_genesis(
         catalog: &SlateDbCatalog,
@@ -1470,6 +1768,11 @@ mod tests {
         clone.close().await.unwrap();
         catalog.snapshot().await.unwrap().validate().unwrap();
         catalog.close().await.unwrap();
+        let reopened = SlateDbCatalog::open(Path::from("genesis/catalog"), store)
+            .await
+            .unwrap();
+        reopened.snapshot().await.unwrap().validate().unwrap();
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2045,6 +2348,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v21_reserved_operation_recovers_published_private_root_without_shared_marker() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog_path = Path::from("v21-private-reserved/catalog");
+        let catalog = Arc::new(
+            SlateDbCatalog::open(catalog_path.clone(), Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        let source_path = Path::from("v21-private-reserved/source");
+        let source_db = Db::open(source_path.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        source_db.put(b"key", b"value").await.unwrap();
+        let physical = source_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        source_db.close().await.unwrap();
+        let source = ImmutableCheckpoint {
+            database_path: source_path,
+            checkpoint_id: physical.id,
+            manifest_id: physical.manifest_id,
+        };
+        let now = catalog_timestamp(Utc::now());
+        let parent_id = Uuid::new_v4();
+        catalog
+            .apply(CatalogMutation::CreateBranch(BranchRecord {
+                id: parent_id,
+                revision: 1,
+                name: "parent".to_string(),
+                state: BranchState::Ready,
+                root: Some(source.durable_root()),
+                parent_id: None,
+                origin_checkpoint_id: None,
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+        catalog
+            .apply(CatalogMutation::CreateCheckpoint(CheckpointRecord {
+                id: source.checkpoint_id,
+                revision: 1,
+                branch_id: parent_id,
+                name: "source".to_string(),
+                root: source.durable_root(),
+                created_at: now,
+                updated_at: now,
+            }))
+            .await
+            .unwrap();
+
+        let operation_id = Uuid::new_v4();
+        let destination_id = Uuid::new_v4();
+        let destination_name = "legacy-child".to_string();
+        catalog
+            .apply(CatalogMutation::ReserveBranchCreate {
+                branch: BranchRecord {
+                    id: destination_id,
+                    revision: 1,
+                    name: destination_name.clone(),
+                    state: BranchState::Creating,
+                    root: None,
+                    parent_id: Some(parent_id),
+                    origin_checkpoint_id: Some(source.checkpoint_id),
+                    created_at: now,
+                    updated_at: now,
+                },
+                operation: Box::new(BranchCreateOperation {
+                    id: operation_id,
+                    revision: 1,
+                    destination_id,
+                    destination_name: destination_name.clone(),
+                    source_checkpoint_id: source.checkpoint_id,
+                    source_root: source.durable_root(),
+                    parent_id: Some(parent_id),
+                    phase: BranchCreatePhase::Reserved,
+                    destination_root: None,
+                    created_at: now,
+                    updated_at: now,
+                }),
+            })
+            .await
+            .unwrap();
+        let branch_root = Path::from("v21-private-reserved/branches");
+        let roots = SlateDbRootStore::new(Arc::clone(&store), branch_root.clone());
+        let private_root = roots
+            .create_from_checkpoint(operation_id, destination_id, &source)
+            .await
+            .unwrap();
+
+        catalog
+            .downgrade_reserved_operation_to_v21_private(operation_id)
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+
+        let migrated = Arc::new(
+            SlateDbCatalog::open(catalog_path, Arc::clone(&store))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !migrated
+                .branch_create_uses_shared_source(operation_id)
+                .await
+                .unwrap()
+        );
+        let lifecycle = BranchLifecycle::new(
+            migrated.clone(),
+            SlateDbRootStore::new(Arc::clone(&store), branch_root),
+        );
+        let branch = lifecycle
+            .create_from_checkpoint(BranchCreateRequest {
+                operation_id,
+                destination_id,
+                destination_name,
+                source,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(branch.root, Some(private_root));
+        assert_eq!(branch.state, BranchState::Ready);
+        migrated.snapshot().await.unwrap();
+        migrated.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn named_concurrent_creates_publish_once_and_ignore_source_name_reuse_on_retry() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let catalog = Arc::new(
@@ -2195,23 +2627,6 @@ mod tests {
             name: source_record.name.clone(),
         };
         lifecycle
-            .deletions()
-            .delete_checkpoint(delete_request.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            lifecycle
-                .leases()
-                .acquire_checkpoint_by_name(
-                    parent.id,
-                    &source_record.name,
-                    checkpoint_lease_request,
-                )
-                .await
-                .expect("an acquired checkpoint lease must survive logical deletion"),
-            checkpoint_grant
-        );
-        lifecycle
             .leases()
             .release(
                 checkpoint_grant.lease.id,
@@ -2220,31 +2635,11 @@ mod tests {
             )
             .await
             .unwrap();
-        AdminBuilder::new(source_path, Arc::clone(&store))
-            .build()
-            .delete_checkpoint(source_checkpoint.id)
-            .await
-            .unwrap();
-        catalog
-            .apply(CatalogMutation::CreateCheckpoint(CheckpointRecord {
-                id: Uuid::new_v4(),
-                revision: 1,
-                branch_id: parent.id,
-                name: source_record.name,
-                root: DurableRoot {
-                    identity: "lifecycle/replacement-source".to_string(),
-                    manifest_id: format!("{}@1", Uuid::new_v4()),
-                },
-                created_at: now,
-                updated_at: now,
-            }))
-            .await
-            .unwrap();
         lifecycle
             .deletions()
             .delete_checkpoint(delete_request)
             .await
-            .expect("an exact checkpoint deletion retry must ignore name reuse");
+            .unwrap();
         assert_eq!(
             lifecycle
                 .create_from_checkpoint_name_by_identity(
@@ -2255,7 +2650,7 @@ mod tests {
                     "reused-source-name-is-resolution-only".to_string(),
                 )
                 .await
-                .expect("a published named retry must ignore source deletion and name reuse"),
+                .expect("a published named retry must ignore the resolution-only source name"),
             left
         );
         let resume_request = BranchCreateRequest {
@@ -2292,6 +2687,10 @@ mod tests {
                     updated_at: now,
                 }),
             })
+            .await
+            .unwrap();
+        catalog
+            .mark_reserved_operation_private_for_test(resume_request.operation_id)
             .await
             .unwrap();
         let resumed_root = root_store
@@ -2619,6 +3018,10 @@ mod tests {
                             updated_at: now,
                         }),
                     })
+                    .await
+                    .unwrap();
+                catalog
+                    .mark_reserved_operation_private_for_test(request.operation_id)
                     .await
                     .unwrap();
             }
